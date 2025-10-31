@@ -4,7 +4,7 @@ import { useAuth } from '@/src/context/AuthContext';
 import VendorPaymentCreateSheet from './vendorpayment';
 
 import { Feather } from '@expo/vector-icons';
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { forwardRef, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Animated,
@@ -13,6 +13,7 @@ import {
   KeyboardAvoidingView,
   Modal,
   Platform,
+  Pressable,
   ScrollView,
   StyleSheet,
   Text,
@@ -33,14 +34,15 @@ const COLOR_PLACEHOLDER = '#64748B';
 const COLOR_BORDER = '#94A3B8';
 const COLOR_BORDER_FOCUS = '#0F172A';
 const COLOR_DIVIDER = '#E5E7EB';
-const COLOR_INPUT_BG = '#F9FAFB';
+const COLOR_INPUT_BG = '#FFFFFF';
 const COLOR_ACCENT = '#0F172A';
+const COLOR_ERROR = '#DC2626';
 
 type CurrencyKey = 'USD' | 'shimaal' | 'junuubi';
 const CURRENCY_OPTIONS: { label: string; key: CurrencyKey; code: string; symbol: string }[] = [
   { label: 'USD (US Dollar)', key: 'USD', code: 'USD', symbol: '$' },
-  { label: 'Shimaal',         key: 'shimaal', code: 'SOS', symbol: 'Sh' },
-  { label: 'Junuubi',         key: 'junuubi', code: 'JNB', symbol: 'J' },
+  { label: 'Shimaal', key: 'shimaal', code: 'SOS', symbol: 'Sh' },
+  { label: 'Junuubi', key: 'junuubi', code: 'JNB', symbol: 'J' },
 ];
 
 /* ──────────────────────────────────────────────────────────
@@ -70,115 +72,208 @@ type SupplierDueItem = {
 type SupplierDueResponse = { items: SupplierDueItem[] };
 
 /* ──────────────────────────────────────────────────────────
-   Small UI: Floating Input + Floating Select
+   Floating Input
+   - Label acts as placeholder.
+   - On focus or when value exists -> label moves into the border line.
+   - When not editable and user taps -> onGuard fires to show inline error.
 ────────────────────────────────────────────────────────── */
-function FloatingInput({
-  label,
-  value,
-  onChangeText,
-  keyboardType = 'default',
-  editable = true,
-  rightAddon,
-  onBlur,
-  onFocus,
-  testID,
-}: {
+type FloatingInputProps = {
   label: string;
   value: string;
   onChangeText?: (t: string) => void;
   keyboardType?: 'default' | 'number-pad' | 'decimal-pad';
   editable?: boolean;
-  rightAddon?: React.ReactNode;
   onFocus?: () => void;
   onBlur?: () => void;
+  onGuard?: () => void; // called when user tries to interact while disabled
   testID?: string;
-}) {
+  error?: string | null;
+};
+
+const FloatingInput = forwardRef<TextInput, FloatingInputProps>(function FI(
+  {
+    label,
+    value,
+    onChangeText,
+    keyboardType = 'default',
+    editable = true,
+    onFocus,
+    onBlur,
+    onGuard,
+    testID,
+    error,
+  },
+  ref
+) {
   const [focused, setFocused] = useState(false);
   const active = focused || (value?.length ?? 0) > 0;
 
   return (
-    <View style={{ marginBottom: 12 }}>
-      <View style={[styles.floatWrap, focused && { borderColor: COLOR_BORDER_FOCUS }]}>
-        <Text style={[styles.floatLabel, active && styles.floatLabelActive]}>{label}</Text>
+    <View style={{ marginBottom: error ? 4 : 14 }}>
+      <View
+        style={[
+          styles.floatWrap,
+          (focused || active) && styles.floatWrapFocused,
+          !editable && styles.inputDisabled,
+          error && { borderColor: COLOR_ERROR },
+        ]}
+      >
+        {/* Label chip only when active (focused or has value) */}
+        {active && (
+          <View style={[styles.labelChipHolder, { backgroundColor: COLOR_BG }]} pointerEvents="none">
+            <Text
+              style={[
+                styles.labelChipText,
+                { color: error ? COLOR_ERROR : COLOR_BORDER_FOCUS, fontWeight: '800' },
+              ]}
+              numberOfLines={1}
+            >
+              {label}
+            </Text>
+          </View>
+        )}
+
+        {/* Input. Placeholder shows the label when not active */}
         <TextInput
+          ref={ref}
           testID={testID}
-          style={[styles.inputBase, styles.inputPadded, !editable && styles.inputDisabled]}
+          style={[styles.inputBase, styles.inputPadded]}
           value={value}
           onChangeText={onChangeText}
           editable={editable}
           keyboardType={keyboardType}
-          placeholder=""                  // ← no placeholder text (label handles it)
+          placeholder={active ? '' : label}
           placeholderTextColor={COLOR_PLACEHOLDER}
-          onFocus={() => { setFocused(true); onFocus?.(); }}
-          onBlur={() => { setFocused(false); onBlur?.(); }}
+          onFocus={() => {
+            if (!editable) return;
+            setFocused(true);
+            onFocus?.();
+          }}
+          onBlur={() => {
+            setFocused(false);
+            onBlur?.();
+          }}
         />
-        {rightAddon ? <View style={styles.addonWrap}>{rightAddon}</View> : null}
+
+        {/* Invisible overlay to capture taps on disabled fields and trigger guard */}
+        {!editable && (
+          <Pressable
+            onPress={onGuard}
+            style={{ ...StyleSheet.absoluteFillObject, borderRadius: 12 }}
+            android_ripple={undefined}
+          />
+        )}
       </View>
+
+      {!!error && <Text style={styles.errorText}>{error}</Text>}
     </View>
   );
-}
+});
 
-function FloatingSelect<T extends string>({
-  label,
+/* ──────────────────────────────────────────────────────────
+   Currency Button + Popup
+   - Shows "Select" by default until chosen.
+   - When disabled and tapped -> shows guard error for prerequisite field.
+────────────────────────────────────────────────────────── */
+function CurrencyButton({
   value,
-  onSelect,
-  options,
-  renderLabel,
+  onPress,
+  disabled,
+  error,
 }: {
-  label: string;
-  value?: T;
-  onSelect: (v: T) => void;
-  options: T[];
-  renderLabel?: (v: T) => string;
+  value?: CurrencyKey;
+  onPress: () => void;
+  disabled?: boolean;
+  error?: string | null;
 }) {
-  const [open, setOpen] = useState(false);
-  const [focused, setFocused] = useState(false);
-  const hasValue = !!value;
-  const showFloat = focused || hasValue;
-  const display = value ? (renderLabel ? renderLabel(value) : String(value)) : label;
+  const curr = CURRENCY_OPTIONS.find((c) => c.key === value);
+  const label = curr ? curr.label.split(' ')[0] : 'Select';
 
   return (
-    <View style={{ marginBottom: 12 }}>
-      <View style={[styles.floatWrap, focused && { borderColor: COLOR_BORDER_FOCUS }]}>
-        <Text style={[styles.floatLabel, showFloat && styles.floatLabelActive]}>{label}</Text>
+    <View style={{ marginBottom: error ? 4 : 14 }}>
+      <View
+        style={[
+          styles.floatWrap,
+          styles.floatWrapFocused, // keep focused color for consistency with chip label
+          disabled && styles.inputDisabled,
+          error && { borderColor: COLOR_ERROR },
+        ]}
+      >
+        <View style={[styles.labelChipHolder, { backgroundColor: COLOR_BG }]} pointerEvents="none">
+          <Text
+            style={[
+              styles.labelChipText,
+              { color: error ? COLOR_ERROR : COLOR_BORDER_FOCUS, fontWeight: '800' },
+            ]}
+          >
+            Currency
+          </Text>
+        </View>
 
         <TouchableOpacity
-          activeOpacity={0.9}
-          onPress={() => { setOpen((s) => !s); setFocused((f) => !f); }}
+          activeOpacity={disabled ? 1 : 0.85}
+          onPress={() => {
+            if (disabled) return;
+            onPress();
+          }}
           style={[styles.inputBase, styles.inputPadded]}
         >
           <Text
             numberOfLines={1}
-            style={[styles.inputText, { color: hasValue ? COLOR_TEXT : COLOR_PLACEHOLDER }]}
+            style={[
+              styles.inputText,
+              { fontSize: 14, color: curr ? COLOR_TEXT : COLOR_PLACEHOLDER },
+            ]}
           >
-            {display}
+            {label}
           </Text>
-          <Feather name={open ? 'chevron-up' : 'chevron-down'} size={18} color={COLOR_TEXT} />
+          <Feather name="chevron-down" size={16} color={COLOR_TEXT} />
         </TouchableOpacity>
-
-        {open && (
-          <View style={styles.dropdown}>
-            {options.map((opt) => {
-              const lbl = renderLabel ? renderLabel(opt) : String(opt);
-              return (
-                <TouchableOpacity
-                  key={opt}
-                  activeOpacity={0.85}
-                  onPress={() => {
-                    onSelect(opt);
-                    setOpen(false);
-                    setFocused(false);
-                  }}
-                  style={styles.dropdownItem}
-                >
-                  <Text style={styles.dropdownText}>{lbl}</Text>
-                </TouchableOpacity>
-              );
-            })}
-          </View>
-        )}
       </View>
+
+      {!!error && <Text style={styles.errorText}>{error}</Text>}
     </View>
+  );
+}
+
+function CurrencyPopup({
+  visible,
+  onClose,
+  onSelect,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  onSelect: (k: CurrencyKey) => void;
+}) {
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <TouchableWithoutFeedback onPress={onClose}>
+        <View style={styles.popupBackdrop} />
+      </TouchableWithoutFeedback>
+
+      <View style={styles.popupCard}>
+        <Text style={styles.popupTitle}>Select currency</Text>
+        <View style={styles.popupList}>
+          {CURRENCY_OPTIONS.map((opt) => (
+            <TouchableOpacity
+              key={opt.key}
+              style={styles.popupItem}
+              activeOpacity={0.85}
+              onPress={() => {
+                onSelect(opt.key);
+                onClose();
+              }}
+            >
+              <Text style={styles.popupItemText}>{opt.label}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        <TouchableOpacity style={styles.popupClose} onPress={onClose} activeOpacity={0.9}>
+          <Text style={styles.popupCloseTxt}>Close</Text>
+        </TouchableOpacity>
+      </View>
+    </Modal>
   );
 }
 
@@ -189,12 +284,17 @@ export default function OilExtraCostModal({
   visible,
   onClose,
   oilId,
+  lotId,
 }: {
   visible: boolean;
   onClose: () => void;
-  oilId: number;
+  oilId?: number;
+  lotId?: number;
 }) {
+
   const { token } = useAuth();
+  const anchorId = oilId ?? lotId;
+
 
   // safe area + sheet geometry + slide animation
   const insets = useSafeAreaInsets();
@@ -220,33 +320,54 @@ export default function OilExtraCostModal({
   const [oil, setOil] = useState<OilRead | null>(null);
 
   // Form state
-  const [currencyKey, setCurrencyKey] = useState<CurrencyKey>('USD');
-  const currencyObj = CURRENCY_OPTIONS.find((c) => c.key === currencyKey)!;
+  const [categoryName, setCategoryName] = useState('');
+  const [currencyKey, setCurrencyKey] = useState<CurrencyKey | undefined>(undefined); // default: Select
+  const currencyObj = CURRENCY_OPTIONS.find((c) => c.key === currencyKey);
+  const symbol = currencyObj?.symbol || '';
 
-  const [exchangeToUSD, setExchangeToUSD] = useState(''); // how many [selected] for $1
+  const [exchangeToUSD, setExchangeToUSD] = useState(''); // if non-USD
   const [perBarrel, setPerBarrel] = useState('');
   const [qtyBarrel, setQtyBarrel] = useState('');
-  const [categoryName, setCategoryName] = useState(''); // first field
+  const isLotContext = !!lotId;
 
-  // derived
-  const rate = parseFloat(exchangeToUSD.replace(',', '.')) || 0;
+
+  // Inline errors
+  const [errCategory, setErrCategory] = useState<string | null>(null);
+  const [errCurrency, setErrCurrency] = useState<string | null>(null);
+  const [errRate, setErrRate] = useState<string | null>(null);
+  const [errPerBarrel, setErrPerBarrel] = useState<string | null>(null);
+  const [errQty, setErrQty] = useState<string | null>(null);
+
+  // gating (sequential enable)
+  const hasCategory = (categoryName || '').trim().length > 0;
+  const canPickCurrency = hasCategory;
+  const needsRate = currencyKey && currencyKey !== 'USD';
+  const rateVal = parseFloat(exchangeToUSD.replace(',', '.')) || 0;
+  const rateOk = !needsRate || rateVal > 0;
   const perB = parseFloat(perBarrel.replace(',', '.')) || 0;
+  const perOk = perB > 0;
   const qty = Math.max(parseInt(qtyBarrel || '0', 10) || 0, 0);
+  const qtyOk = qty > 0;
 
-  // totals
+  const canEditRate = canPickCurrency && !!currencyKey && needsRate;
+  const canEditPerBarrel = canPickCurrency && !!currencyKey && (!needsRate || rateOk);
+  const canEditQty = canEditPerBarrel && perOk;
+
+  // derived totals
   const totalInSelected = useMemo(() => {
     const n = perB * qty;
     return isFinite(n) ? n : 0;
   }, [perB, qty]);
 
   const totalInUSD = useMemo(() => {
+    if (!currencyKey) return 0;
     if (currencyKey === 'USD') return totalInSelected;
-    if (!(rate > 0)) return 0;
-    // selected = USD * rate → USD = selected / rate
-    return totalInSelected / rate;
-  }, [totalInSelected, rate, currencyKey]);
+    if (!(rateVal > 0)) return 0;
+    return totalInSelected / rateVal;
+  }, [totalInSelected, rateVal, currencyKey]);
 
-  const symbol = currencyObj?.symbol || '';
+  // currency popup
+  const [showCurrencyPopup, setShowCurrencyPopup] = useState(false);
 
   // Payment integration
   const [createdExtraId, setCreatedExtraId] = useState<number | null>(null);
@@ -262,9 +383,7 @@ export default function OilExtraCostModal({
   const toDecimal = (s: string) => {
     let out = s.replace(/[^0-9.]/g, '');
     const firstDot = out.indexOf('.');
-    if (firstDot !== -1) {
-      out = out.slice(0, firstDot + 1) + out.slice(firstDot + 1).replace(/\./g, '');
-    }
+    if (firstDot !== -1) out = out.slice(0, firstDot + 1) + out.slice(firstDot + 1).replace(/\./g, '');
     return out;
   };
   const toInt = (s: string) => s.replace(/[^0-9]/g, '');
@@ -283,8 +402,8 @@ export default function OilExtraCostModal({
         null;
       setVendorNameOverride(prefer);
 
-      // default currency to oil's if present
-      const oilCur = String(oilData?.currency || 'USD').toUpperCase();
+      // default currency to oil's if present (still show "Select" if none)
+      const oilCur = String(oilData?.currency || '').toUpperCase();
       const found = CURRENCY_OPTIONS.find((c) => c.code === oilCur);
       if (found) setCurrencyKey(found.key);
     } catch {
@@ -300,7 +419,16 @@ export default function OilExtraCostModal({
       loadOil();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, oilId]);
+  }, [visible, oilId, lotId]);
+
+
+  const clearErrors = () => {
+    setErrCategory(null);
+    setErrCurrency(null);
+    setErrRate(null);
+    setErrPerBarrel(null);
+    setErrQty(null);
+  };
 
   const clearForm = () => {
     setExchangeToUSD('');
@@ -310,40 +438,106 @@ export default function OilExtraCostModal({
     setCreatedExtraId(null);
     setShowPayPrompt(false);
     setShowVendorSheet(false);
+    setCurrentPayable(0);
+    clearErrors();
   };
 
-  // Fetch due for a specific extra cost id
+  // Guard helpers (called when user tries to move out-of-order)
+  const guardCurrency = () => {
+    if (!hasCategory) {
+      setErrCategory('Required');
+      return false;
+    }
+    return true;
+  };
+
+  const guardRate = () => {
+    if (!currencyKey) {
+      setErrCurrency('Please select a currency');
+      return false;
+    }
+    if (needsRate && !(rateVal > 0)) {
+      setErrRate('Enter a valid exchange rate');
+      return false;
+    }
+    return true;
+  };
+
+  const guardPerBarrel = () => {
+    if (!guardCurrency()) return false;
+    if (!guardRate()) return false;
+    return true;
+  };
+
+  const guardQty = () => {
+    if (!guardPerBarrel()) return false;
+    if (!(perB > 0)) {
+      setErrPerBarrel('Enter amount per barrel');
+      return false;
+    }
+    return true;
+  };
+
+  // Optional (refresh due from server later if needed)
   const fetchExtraDue = async (extraId: number) => {
     try {
+      const params = isLotContext
+        ? { lot_id: lotId, only_with_payments_q: 'false' }
+        : { oil_id: oilId, only_with_payments_q: 'false' };
+
       const r = await api.get<SupplierDueResponse>(`/diiwaanvendorpayments/supplier-dues`, {
         headers: authHeader,
-        params: { oil_id: oilId, only_with_payments_q: 'false' },
+        params,
       });
+
       const items = r?.data?.items || [];
-      const one = items.find((it) => it.oil_id === oilId);
+      const one = isLotContext
+        ? items.find((it: any) => it.lot_id === lotId)
+        : items.find((it: any) => it.oil_id === oilId);
+
       const ecList = (one?.extra_costs || []) as SupplierDueItem['extra_costs'];
       const match = ecList?.find((ec) => ec.id === extraId);
-      const due = Number(match?.due || 0);
-      return due;
+      return Number(match?.due || 0);
     } catch {
       return 0;
     }
   };
 
+
   // Submit: send category and amount in USD
   const submitCreate = async () => {
-    const name = (categoryName || '').trim();
-    const qtyNum = qty;
+    clearErrors();
+    let ok = true;
 
-    // validations (minimal, per your flow)
-    if (!name) return;
-    if (qtyNum <= 0) return;
-    if (perB <= 0) return;
-    if (currencyKey !== 'USD' && !(rate > 0)) return;
+    if (!hasCategory) {
+      setErrCategory('Required');
+      ok = false;
+    }
+    if (!currencyKey) {
+      setErrCurrency('Please select a currency');
+      ok = false;
+    }
+    if (currencyKey && currencyKey !== 'USD' && !(rateVal > 0)) {
+      setErrRate('Enter a valid exchange rate');
+      ok = false;
+    }
+    if (!(perB > 0)) {
+      setErrPerBarrel('Enter amount per barrel');
+      ok = false;
+    }
+    if (!(qty > 0)) {
+      setErrQty('Enter quantity of barrels');
+      ok = false;
+    }
 
-    const finalCategory = `${name}-${qtyNum}-barrel`;
+    if (!ok) return;
+
+    const finalCategory = `${categoryName.trim()}-${qty}-barrel`;
     const amountUSD = Number.isFinite(totalInUSD) ? totalInUSD : 0;
-    if (!(amountUSD > 0)) return;
+    if (!(amountUSD > 0)) {
+      setErrPerBarrel('Check values (total must be > 0)');
+      return;
+    }
 
     const payload = {
       category: finalCategory,
@@ -352,19 +546,17 @@ export default function OilExtraCostModal({
 
     try {
       setLoading(true);
-      const res = await api.post(`/diiwaanoil/${oilId}/extra-costs`, payload, { headers: authHeader });
+      if (!anchorId) return;
+      const res = await api.post(`/diiwaanoil/${anchorId}/extra-costs`, payload, { headers: authHeader });
+
       clearForm();
       const newId: number | undefined = res?.data?.id;
-      if (newId) {
-        setCreatedExtraId(newId);
-        const due = await fetchExtraDue(newId);
-        setCurrentPayable(due);
-        setShowPayPrompt(true);
-      } else {
-        setShowPayPrompt(false);
-      }
+
+      setCreatedExtraId(newId ?? null);
+      setCurrentPayable(amountUSD);
+      setShowPayPrompt(true);
     } catch {
-      // optional: show a toast or inline error
+      // optional: toast
     } finally {
       setLoading(false);
     }
@@ -377,7 +569,6 @@ export default function OilExtraCostModal({
     onClose();
   };
 
-  // UI strings
   const selectedCurrencyName = currencyObj?.label?.split(' ')[0] || 'Currency';
   const totalSelectedLabel = `Total in ${selectedCurrencyName}`;
 
@@ -411,56 +602,98 @@ export default function OilExtraCostModal({
                 </TouchableOpacity>
               </View>
 
-              {/* Content */}
+              {/* Content: fully scrollable */}
               <ScrollView
                 keyboardShouldPersistTaps="handled"
-                contentContainerStyle={{ paddingBottom: 18 }}
-                showsVerticalScrollIndicator={false}
+                contentContainerStyle={styles.scrollBody}
+                showsVerticalScrollIndicator
+                bounces
               >
-                <Text style={styles.sectionTitle}>Add new extra cost</Text>
+                {/* push the first row down a bit */}
+                <View style={{ height: 10 }} />
 
-                {/* 1) Other charges name (FIRST) */}
-                <FloatingInput
-                  label="Other charges name"
-                  value={categoryName}
-                  onChangeText={setCategoryName}
-                />
-
-                {/* 2) Currency (floating select) */}
-                <FloatingSelect<CurrencyKey>
-                  label="Currency"
-                  value={currencyKey}
-                  onSelect={setCurrencyKey}
-                  options={['USD', 'shimaal', 'junuubi']}
-                  renderLabel={(v) => CURRENCY_OPTIONS.find((c) => c.key === v)?.label || v}
-                />
-
-                {/* 3) Exchange rate to $1 — only when NOT USD */}
-                {currencyKey !== 'USD' && (
-                  <FloatingInput
-                    label={`Exchange rate to $1 (${selectedCurrencyName} per $1)`}
-                    value={exchangeToUSD}
-                    onChangeText={(t) => setExchangeToUSD(toDecimal(t))}
-                    keyboardType="decimal-pad"
-                  />
-                )}
-
-                {/* 4) Amount per barrel + Qty of barrel (flex row) */}
+                {/* Row: Other charges name + Currency (equal width) */}
                 <View style={styles.row2}>
                   <View style={styles.col}>
                     <FloatingInput
-                      label={`Amount per barrel (${symbol})`}
+                      label="Other charges name"
+                      value={categoryName}
+                      onChangeText={(t) => {
+                        setCategoryName(t);
+                        if (t.trim().length > 0) setErrCategory(null);
+                      }}
+                      editable={true}
+                      error={errCategory}
+                    />
+                  </View>
+                  <View style={styles.col}>
+                    <CurrencyButton
+                      value={currencyKey}
+                      disabled={!canPickCurrency}
+                      onPress={() => {
+                        setErrCurrency(null);
+                        setShowCurrencyPopup(true);
+                      }}
+                      error={errCurrency}
+                    />
+                  </View>
+                </View>
+
+                {/* Exchange rate to $1 — only when NOT USD (and after currency) */}
+                {currencyKey && currencyKey !== 'USD' ? (
+                  <FloatingInput
+                    label={`Exchange rate to $1 (${(currencyObj?.label || 'Currency').split(' ')[0]} per $1)`}
+                    value={exchangeToUSD}
+                    onChangeText={(t) => {
+                      const v = toDecimal(t);
+                      setExchangeToUSD(v);
+                      if ((parseFloat(v || '0') || 0) > 0) setErrRate(null);
+                    }}
+                    keyboardType="decimal-pad"
+                    editable={canEditRate}
+                    onGuard={() => {
+                      // user tapped while disabled
+                      if (!hasCategory) setErrCategory('Required');
+                      else if (!currencyKey) setErrCurrency('Please select a currency');
+                    }}
+                    error={errRate}
+                  />
+                ) : null}
+
+                {/* Amount per barrel + Qty */}
+                <View style={styles.row2}>
+                  <View style={styles.col}>
+                    <FloatingInput
+                      label={`Amount per barrel (${symbol || ''})`}
                       value={perBarrel}
-                      onChangeText={(t) => setPerBarrel(toDecimal(t))}
+                      onChangeText={(t) => {
+                        const v = toDecimal(t);
+                        setPerBarrel(v);
+                        if ((parseFloat(v || '0') || 0) > 0) setErrPerBarrel(null);
+                      }}
                       keyboardType="decimal-pad"
+                      editable={canEditPerBarrel}
+                      onGuard={() => {
+                        if (!guardPerBarrel()) return;
+                      }}
+                      error={errPerBarrel}
                     />
                   </View>
                   <View style={styles.col}>
                     <FloatingInput
                       label="Qty (barrels)"
                       value={qtyBarrel}
-                      onChangeText={(t) => setQtyBarrel(toInt(t))}
+                      onChangeText={(t) => {
+                        const v = toInt(t);
+                        setQtyBarrel(v);
+                        if ((parseInt(v || '0', 10) || 0) > 0) setErrQty(null);
+                      }}
                       keyboardType="number-pad"
+                      editable={canEditQty}
+                      onGuard={() => {
+                        if (!guardQty()) return;
+                      }}
+                      error={errQty}
                     />
                   </View>
                 </View>
@@ -483,17 +716,31 @@ export default function OilExtraCostModal({
                     </Text>
                   </View>
 
-                  {/* helper hint when rate missing for non-USD */}
-                  {currencyKey !== 'USD' && !(rate > 0) ? (
+                  {currencyKey && currencyKey !== 'USD' && !(rateVal > 0) ? (
                     <Text style={styles.rateHint}>Enter a valid exchange rate to calculate USD total.</Text>
                   ) : null}
                 </View>
 
                 {/* Submit */}
                 <TouchableOpacity
-                  style={[styles.submitBtn, loading && { opacity: 0.7 }]}
+                  style={[
+                    styles.submitBtn,
+                    loading && { opacity: 0.7 },
+                    (!hasCategory ||
+                      !currencyKey ||
+                      (currencyKey !== 'USD' && !(rateVal > 0)) ||
+                      !perOk ||
+                      !qtyOk) && { opacity: 0.5 },
+                  ]}
                   onPress={submitCreate}
-                  disabled={loading}
+                  disabled={
+                    loading ||
+                    !hasCategory ||
+                    !currencyKey ||
+                    (currencyKey !== 'USD' && !(rateVal > 0)) ||
+                    !perOk ||
+                    !qtyOk
+                  }
                   activeOpacity={0.9}
                 >
                   {loading ? (
@@ -505,13 +752,30 @@ export default function OilExtraCostModal({
                     </>
                   )}
                 </TouchableOpacity>
+
+                <View style={{ height: 18 }} />
               </ScrollView>
             </View>
           </KeyboardAvoidingView>
         </Animated.View>
       </Modal>
 
-      {/* Pay Now? prompt — for THIS extra cost only */}
+      {/* Currency Popup */}
+      <CurrencyPopup
+        visible={showCurrencyPopup}
+        onClose={() => setShowCurrencyPopup(false)}
+        onSelect={(k) => {
+          setCurrencyKey(k);
+          setErrCurrency(null);
+          // reset rate if switching to USD
+          if (k === 'USD') {
+            setExchangeToUSD('');
+            setErrRate(null);
+          }
+        }}
+      />
+
+      {/* Pay Now? prompt */}
       <Modal
         visible={showPayPrompt}
         transparent
@@ -529,56 +793,64 @@ export default function OilExtraCostModal({
         >
           <View style={styles.backdrop} />
         </TouchableWithoutFeedback>
+
         <View style={styles.payPromptCard}>
           <Text style={styles.payPromptTitle}>Pay vendor now?</Text>
-          <Text style={styles.payPromptBody}>
-            Current payable for this extra cost is{' '}
-            <Text style={{ fontWeight: '900', color: COLOR_TEXT }}>
-              ${Number(currentPayable || 0).toFixed(2)}
-            </Text>. Do you want to record a payment now?
-          </Text>
-          <View style={{ flexDirection: 'row', gap: 10 }}>
+
+          <View style={styles.payRow}>
+            <Text style={styles.payLabel}>Total (USD)</Text>
+            <Text style={styles.payValue}>${Number(currentPayable || 0).toFixed(2)}</Text>
+          </View>
+
+          <Text style={styles.payPromptBody}>Do you want to record a payment for this extra cost now?</Text>
+
+          <View style={styles.payBtnRow}>
             <TouchableOpacity
-              style={[styles.submitBtn, { backgroundColor: '#F3F4F6' }]}
+              style={[styles.payBtn, styles.payBtnLight]}
               onPress={() => {
                 setShowPayPrompt(false);
                 onClose();
               }}
+              activeOpacity={0.9}
             >
-              <Text style={{ color: '#0B1221', fontWeight: '800' }}>Later</Text>
+              <Text style={styles.payBtnLightTxt}>Later</Text>
             </TouchableOpacity>
+
             <TouchableOpacity
-              style={[styles.submitBtn]}
+              style={[styles.payBtn, styles.payBtnDark]}
               onPress={() => {
                 setShowPayPrompt(false);
                 onClose();
                 setShowVendorSheet(true);
               }}
+              activeOpacity={0.9}
             >
-              <Text style={styles.submitText}>Pay now</Text>
+              <Text style={styles.payBtnDarkTxt}>Pay now</Text>
             </TouchableOpacity>
           </View>
         </View>
       </Modal>
 
-      {/* Vendor Payment Sheet (scoped to extra_cost_id) */}
+      {/* Vendor Payment Sheet */}
       <VendorPaymentCreateSheet
-        visible={showVendorSheet}
-        onClose={() => setShowVendorSheet(false)}
-        token={token || null}
-        oilId={oilId}
-        vendorNameOverride={vendorNameOverride ?? undefined}
-        currentPayable={currentPayable}
-        extraCostId={createdExtraId ?? undefined}
-        onCreated={async () => {
-          if (createdExtraId) {
-            const due = await fetchExtraDue(createdExtraId);
-            setCurrentPayable(due);
-          }
-        }}
-        companyName={undefined}
-        companyContact={undefined}
-      />
+      visible={showVendorSheet}
+      onClose={() => setShowVendorSheet(false)}
+      token={token || null}
+      oilId={oilId}
+      lotId={lotId}
+      vendorNameOverride={vendorNameOverride ?? undefined}
+      currentPayable={currentPayable}
+      extraCostId={createdExtraId ?? undefined}
+      onCreated={async () => {
+        if (createdExtraId) {
+          const due = await fetchExtraDue(createdExtraId);
+          setCurrentPayable(due);
+        }
+      }}
+      companyName={undefined}
+      companyContact={undefined}
+    />
+
     </>
   );
 }
@@ -636,56 +908,45 @@ const styles = StyleSheet.create({
   },
   titleCenter: { fontSize: 18, fontWeight: '800', color: COLOR_TEXT, textAlign: 'center' },
 
-  // Sections
-  sectionTitle: { fontSize: 14, color: COLOR_SUB, fontWeight: '800', marginBottom: 8, marginTop: 6 },
+  // Scroll body padding
+  scrollBody: {
+    paddingBottom: 18,
+    paddingTop: 6,
+  },
 
-  // Floating field frames
+  // Field frame
   floatWrap: {
-    borderWidth: 1.2,
+    borderWidth: 1.4,
     borderColor: COLOR_BORDER,
     borderRadius: 12,
     backgroundColor: COLOR_INPUT_BG,
     position: 'relative',
   },
-  floatLabel: {
+  floatWrapFocused: { borderColor: COLOR_BORDER_FOCUS },
+
+  // Label chip that sits over the border line
+  labelChipHolder: {
     position: 'absolute',
-    left: 10,
+    left: 12,
     top: -10,
     paddingHorizontal: 6,
-    backgroundColor: COLOR_BG,
-    fontSize: 11,
-    color: COLOR_PLACEHOLDER,
+    borderRadius: 4,
   },
-  floatLabelActive: { color: COLOR_BORDER_FOCUS, fontWeight: '800' },
+  labelChipText: { fontSize: 11 },
 
   // Input base
   inputBase: {
-    minHeight: 46,
+    minHeight: 48,
     alignItems: 'center',
     flexDirection: 'row',
     justifyContent: 'space-between',
   },
-  inputPadded: { paddingHorizontal: 12, paddingVertical: 10 },
+  inputPadded: { paddingHorizontal: 12, paddingVertical: 12 },
   inputText: { fontSize: 15, color: COLOR_TEXT },
-  inputDisabled: { backgroundColor: '#F3F4F6' },
-  addonWrap: { position: 'absolute', right: 8, top: 0, bottom: 0, justifyContent: 'center' },
+  inputDisabled: { backgroundColor: '#F8FAFC' },
 
-  // Dropdown
-  dropdown: {
-    marginTop: 8,
-    borderWidth: 1.2,
-    borderColor: COLOR_BORDER,
-    borderRadius: 12,
-    overflow: 'hidden',
-    backgroundColor: COLOR_BG,
-  },
-  dropdownItem: {
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: COLOR_DIVIDER,
-  },
-  dropdownText: { fontSize: 15, color: COLOR_TEXT },
+  // Error text
+  errorText: { marginTop: 4, color: COLOR_ERROR, fontSize: 11, fontWeight: '700' },
 
   // Grid
   row2: { flexDirection: 'row', gap: 12 },
@@ -693,7 +954,7 @@ const styles = StyleSheet.create({
 
   // Summary
   summaryCard: {
-    marginTop: 4,
+    marginTop: 6,
     marginBottom: 12,
     padding: 12,
     borderRadius: 12,
@@ -707,7 +968,7 @@ const styles = StyleSheet.create({
   divider: { height: 1, backgroundColor: '#E5E7EB', marginVertical: 8 },
   rateHint: { marginTop: 6, color: '#B45309', fontSize: 11 },
 
-  // Buttons
+  // Buttons (main submit)
   submitBtn: {
     backgroundColor: COLOR_ACCENT,
     borderRadius: 14,
@@ -723,6 +984,44 @@ const styles = StyleSheet.create({
   },
   submitText: { color: 'white', fontSize: 15, fontWeight: '800' },
 
+  // Currency popup (small)
+  popupBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(2,6,23,0.55)' },
+  popupCard: {
+    position: 'absolute',
+    left: 24,
+    right: 24,
+    top: '28%',
+    borderRadius: 16,
+    backgroundColor: '#fff',
+    padding: 14,
+    borderWidth: 1,
+    borderColor: '#EEF1F6',
+  },
+  popupTitle: { fontSize: 14, fontWeight: '900', color: COLOR_TEXT, marginBottom: 10, textAlign: 'center' },
+  popupList: {
+    borderWidth: 1,
+    borderColor: '#EEF2F7',
+    borderRadius: 12,
+    overflow: 'hidden',
+  },
+  popupItem: {
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: COLOR_DIVIDER,
+    backgroundColor: '#fff',
+  },
+  popupItemText: { color: COLOR_TEXT, fontSize: 13, fontWeight: '700' },
+  popupClose: {
+    marginTop: 10,
+    height: 44,
+    borderRadius: 12,
+    backgroundColor: '#0F172A',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  popupCloseTxt: { color: '#FFFFFF', fontWeight: '800', fontSize: 14 },
+
   // Pay prompt
   payPromptCard: {
     position: 'absolute',
@@ -736,5 +1035,23 @@ const styles = StyleSheet.create({
     borderColor: '#EEF1F6',
   },
   payPromptTitle: { fontSize: 16, fontWeight: '900', color: COLOR_TEXT, marginBottom: 8 },
-  payPromptBody: { color: COLOR_SUB, marginBottom: 12 },
+  payPromptBody: { color: COLOR_SUB, marginTop: 6, marginBottom: 12 },
+  payRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  payLabel: { color: COLOR_SUB, fontSize: 12, fontWeight: '800' },
+  payValue: { color: COLOR_TEXT, fontSize: 14, fontWeight: '900' },
+
+  // Pay prompt buttons row
+  payBtnRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 12 },
+  payBtn: {
+    flexGrow: 1,
+    flexBasis: '48%',
+    borderRadius: 12,
+    paddingVertical: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  payBtnLight: { backgroundColor: '#F3F4F6', borderWidth: 1, borderColor: '#E5E7EB' },
+  payBtnDark: { backgroundColor: COLOR_ACCENT },
+  payBtnLightTxt: { color: '#0B1221', fontWeight: '800', textAlign: 'center' },
+  payBtnDarkTxt: { color: '#FFFFFF', fontWeight: '800', textAlign: 'center' },
 });

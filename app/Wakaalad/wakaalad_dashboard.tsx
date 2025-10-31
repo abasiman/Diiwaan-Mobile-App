@@ -1,5 +1,5 @@
 // app/Wakaalad/wakaalad_dashboard.tsx
-import { AntDesign, Feather } from '@expo/vector-icons';
+import { Feather } from '@expo/vector-icons';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import dayjs from 'dayjs';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -72,11 +72,11 @@ const COLOR_MUTED = '#64748B';
 const COLOR_DIV = '#E5E7EB';
 const COLOR_CARD = '#F8FAFC';
 const COLOR_ACCENT = '#0B2447'; // dark blue for progress
+const COLOR_SUCCESS = '#16A34A';
 
 const CAPACITY = { fuusto: 240, caag: 20 } as const;
 const fuustoCap = (oilType?: string) =>
   (String(oilType || '').toLowerCase() === 'petrol' ? 230 : CAPACITY.fuusto);
-
 
 function formatNumber(n?: number | null, fractionDigits = 0) {
   if (n === undefined || n === null || isNaN(Number(n))) return '—';
@@ -104,6 +104,22 @@ function percentStock(it: WakaaladRead) {
   return Math.max(0, Math.min(100, pct));
 }
 
+/** Green round confirmation tick */
+const ConfirmBadge = ({ size = 16 }: { size?: number }) => (
+  <View
+    style={{
+      width: size,
+      height: size,
+      borderRadius: size / 2,
+      backgroundColor: COLOR_SUCCESS,
+      alignItems: 'center',
+      justifyContent: 'center',
+    }}
+  >
+    <Feather name="check" size={Math.max(10, Math.floor(size * 0.62))} color="#fff" />
+  </View>
+);
+
 export default function WakaaladDashboard() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -123,8 +139,7 @@ export default function WakaaladDashboard() {
   // Create modal
   const [createOpen, setCreateOpen] = useState(false);
 
-  // Unit dropdown
-  const [openUnit, setOpenUnit] = useState(false);
+  // Unit selector (prominent, below the search)
   const [unitMode, setUnitMode] = useState<UnitMode>('fuusto'); // default fuusto
 
   // Actions modal
@@ -218,20 +233,19 @@ export default function WakaaladDashboard() {
   const totalLitersStock = (it: WakaaladRead) => Number(it.wakaal_stock || 0);
   const totalLitersSold  = (it: WakaaladRead) => Number(it.wakaal_sold || 0);
 
- function stockValue(it: WakaaladRead): number {
-  const liters = totalLitersStock(it);
-  if (unitMode === 'liters') return liters;
-  if (unitMode === 'fuusto') return Math.floor(liters / fuustoCap(it.oil_type));
-  return Math.floor(liters / CAPACITY.caag); // caag
-}
+  function stockValue(it: WakaaladRead): number {
+    const liters = totalLitersStock(it);
+    if (unitMode === 'liters') return liters;
+    if (unitMode === 'fuusto') return Math.floor(liters / fuustoCap(it.oil_type));
+    return Math.floor(liters / CAPACITY.caag); // caag
+  }
 
   function soldValue(it: WakaaladRead): number {
-  const liters = totalLitersSold(it);
-  if (unitMode === 'liters') return liters;
-  if (unitMode === 'fuusto') return Math.floor(liters / fuustoCap(it.oil_type));
-  return Math.floor(liters / CAPACITY.caag); // caag
-}
-
+    const liters = totalLitersSold(it);
+    if (unitMode === 'liters') return liters;
+    if (unitMode === 'fuusto') return Math.floor(liters / fuustoCap(it.oil_type));
+    return Math.floor(liters / CAPACITY.caag); // caag
+  }
 
   function unitSuffix(): string {
     if (unitMode === 'fuusto') return 'fuusto';
@@ -291,7 +305,7 @@ export default function WakaaladDashboard() {
         </LinearGradient>
       </SafeAreaView>
 
-      {/* Search + Filters + Unit dropdown */}
+      {/* Search */}
       <View style={styles.searchRow}>
         <View style={styles.searchBox}>
           <Feather name="search" size={12} color={COLOR_MUTED} />
@@ -311,45 +325,33 @@ export default function WakaaladDashboard() {
             </TouchableOpacity>
           )}
 
-          {/* Unit dropdown trigger */}
-          <View style={{ width: 8 }} />
-          <View style={{ position: 'relative' }}>
-            <TouchableOpacity
-              onPress={() => setOpenUnit((s) => !s)}
-              activeOpacity={0.9}
-              style={styles.unitBtn}
-            >
-              <Feather name="layers" size={12} color={COLOR_ACCENT} />
-              <Text style={styles.unitBtnTxt}>{unitLabel}</Text>
-              <Feather name={openUnit ? 'chevron-up' : 'chevron-down'} size={12} color={COLOR_ACCENT} />
-            </TouchableOpacity>
-
-            {openUnit && (
-              <View style={styles.unitDropdown}>
-                {(['fuusto', 'caag', 'liters'] as UnitMode[]).map((u) => (
-                  <TouchableOpacity
-                    key={u}
-                    style={styles.unitOption}
-                    onPress={() => {
-                      setUnitMode(u);
-                      setOpenUnit(false);
-                    }}
-                  >
-                    <Text style={styles.unitOptionTxt}>
-                      {u === 'fuusto' ? 'Fuusto' : u === 'caag' ? 'Caag' : 'Liters'}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            )}
-          </View>
-
           <TouchableOpacity onPress={() => setShowFilters(true)} style={styles.headerFilterBtnSmall}>
             <Feather name="filter" size={12} color={COLOR_ACCENT} />
             <Text style={styles.headerFilterTxtSmall}>Filter</Text>
           </TouchableOpacity>
         </View>
-        {/* general Stock/Sold strip intentionally removed */}
+      </View>
+
+      {/* BIG Unit Selector (below search) */}
+      <View style={styles.unitBar}>
+        <Text style={styles.unitBarLabel}>Display in</Text>
+        <View style={styles.unitChipsRow}>
+          {(['fuusto', 'caag', 'liters'] as UnitMode[]).map((u) => {
+            const active = unitMode === u;
+            const label = u === 'fuusto' ? 'Fuusto' : u === 'caag' ? 'Caag' : 'Liters';
+            return (
+              <TouchableOpacity
+                key={u}
+                onPress={() => setUnitMode(u)}
+                activeOpacity={0.9}
+                style={[styles.unitChip, active && styles.unitChipActive]}
+              >
+                <Feather name="layers" size={12} color={active ? '#fff' : COLOR_ACCENT} />
+                <Text style={[styles.unitChipTxt, active && styles.unitChipTxtActive]}>{label}</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
       </View>
 
       {/* List */}
@@ -370,7 +372,6 @@ export default function WakaaladDashboard() {
           </View>
         ) : (
           filtered.map((wk) => {
-            // sold % (for info) and stock % (for the bar that starts full and decreases)
             const pctSold  = percentSold(wk);
             const pctStock = percentStock(wk);
             const totalLiters = (wk.wakaal_stock || 0) + (wk.wakaal_sold || 0);
@@ -379,8 +380,10 @@ export default function WakaaladDashboard() {
             const sold = soldValue(wk);
             const suffix = unitSuffix();
 
-            // clamp label so it doesn't overflow edges
             const pctForLabel = Math.max(4, Math.min(96, Math.round(pctStock)));
+
+            // explicit fuusto sold (for green tick)
+            const soldFuustoCount = Math.floor((wk.wakaal_sold || 0) / fuustoCap(wk.oil_type));
 
             return (
               <View key={wk.id} style={styles.card}>
@@ -416,7 +419,7 @@ export default function WakaaladDashboard() {
                     </View>
                   </View>
 
-                  {/* Progress bar: DARK BLUE, starts full (stock) and decreases as you sell */}
+                  {/* Progress bar */}
                   <View
                     style={styles.progressWrap}
                     accessible
@@ -427,7 +430,7 @@ export default function WakaaladDashboard() {
                     <View style={styles.progressBg} />
                     <View style={[styles.progressFill, { width: `${pctStock}%` }]} />
 
-                    {/* Sliding percentage tag attached to the end of the fill */}
+                    {/* Sliding percentage tag */}
                     <View
                       pointerEvents="none"
                       style={[
@@ -447,21 +450,23 @@ export default function WakaaladDashboard() {
                         {formatNumber(stock)} {suffix}
                       </Text>
                     </View>
+
+                    {/* SOLD with round green confirmation tick */}
                     <View style={styles.statBox}>
                       <Text style={styles.statLabel}>Sold ({unitLabel})</Text>
-                      <Text style={styles.statValue}>
-                        {formatNumber(sold)} {suffix}
-                      </Text>
-                    </View>
-                    <View style={styles.statBoxSmall}>
-                      <Text style={styles.statMini}>Sold {Math.round(pctSold)}%</Text>
-                    </View>
-                  </View>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                        {unitMode === 'fuusto' && <ConfirmBadge size={16} />}
+                        <Text style={styles.statValue}>
+                          {formatNumber(sold)} {suffix}
+                        </Text>
+                      </View>
 
-                  <View style={{ marginTop: 6 }}>
-                    <Text style={styles.breakdownText}>
-                      Breakdown (stock): {wk.stock_breakdown} • (sold): {wk.sold_breakdown}
-                    </Text>
+                    
+                    </View>
+
+                  {/*   <View style={styles.statBoxSmall}>
+                      <Text style={styles.statMini}>Sold {Math.round(pctSold)}%</Text>
+                    </View> */}
                   </View>
                 </View>
               </View>
@@ -479,7 +484,7 @@ export default function WakaaladDashboard() {
                 <View style={styles.modalHeader}>
                   <Text style={styles.modalTitle}>Filters</Text>
                   <TouchableOpacity onPress={() => setShowFilters(false)}>
-                    <AntDesign name="close" size={16} color="#1F2937" />
+                    <Feather name="x" size={16} color="#1F2937" />
                   </TouchableOpacity>
                 </View>
 
@@ -611,7 +616,7 @@ const styles = StyleSheet.create({
   },
   createBtnTxt: { color: COLOR_ACCENT, fontWeight: '800', fontSize: 11 },
 
-  searchRow: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 8 },
+  searchRow: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 6 },
   searchBox: {
     paddingHorizontal: 8,
     paddingVertical: 6,
@@ -638,38 +643,47 @@ const styles = StyleSheet.create({
   },
   headerFilterTxtSmall: { color: COLOR_ACCENT, fontSize: 10, fontWeight: '800' },
 
-  // Unit dropdown
-  unitBtn: {
+  // BIG Unit Selector (prominent)
+  unitBar: {
+    paddingHorizontal: 16,
+    paddingBottom: 8,
+    paddingTop: 0,
+  },
+  unitBarLabel: {
+    fontSize: 10,
+    color: '#334155',
+    fontWeight: '900',
+    marginBottom: 6,
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+  },
+  unitChipsRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  unitChip: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
-    backgroundColor: '#ECF2FF',
-    paddingVertical: 5,
-    paddingHorizontal: 10,
-    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: '#D9E3FF',
+    backgroundColor: '#ECF2FF',
   },
-  unitBtnTxt: { color: COLOR_ACCENT, fontSize: 10, fontWeight: '900' },
-  unitDropdown: {
-    position: 'absolute',
-    top: 36,
-    right: 0,
-    backgroundColor: '#FFFFFF',
-    borderWidth: 1,
-    borderColor: '#E5E7EB',
-    borderRadius: 10,
-    overflow: 'hidden',
-    minWidth: 120,
-    zIndex: 50,
-    shadowColor: '#000',
-    shadowOpacity: 0.1,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: 6 },
-    elevation: 8,
+  unitChipActive: {
+    backgroundColor: COLOR_ACCENT,
+    borderColor: COLOR_ACCENT,
   },
-  unitOption: { paddingVertical: 10, paddingHorizontal: 12, borderBottomWidth: 1, borderBottomColor: '#F1F5F9' },
-  unitOptionTxt: { fontSize: 12, color: COLOR_TEXT, fontWeight: '800' },
+  unitChipTxt: {
+    color: COLOR_ACCENT,
+    fontSize: 11,
+    fontWeight: '900',
+  },
+  unitChipTxtActive: {
+    color: '#FFFFFF',
+  },
 
   scrollContent: { padding: 12, paddingBottom: 24 },
   loading: { padding: 20, alignItems: 'center', justifyContent: 'center' },
@@ -772,7 +786,7 @@ const styles = StyleSheet.create({
   statValue: { color: COLOR_TEXT, fontSize: 13, fontWeight: '900' },
   statMini: { color: '#0369A1', fontSize: 10, fontWeight: '900' },
 
-  breakdownText: { color: '#6B7280', fontSize: 10, marginTop: 2 },
+  breakdownText: { color: '#6B7280', fontSize: 10, marginTop: 0 },
 
   // Modal
   modalBackdrop: {

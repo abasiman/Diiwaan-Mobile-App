@@ -52,6 +52,10 @@ type AccountSummary = {
   net_profit_native: number;
   net_profit_usd: number;
 
+  // NEW: report-only petrol fuusto shorts
+  petrol_fuusto_shorts_native: number;
+  petrol_fuusto_shorts_usd: number;
+
   truck_plate?: string | null;
 };
 
@@ -187,10 +191,6 @@ export default function TenantAccountsStatement() {
   const [summary, setSummary] = useState<AccountSummary | null>(null);
   const [loading, setLoading] = useState(true);
 
-
-
-  
-
   const fetchSummary = useCallback(async () => {
     if (!token) return;
     setLoading(true);
@@ -265,6 +265,9 @@ export default function TenantAccountsStatement() {
   const cogs = summary?.cogs_usd ?? Math.max(0, - (summary?.oil_asset_usd ?? 0));
   const net  = summary?.net_profit_usd ?? (revenue - cogs);
 
+  // NEW: Petrol fuusto shorts (USD)
+  const petrolShortsUsd = summary?.petrol_fuusto_shorts_usd ?? 0;
+
   const { label: periodLabel } = buildRange();
   const truckLabel = truckPlate ? ` • Plate: ${truckPlate}` : '';
 
@@ -282,8 +285,9 @@ export default function TenantAccountsStatement() {
       `• Revenue: ${money(revenue)}`,
       `• COGS: ${money(cogs)}`,
       `• Net Profit: ${money(net)}`,
+      `• Petrol Fuusto Shorts: ${money(petrolShortsUsd)}`,
     ].join('\n');
-  }, [periodLabel, truckLabel, cash, ar, ap, revenue, cogs, net, inventory, totalAssets]);
+  }, [periodLabel, truckLabel, cash, ar, ap, revenue, cogs, net, inventory, totalAssets, petrolShortsUsd]);
 
   /* ─────────────────── Screenshot + actions (Degso) ─────────────────── */
   const statementRef = useRef<View>(null);
@@ -322,18 +326,17 @@ export default function TenantAccountsStatement() {
     }
   };
 
-
   useFocusEffect(
-  React.useCallback(() => {
-    const onHardwareBackPress = () => {
-      router.replace('/menu'); // always go to /menu
-      return true;             // consume the back press so the app never exits
-    };
+    React.useCallback(() => {
+      const onHardwareBackPress = () => {
+        router.replace('/menu'); // always go to /menu
+        return true;             // consume the back press so the app never exits
+      };
 
-    const sub = BackHandler.addEventListener('hardwareBackPress', onHardwareBackPress);
-    return () => sub.remove();
-  }, [router])
-);
+      const sub = BackHandler.addEventListener('hardwareBackPress', onHardwareBackPress);
+      return () => sub.remove();
+    }, [router])
+  );
 
   const onDownload = async () => {
     const uri = shotUri ?? (await ensureShot());
@@ -379,9 +382,10 @@ export default function TenantAccountsStatement() {
 
   /* ─────────────────── Render ─────────────────── */
   if (loading) {
+    // Removed the purple/blue color override; keep a small, default spinner
     return (
       <View style={styles.loading}>
-        <ActivityIndicator size="large" color="#4F46E5" />
+        <ActivityIndicator />
       </View>
     );
   }
@@ -460,70 +464,72 @@ export default function TenantAccountsStatement() {
         {/* STATEMENT PAPER */}
         <View ref={statementRef} collapsable={false} style={styles.paper}>
           {/* Overview card */}
-                  {/* Overview card */}
-        <View style={[styles.card, { backgroundColor: '#F0F9FF' }]}>
-          <View style={styles.sectionHeader}>
-            <Text style={styles.sectionTitle}>Overview</Text>
-            <View style={styles.badge}>
-              <Ionicons name="time-outline" size={12} color="#1E40AF" />
-              <Text style={styles.badgeTxt}>
-                {buildRange().label}{truckPlate ? ` • ${truckPlate}` : ''}
-              </Text>
+          <View style={[styles.card, { backgroundColor: '#F0F9FF' }]}>
+            <View style={styles.sectionHeader}>
+              <Text style={styles.sectionTitle}>Overview</Text>
+              <View style={styles.badge}>
+                <Ionicons name="time-outline" size={12} color="#1E40AF" />
+                <Text style={styles.badgeTxt}>
+                  {buildRange().label}{truckPlate ? ` • ${truckPlate}` : ''}
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.row}>
+              <View style={styles.rowLeft}>
+                <Ionicons name="trending-up-outline" size={16} color="#0EA5E9" />
+                <Text style={styles.rowLabel}>Net Profit</Text>
+              </View>
+              <Text style={[styles.rowValue, numFace, { color: net >= 0 ? OK : BAD }]}>{money(net)}</Text>
+            </View>
+
+            <View style={styles.row}>
+              <View style={styles.rowLeft}>
+                <Ionicons name="add-circle-outline" size={16} color="#0EA5E9" />
+                <Text style={styles.rowLabel}>Revenue</Text>
+              </View>
+              <Text style={[styles.rowValue, numFace]}>{money(revenue)}</Text>
+            </View>
+
+            {/* COGS row with child description beneath the label (smaller) */}
+            <View style={styles.row}>
+              <View style={[styles.rowLeft, { alignItems: 'flex-start' }]}>
+                <Ionicons name="trending-up-outline" size={16} color="#0EA5E9" />
+                <View style={{ marginLeft: 10 }}>
+                  <Text style={styles.rowLabel}>COGS</Text>
+                  <Text style={styles.rowSubLabel}>Qiimaha ay ku fadhiso saliida la'iibiyay</Text>
+                </View>
+              </View>
+              <Text style={[styles.rowValue, numFace]}>{money(cogs)}</Text>
+            </View>
+
+            {/* Total Assets */}
+            <View style={styles.row}>
+              <View style={styles.rowLeft}>
+                <Ionicons name="layers-outline" size={16} color="#0EA5E9" />
+                <Text style={styles.rowLabel}>Total Asset</Text>
+              </View>
+              <Text style={[styles.rowValue, numFace]}>{money(totalAssets)}</Text>
             </View>
           </View>
 
-          <View style={styles.row}>
-            <View style={styles.rowLeft}>
-              <Ionicons name="trending-up-outline" size={16} color="#0EA5E9" />
-              <Text style={styles.rowLabel}>Net Profit</Text>
-            </View>
-            <Text style={[styles.rowValue, numFace, { color: net >= 0 ? OK : BAD }]}>{money(net)}</Text>
-          </View>
-
-          <View style={styles.row}>
-            <View style={styles.rowLeft}>
-              <Ionicons name="add-circle-outline" size={16} color="#0EA5E9" />
-              <Text style={styles.rowLabel}>Revenue</Text>
-            </View>
-            <Text style={[styles.rowValue, numFace]}>{money(revenue)}</Text>
-          </View>
-
-          <View style={styles.row}>
-            <View style={styles.rowLeft}>
-              <Ionicons name="trending-up-outline" size={16} color="#0EA5E9" />
-              <Text style={styles.rowLabel}>COGS</Text>
-            </View>
-            <Text style={[styles.rowValue, numFace]}>{money(cogs)}</Text>
-          </View>
-
-          {/* ✅ Put Total Assets back */}
-          <View style={styles.row}>
-            <View style={styles.rowLeft}>
-              <Ionicons name="layers-outline" size={16} color="#0EA5E9" />
-              <Text style={styles.rowLabel}>Total Assets (Cash + A/R + Inventory)</Text>
-            </View>
-            <Text style={[styles.rowValue, numFace]}>{money(totalAssets)}</Text>
-          </View>
-        </View>
-
-
-          {/* Sections */}
+          {/* Cash & Receivables */}
           <Card>
             <CardHeader title="Cash & Receivables" />
             <Row icon="cash-outline" label="Cash" value={cash} valueColor={cash >= 0 ? OK : BAD} />
             <Row icon="card-outline" label="Deymaha Ka Maqan (A/R)" value={ar} valueColor={ar >= 0 ? OK : BAD} />
           </Card>
 
+          {/* Liabilities */}
           <Card>
             <CardHeader title="Liabilities" />
             <Row icon="document-text-outline" label="Deymaha Kugu Maqan (A/P)" value={ap} valueColor={ap >= 0 ? BAD : OK} />
           </Card>
 
+          {/* NEW: Petrol Fuusto Shorts (report-only) */}
           <Card>
-            <CardHeader title="Income, COGS & Inventory (USD View)" />
-            <Row icon="add-circle-outline" label="Revenue" value={revenue} valueColor={revenue >= 0 ? OK : BAD} />
-            <Row icon="trending-up-outline" label="COGS" value={cogs} valueColor={cogs > 0 ? BAD : OK} />
-            <Row icon="cube-outline" label="Inventory (Remaining)" value={inventory} />
+            <CardHeader title="Petrol Fuusto Shorts (USD View)" />
+            <Row icon="alert-circle-outline" label="Shorts (10L per fuusto at cost)" value={petrolShortsUsd} valueColor={petrolShortsUsd > 0 ? BAD : TEXT} />
           </Card>
         </View>
       </ScrollView>
@@ -537,6 +543,7 @@ export default function TenantAccountsStatement() {
               <Text style={styles.sheetTitle}>Degso Statement</Text>
               {busyShot ? (
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  {/* keep this a small, neutral spinner */}
                   <ActivityIndicator size="small" />
                   <Text style={styles.sheetHint}>Preparing image…</Text>
                 </View>
@@ -690,6 +697,7 @@ const styles = StyleSheet.create({
   },
   rowLeft: { flexDirection: 'row', alignItems: 'center', flex: 1 },
   rowLabel: { marginLeft: 10, fontSize: 12, color: '#374151' },
+  rowSubLabel: { marginTop: 2, fontSize: 9, color: '#6B7280' }, // tiny child under COGS
   rowValue: { fontSize: 12, fontWeight: '700', color: '#111827' },
 
   /* Overview tag */

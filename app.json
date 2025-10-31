@@ -2,23 +2,16 @@
   "expo": {
     "name": "Diiwaan",
     "slug": "Diiwaan",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "scheme": "diiwaan",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
-
-    /* ❌ Remove this root flag; use build-properties instead
-    "newArchEnabled": false,
-    */
-
     "icon": "./assets/images/android/play_store_512.png",
-
     "splash": {
       "image": "./assets/images/android/splash_logo.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
-
     "updates": {
       "enabled": true,
       "checkAutomatically": "ON_LOAD",
@@ -26,22 +19,19 @@
       "url": "https://u.expo.dev/1263b1c9-8188-4018-b059-e5f84795b9b5"
     },
     "runtimeVersion": { "policy": "sdkVersion" },
-
     "ios": {
       "bundleIdentifier": "com.luneksa.diiwaan",
       "supportsTablet": true,
       "icon": "./assets/images/android/play_store_512.png",
-
-      /* ✅ Nice to have: explicit Photo Library strings */
+      "buildNumber": "3",
       "infoPlist": {
         "NSPhotoLibraryUsageDescription": "We save statement screenshots to your photo library.",
         "NSPhotoLibraryAddUsageDescription": "We save statement screenshots to your photo library."
       }
     },
-
     "android": {
       "package": "com.luneksa.diiwaan",
-      "versionCode": 8,
+      "versionCode": 203,
       "icon": "./assets/images/android/ic_launcher.png",
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/android/ic_launcher_foreground.png",
@@ -55,49 +45,21 @@
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
-
-      /* ✅ Permissions: 
-         - READ_MEDIA_IMAGES for Android 13+
-         - WRITE_EXTERNAL_STORAGE for Android 12 and below (MediaStore write)
-      */
-      "permissions": ["READ_MEDIA_IMAGES", "WRITE_EXTERNAL_STORAGE"]
+      "permissions": ["READ_MEDIA_IMAGES"]
     },
-
-    "androidNavigationBar": {
-      "backgroundColor": "#ffffff",
-      "barStyle": "light-content"
-    },
-
+    "androidNavigationBar": { "backgroundColor": "#ffffff", "barStyle": "light-content" },
     "web": { "bundler": "metro", "output": "static" },
-
     "plugins": [
       "expo-router",
       "expo-secure-store",
       "expo-updates",
       "expo-font",
-
-      /* ✅ Compile the native MediaLibrary module */
       "expo-media-library",
-
-      /* ✅ Turn on New Architecture in a supported way */
-      [
-        "expo-build-properties",
-        {
-          "android": { "newArchEnabled": true },
-          "ios": { "newArchEnabled": true }
-        }
-      ]
+      ["expo-build-properties", { "android": { "newArchEnabled": true }, "ios": { "newArchEnabled": true } }]
     ],
-
     "assetBundlePatterns": ["**/*"],
-
     "experiments": { "typedRoutes": true },
-
-    "extra": {
-      "router": {},
-      "eas": { "projectId": "1263b1c9-8188-4018-b059-e5f84795b9b5" }
-    },
-
+    "extra": { "router": {}, "eas": { "projectId": "1263b1c9-8188-4018-b059-e5f84795b9b5" } },
     "owner": "luneksa"
   }
 }

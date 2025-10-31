@@ -36,7 +36,7 @@ const FUUSTO_DEFAULT_L = 240;
 const CAAG_L = 20;
 
 const fuustoCap = (oilType?: string) =>
-  (oilType || '').toLowerCase() === 'petrol' ? 230 : FUUSTO_DEFAULT_L;
+  (oilType || '').toLowerCase() === 'petrol' ? 240 : FUUSTO_DEFAULT_L;
 
 
 type OilSellOption = {
@@ -164,11 +164,10 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
   const { token } = useAuth();
   const { show: showToast, ToastView } = useToast();
 
-  // long bottom sheet geometry
   const insets = useSafeAreaInsets();
   const bottomSafe = insets.bottom || 0;
   const SCREEN_H = Dimensions.get('window').height;
-  const SHEET_H = Math.round(SCREEN_H * 0.92);
+  const SHEET_H = Math.round(SCREEN_H * 0.96); // larger, closer to top
   const slideY = useRef(new Animated.Value(SHEET_H)).current;
 
   useEffect(() => {
@@ -204,19 +203,18 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
   }, [oilQuery, options]);
 
   const allocLiters = useMemo(() => {
-  const v = parseFloat((allocAmt || '').replace(',', '.'));
-  if (!Number.isFinite(v)) return 0;
-  if (unit === 'liters') return v;
-  if (unit === 'fuusto') return v * fuustoCap(selected?.oil_type);
-  return v * CAAG_L;
-}, [allocAmt, unit, selected?.oil_type]);
+    const v = parseFloat((allocAmt || '').replace(',', '.'));
+    if (!Number.isFinite(v)) return 0;
+    if (unit === 'liters') return v;
+    if (unit === 'fuusto') return v * fuustoCap(selected?.oil_type);
+    return v * CAAG_L;
+  }, [allocAmt, unit, selected?.oil_type]);
 
   const availableInUnit = useMemo(() => {
   if (!selected) return 0;
-  const L = Number(selected.in_stock_l || 0);
-  if (unit === 'liters') return L;
-  if (unit === 'fuusto') return Math.floor(L / fuustoCap(selected.oil_type));
-  return Math.floor(L / CAAG_L);
+  if (unit === 'liters') return Number(selected.in_stock_l || 0);
+  if (unit === 'fuusto') return Math.floor(Number(selected.in_stock_fuusto || 0));
+  return Math.floor(Number(selected.in_stock_caag || 0));
 }, [selected, unit]);
 
 
@@ -295,8 +293,8 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
 
         <Animated.View style={[styles.sheetWrapAbs, { height: SHEET_H, transform: [{ translateY: slideY }] }]}>
           <KeyboardAvoidingView
-            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-            keyboardVerticalOffset={Platform.OS === 'ios' ? 18 : 0}
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+            keyboardVerticalOffset={Platform.OS === 'ios' ? 40 : 0} // lift a bit on iOS; Android resizes height
             style={{ flex: 1 }}
           >
             <View style={[styles.sheetCard, { paddingBottom: Math.max(18, bottomSafe) }]}>
@@ -310,13 +308,12 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
                 </TouchableOpacity>
               </View>
 
-              {/* Content (added paddingTop for space under header) */}
+              {/* Content */}
               <ScrollView
                 keyboardShouldPersistTaps="handled"
                 contentContainerStyle={{ paddingTop: 16, paddingBottom: 24 }}
                 showsVerticalScrollIndicator={false}
               >
-                {/* FIRST FIELD gets extra top margin */}
                 <PickerField
                   label="Oil lot"
                   value={selected ? `${(selected.oil_type || '').toUpperCase()} • ${selected.truck_plate || '—'}` : undefined}
@@ -327,29 +324,8 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
                   style={{ marginTop: 14 }}
                 />
 
-                {selected && (
-                  <View style={styles.infoCard}>
-                    <View style={styles.stockChip}>
-                    <Text style={styles.stockChipLabel}>Liters</Text>
-                    <Text style={styles.stockChipValue}>{Number(selected.in_stock_l || 0).toFixed(2)} L</Text>
-                  </View>
-                  <View style={styles.stockChip}>
-                    <Text style={styles.stockChipLabel}>Fuusto</Text>
-                    <Text style={styles.stockChipValue}>
-                      {Math.floor(Number(selected.in_stock_l || 0) / fuustoCap(selected.oil_type))} fuusto
-                    </Text>
-                  </View>
-                  <View style={styles.stockChip}>
-                    <Text style={styles.stockChipLabel}>Caag</Text>
-                    <Text style={styles.stockChipValue}>
-                      {Math.floor(Number(selected.in_stock_l || 0) / CAAG_L)} caag
-                    </Text>
-                  </View>
+                {/* Removed unit-type stock chips as requested */}
 
-                  </View>
-                )}
-
-                {/* Row with BIGGER GAP so fields don't crowd */}
                 <View style={{ flexDirection: 'row', gap: 16, marginBottom: 20 }}>
                   <FloatingInput
                     label="Wakaalad name"
@@ -374,7 +350,6 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
                   value={allocAmt}
                   onChangeText={(t) => setAllocAmt(toDecimal(t))}
                   keyboardType="decimal-pad"
-                  placeholder={unit === 'fuusto' ? '' : unit === 'caag' ? '' : ''}
                 />
 
                 {selected && allocLiters > 0 && exceeds && (
@@ -405,90 +380,98 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
         </Animated.View>
       </Modal>
 
-      {/* Oil Lot Popup */}
+      {/* Oil Lot Popup - Centered */}
       <Modal visible={oilPickerOpen} transparent animationType="fade" onRequestClose={() => setOilPickerOpen(false)}>
         <TouchableWithoutFeedback onPress={() => setOilPickerOpen(false)}>
           <View style={styles.backdrop} />
         </TouchableWithoutFeedback>
-        <View style={styles.popupCard}>
-          <View style={styles.popupHeader}>
-            <Text style={styles.popupTitle}>Select Oil lot</Text>
-            <TouchableOpacity onPress={() => setOilPickerOpen(false)}>
-              <Feather name="x" size={18} color={COLOR_TEXT} />
-            </TouchableOpacity>
-          </View>
 
-          <View style={{ paddingHorizontal: 12, paddingBottom: 10 }}>
-            <TextInput
-              placeholder="Search oil or plate…"
-              placeholderTextColor={COLOR_PLACEHOLDER}
-              style={[styles.inputBase, styles.inputPadded, styles.popupSearch]}
-              value={oilQuery}
-              onChangeText={setOilQuery}
-            />
-          </View>
+        <View style={styles.popupCenterWrap} pointerEvents="box-none">
+          <View style={styles.popupCard}>
+            <View style={styles.popupHeader}>
+              <Text style={styles.popupTitle}>Select Oil lot</Text>
+              <TouchableOpacity onPress={() => setOilPickerOpen(false)}>
+                <Feather name="x" size={18} color={COLOR_TEXT} />
+              </TouchableOpacity>
+            </View>
 
-          {loadingOptions ? (
-            <View style={{ padding: 14, alignItems: 'center' }}>
-              <ActivityIndicator />
+            <View style={{ paddingHorizontal: 12, paddingBottom: 10, marginTop: 8 }}>
+              <TextInput
+                placeholder="Search oil or plate…"
+                placeholderTextColor={COLOR_PLACEHOLDER}
+                style={[styles.inputBase, styles.inputPadded, styles.popupSearch]}
+                value={oilQuery}
+                onChangeText={setOilQuery}
+              />
             </View>
-          ) : filteredOptions.length === 0 ? (
-            <View style={{ padding: 14 }}>
-              <Text style={{ color: COLOR_SUB, fontSize: 12 }}>No matching lots.</Text>
-            </View>
-          ) : (
-            <ScrollView style={{ maxHeight: 420 }}>
-              {filteredOptions.map((o) => (
-                <TouchableOpacity
-                  key={o.id}
-                  style={styles.optionRowSm}
-                  onPress={() => {
-                    setSelectedId(o.id);
-                    setOilPickerOpen(false);
-                  }}
-                  activeOpacity={0.9}
-                >
-                  <Text style={styles.pickerMain}>{(o.oil_type || '').toUpperCase()} • {o.truck_plate || '—'}</Text>
-                  <Text style={styles.pickerSub}>Stock: {Number(o.in_stock_l || 0).toFixed(2)} L</Text>
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-          )}
+
+            {loadingOptions ? (
+              <View style={{ padding: 14, alignItems: 'center' }}>
+                <ActivityIndicator />
+              </View>
+            ) : filteredOptions.length === 0 ? (
+              <View style={{ padding: 14 }}>
+                <Text style={{ color: COLOR_SUB, fontSize: 12 }}>No matching lots.</Text>
+              </View>
+            ) : (
+              <ScrollView style={styles.popupScroll}>
+                {filteredOptions.map((o) => (
+                  <TouchableOpacity
+                    key={o.id}
+                    style={styles.optionRowSm}
+                    onPress={() => {
+                      setSelectedId(o.id);
+                      setOilPickerOpen(false);
+                    }}
+                    activeOpacity={0.9}
+                  >
+                    <Text style={styles.pickerMain}>{(o.oil_type || '').toUpperCase()} • {o.truck_plate || '—'}</Text>
+                    <Text style={styles.pickerSub}>Stock: {Number(o.in_stock_l || 0).toFixed(2)} L</Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+            )}
+          </View>
         </View>
       </Modal>
 
-      {/* Unit Popup */}
+      {/* Unit Popup - Centered */}
       <Modal visible={unitPickerOpen} transparent animationType="fade" onRequestClose={() => setUnitPickerOpen(false)}>
         <TouchableWithoutFeedback onPress={() => setUnitPickerOpen(false)}>
           <View style={styles.backdrop} />
         </TouchableWithoutFeedback>
-        <View style={styles.popupCard}>
-          <View style={styles.popupHeader}>
-            <Text style={styles.popupTitle}>Qoondo</Text>
-            <TouchableOpacity onPress={() => setUnitPickerOpen(false)}>
-              <Feather name="x" size={18} color={COLOR_TEXT} />
+
+        <View style={styles.popupCenterWrap} pointerEvents="box-none">
+          <View style={styles.popupCard}>
+            <View style={styles.popupHeader}>
+              <Text style={styles.popupTitle}>Qoondo</Text>
+              <TouchableOpacity onPress={() => setUnitPickerOpen(false)}>
+                <Feather name="x" size={18} color={COLOR_TEXT} />
+              </TouchableOpacity>
+            </View>
+
+            <View style={{ height: 6 }} />
+
+            <TouchableOpacity style={styles.optionRowSm} onPress={() => { setUnit('fuusto'); setUnitPickerOpen(false); }}>
+              <Text style={styles.pickerMain}>Fuusto (×{fuustoCap(selected?.oil_type)} L)</Text>
+              {selected ? (
+                // Fuusto available — after (use server value)
+              <Text style={styles.pickerSub}>
+                Available: {Math.floor(Number(selected.in_stock_fuusto || 0))} fuusto
+              </Text>
+              ) : null}
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.optionRowSm} onPress={() => { setUnit('caag'); setUnitPickerOpen(false); }}>
+              <Text style={styles.pickerMain}>Caag (×{CAAG_L} L)</Text>
+              {selected ? <Text style={styles.pickerSub}>Available: {Math.floor(Number(selected.in_stock_caag || 0))} caag</Text> : null}
+            </TouchableOpacity>
+
+            <TouchableOpacity style={[styles.optionRowSm, { borderBottomWidth: 0 }]} onPress={() => { setUnit('liters'); setUnitPickerOpen(false); }}>
+              <Text style={styles.pickerMain}>Litir</Text>
+              {selected ? <Text style={styles.pickerSub}>Available: {Number(selected.in_stock_l || 0).toFixed(2)} L</Text> : null}
             </TouchableOpacity>
           </View>
-
-          <TouchableOpacity style={styles.optionRowSm} onPress={() => { setUnit('fuusto'); setUnitPickerOpen(false); }}>
-          <Text style={styles.pickerMain}>Fuusto (×{fuustoCap(selected?.oil_type)} L)</Text>
-          {selected ? (
-            <Text style={styles.pickerSub}>
-              Available: {Math.floor(Number(selected.in_stock_l || 0) / fuustoCap(selected.oil_type))} fuusto
-            </Text>
-          ) : null}
-        </TouchableOpacity>
-
-
-          <TouchableOpacity style={styles.optionRowSm} onPress={() => { setUnit('caag'); setUnitPickerOpen(false); }}>
-            <Text style={styles.pickerMain}>Caag (×{CAAG_L} L)</Text>
-            {selected ? <Text style={styles.pickerSub}>Available: {Math.floor(Number(selected.in_stock_caag || 0))} caag</Text> : null}
-          </TouchableOpacity>
-
-          <TouchableOpacity style={[styles.optionRowSm, { borderBottomWidth: 0 }]} onPress={() => { setUnit('liters'); setUnitPickerOpen(false); }}>
-            <Text style={styles.pickerMain}>Litir</Text>
-            {selected ? <Text style={styles.pickerSub}>Available: {Number(selected.in_stock_l || 0).toFixed(2)} L</Text> : null}
-          </TouchableOpacity>
         </View>
       </Modal>
     </>
@@ -533,28 +516,7 @@ const styles = StyleSheet.create({
   inputText: { fontSize: 15, color: COLOR_TEXT },
   inputDisabled: { backgroundColor: '#F3F4F6' },
 
-  infoCard: {
-    marginTop: -2,
-    marginBottom: 20,
-    padding: 12,
-    borderRadius: 12,
-    backgroundColor: '#F9FAFB',
-    borderWidth: 1.4,
-    borderColor: DARK_BORDER,
-  },
-  infoRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
-  infoText: { fontSize: 12, color: COLOR_TEXT, fontWeight: '800' },
-  stockChip: {
-    flex: 1,
-    borderRadius: 10,
-    borderWidth: 1.2,
-    borderColor: DARK_BORDER,
-    backgroundColor: '#FFFFFF',
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-  },
-  stockChipLabel: { fontSize: 10, color: COLOR_SUB, fontWeight: '800', marginBottom: 4 },
-  stockChipValue: { fontSize: 12, color: COLOR_TEXT, fontWeight: '900' },
+  // (infoCard removed)
 
   inlineWarning: {
     marginTop: -2,
@@ -586,11 +548,24 @@ const styles = StyleSheet.create({
   },
   submitText: { color: 'white', fontSize: 15, fontWeight: '800' },
 
+  // Centering wrapper for popups
+  popupCenterWrap: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+  },
+
   popupCard: {
-    position: 'absolute',
-    left: 16, right: 16, top: '12%',
-    borderRadius: 16, backgroundColor: '#fff', paddingBottom: 8,
-    borderWidth: 1, borderColor: DARK_BORDER, maxHeight: '76%', overflow: 'hidden',
+    width: '92%',
+    maxWidth: 560,
+    borderRadius: 16,
+    backgroundColor: '#fff',
+    paddingBottom: 8,
+    borderWidth: 1,
+    borderColor: DARK_BORDER,
+    maxHeight: '76%',
+    overflow: 'hidden',
   },
   popupHeader: {
     paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: DARK_BORDER,
@@ -598,6 +573,7 @@ const styles = StyleSheet.create({
   },
   popupTitle: { fontWeight: '800', color: COLOR_TEXT, fontSize: 14 },
   popupSearch: { borderRadius: 10, borderWidth: 1.2, borderColor: DARK_BORDER, backgroundColor: '#FFFFFF' },
+  popupScroll: { maxHeight: 420 },
 
   optionRowSm: { paddingHorizontal: 12, paddingVertical: 12, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: COLOR_DIVIDER },
   pickerMain: { fontSize: 13.5, fontWeight: '700', color: COLOR_TEXT },

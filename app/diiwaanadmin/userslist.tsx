@@ -61,6 +61,22 @@ type SuperAdminUsersResponse = {
   };
 };
 
+/* Purge endpoint response (matches what we added on backend) */
+type PurgeDryRunItem = { table: string; count: number };
+type PurgeDryRunResponse = {
+  dry_run?: boolean;
+  user_id: number;
+  will_delete_user_rows?: number;
+  will_delete_dependents?: PurgeDryRunItem[];
+  note?: string;
+};
+type PurgeExecuteResponse = {
+  message: string;
+  user_id: number;
+  deleted_dependents: PurgeDryRunItem[];
+  deleted_user_rows: number;
+};
+
 /* ============================ Theme ============================ */
 const BRAND_BLUE = '#0B2447';
 const BRAND_BLUE_2 = '#19376D';
@@ -96,7 +112,15 @@ export default function DiiwaanUsersList() {
 
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<SuperAdminUser | null>(null);
-  const [acting, setActing] = useState(false);
+
+  const [acting, setActing] = useState(false);           // single user manage/activate/deactivate/delete
+  const [purging, setPurging] = useState(false);         // single user purge
+  const [bulkPurging, setBulkPurging] = useState(false); // bulk purge in progress
+
+  // Multi-select state
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+
   const [loggingOut, setLoggingOut] = useState(false);
 
   const authHeader = useMemo(() => (token ? { Authorization: `Bearer ${token}` } : {}), [token]);
@@ -159,7 +183,6 @@ export default function DiiwaanUsersList() {
     });
   }, [data, search]);
 
-
   const manage = async (userId: number, action: 'activate' | 'deactivate' | 'delete') => {
     setActing(true);
     try {
@@ -177,6 +200,149 @@ export default function DiiwaanUsersList() {
     }
   };
 
+  /* ============================ PURGE (single) ============================ */
+  const dryRunPurge = async (userId: number) => {
+    const res = await api.post<PurgeDryRunResponse>(
+      '/diiwaan/superadmin/users/purge',
+      { user_id: userId, dry_run: true },
+      { headers: authHeader }
+    );
+    return res.data;
+  };
+
+  const execPurge = async (userId: number) => {
+    const res = await api.post<PurgeExecuteResponse>(
+      '/diiwaan/superadmin/users/purge',
+      { user_id: userId, dry_run: false },
+      { headers: authHeader }
+    );
+    return res.data;
+  };
+
+  const confirmAndPurgeSingle = async (userToPurge: SuperAdminUser) => {
+    setPurging(true);
+    try {
+      const dry = await dryRunPurge(userToPurge.id);
+      const depCount = (dry.will_delete_dependents || []).reduce((s, r) => s + (r.count || 0), 0);
+      const total = (dry.will_delete_user_rows || 0) + depCount;
+
+      Alert.alert(
+        'Purge user?',
+        `This will permanently delete ${userToPurge.username || 'the user'} and ${depCount} related row(s) across ${
+          (dry.will_delete_dependents || []).filter(x => x.count > 0).length
+        } table(s). Total rows (including user): ${total}.\n\nThis action cannot be undone.`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Purge',
+            style: 'destructive',
+            onPress: async () => {
+              try {
+                await execPurge(userToPurge.id);
+                await fetchAll();
+                setSelected((prev) => (prev && prev.id === userToPurge.id ? null : prev));
+                Alert.alert('Purged', 'User and related data were permanently deleted.');
+              } catch (e: any) {
+                Alert.alert('Purge failed', e?.response?.data?.detail || 'Unable to purge user.');
+              }
+            },
+          },
+        ]
+      );
+    } catch (e: any) {
+      Alert.alert('Dry run failed', e?.response?.data?.detail || 'Unable to analyze purge impact.');
+    } finally {
+      setPurging(false);
+    }
+  };
+
+  /* ============================ BULK SELECTION + PURGE ============================ */
+  const toggleSelectMode = (on?: boolean) => {
+    if (typeof on === 'boolean') {
+      setSelectionMode(on);
+      if (!on) setSelectedIds(new Set());
+      return;
+    }
+    setSelectionMode((v) => {
+      const next = !v;
+      if (!next) setSelectedIds(new Set());
+      return next;
+    });
+  };
+
+  const toggleSelectId = (id: number) => {
+    setSelectedIds((prev) => {
+      const s = new Set(prev);
+      if (s.has(id)) s.delete(id);
+      else s.add(id);
+      return s;
+    });
+  };
+
+  const selectAllVisible = () => {
+    const s = new Set<number>();
+    filtered.forEach((u) => s.add(u.id));
+    setSelectedIds(s);
+  };
+
+  const clearSelection = () => setSelectedIds(new Set());
+
+  const bulkPurge = async () => {
+    if (selectedIds.size === 0) return;
+
+    setBulkPurging(true);
+    try {
+      // Run dry-runs to estimate totals
+      let totalUsers = 0;
+      let totalUserRows = 0;
+      let totalDependents = 0;
+
+      for (const id of selectedIds) {
+        try {
+          const dry = await dryRunPurge(id);
+          totalUsers += 1;
+          totalUserRows += dry.will_delete_user_rows || 0;
+          totalDependents += (dry.will_delete_dependents || []).reduce((s, r) => s + (r.count || 0), 0);
+        } catch (e: any) {
+          setBulkPurging(false);
+          Alert.alert('Dry run failed', e?.response?.data?.detail || `Unable to analyze user ${id}.`);
+          return;
+        }
+      }
+
+      const totalRows = totalUserRows + totalDependents;
+
+      Alert.alert(
+        'Bulk purge?',
+        `You are about to permanently purge ${totalUsers} user(s).\nEstimated total rows to delete: ${totalRows}.\n\nThis cannot be undone.`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Purge selected',
+            style: 'destructive',
+            onPress: async () => {
+              // Execute purges sequentially
+              try {
+                for (const id of selectedIds) {
+                  await execPurge(id);
+                }
+                await fetchAll();
+                toggleSelectMode(false);
+                Alert.alert('Done', 'Selected users were purged.');
+              } catch (e: any) {
+                Alert.alert('Purge failed', e?.response?.data?.detail || 'One of the purges failed.');
+              } finally {
+                setBulkPurging(false);
+              }
+            },
+          },
+        ]
+      );
+    } catch {
+      setBulkPurging(false);
+      Alert.alert('Bulk purge failed', 'Unexpected error during dry-run.');
+    }
+  };
 
   const handleLogout = () => {
     Alert.alert('Log out', 'Are you sure you want to log out?', [
@@ -221,7 +387,6 @@ export default function DiiwaanUsersList() {
     />
   );
 
-
   if (!isSuperAdmin) {
     return (
       <SafeAreaView style={[styles.screen, { paddingTop: insets.top }]}>
@@ -245,20 +410,31 @@ export default function DiiwaanUsersList() {
         <View style={styles.headerRow}>
           <Text style={styles.headerTitle}>Users • Super Admin</Text>
 
-          <TouchableOpacity
-            onPress={handleLogout}
-            style={styles.logoutBtn}
-            accessibilityLabel="Log out"
-          >
-            {loggingOut ? (
-              <ActivityIndicator size="small" color="#fff" />
-            ) : (
-              <>
-                <Feather name="log-out" size={16} color="#fff" />
-                <Text style={styles.logoutTxt}>Logout</Text>
-              </>
-            )}
-          </TouchableOpacity>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+            {/* Toggle selection mode */}
+            <TouchableOpacity
+              onPress={() => toggleSelectMode()}
+              style={styles.headerIconBtn}
+              accessibilityLabel={selectionMode ? 'Exit selection' : 'Select multiple'}
+            >
+              <Feather name={selectionMode ? 'x-square' : 'check-square'} size={16} color="#fff" />
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              onPress={handleLogout}
+              style={styles.logoutBtn}
+              accessibilityLabel="Log out"
+            >
+              {loggingOut ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <>
+                  <Feather name="log-out" size={16} color="#fff" />
+                  <Text style={styles.logoutTxt}>Logout</Text>
+                </>
+              )}
+            </TouchableOpacity>
+          </View>
         </View>
       </LinearGradient>
 
@@ -304,6 +480,40 @@ export default function DiiwaanUsersList() {
             </TouchableOpacity>
           </View>
 
+          {/* SELECTION TOOLBAR */}
+          {selectionMode && (
+            <View style={styles.selectionBar}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                <Feather name="layers" size={14} color="#fff" />
+                <Text style={styles.selectionBarText}>{selectedIds.size} selected</Text>
+              </View>
+              <View style={{ flexDirection: 'row', gap: 8 }}>
+                <TouchableOpacity style={styles.selectionBtn} onPress={selectAllVisible}>
+                  <Feather name="select-all" size={14} color="#fff" />
+                  <Text style={styles.selectionBtnTxt}>Select all</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.selectionBtn} onPress={clearSelection}>
+                  <Feather name="x" size={14} color="#fff" />
+                  <Text style={styles.selectionBtnTxt}>Clear</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.selectionBtn, { backgroundColor: '#DC2626' }]}
+                  onPress={bulkPurge}
+                  disabled={bulkPurging || selectedIds.size === 0}
+                >
+                  {bulkPurging ? (
+                    <ActivityIndicator size="small" color="#fff" />
+                  ) : (
+                    <>
+                      <Feather name="x-octagon" size={14} color="#fff" />
+                      <Text style={styles.selectionBtnTxt}>Purge selected</Text>
+                    </>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
+
           {/* LIST */}
           <FlatList
             data={filtered}
@@ -315,32 +525,53 @@ export default function DiiwaanUsersList() {
                 <Text style={{ color: MUTED, fontSize: 12 }}>No users found.</Text>
               </View>
             }
-            renderItem={({ item }) => (
-              <TouchableOpacity
-                activeOpacity={0.85}
-                onPress={() => setSelected(item)}
-                style={styles.userRow}
-              >
-                <View style={{ flex: 1 }}>
-                  <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                    <OnlineDot on={item.is_online} />
-                    <Text style={styles.userName} numberOfLines={1}>
-                      {item.username || '—'}
+            renderItem={({ item }) => {
+              const isChecked = selectedIds.has(item.id);
+              return (
+                <TouchableOpacity
+                  activeOpacity={0.85}
+                  onPress={() => {
+                    if (selectionMode) {
+                      toggleSelectId(item.id);
+                    } else {
+                      setSelected(item);
+                    }
+                  }}
+                  onLongPress={() => {
+                    if (!selectionMode) {
+                      toggleSelectMode(true);
+                      toggleSelectId(item.id);
+                    }
+                  }}
+                  style={styles.userRow}
+                >
+                  {selectionMode && (
+                    <View style={styles.checkboxWrap}>
+                      <Feather name={isChecked ? 'check-square' : 'square'} size={20} color={isChecked ? ACCENT : '#9CA3AF'} />
+                    </View>
+                  )}
+
+                  <View style={{ flex: 1 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                      <OnlineDot on={item.is_online} />
+                      <Text style={styles.userName} numberOfLines={1}>
+                        {item.username || '—'}
+                      </Text>
+                    </View>
+                    <Text style={styles.userSub} numberOfLines={1}>
+                      {item.phone_number || item.email || '—'}
                     </Text>
                   </View>
-                  <Text style={styles.userSub} numberOfLines={1}>
-                    {item.phone_number || item.email || '—'}
-                  </Text>
-                </View>
 
-                <View style={{ alignItems: 'flex-end' }}>
-                  <StatusChip status={item.status} />
-                  <Text style={styles.lastSeen} numberOfLines={1}>
-                    {item.last_seen_at ? `Seen ${fmtDateTime(item.last_seen_at)}` : 'Never seen'}
-                  </Text>
-                </View>
-              </TouchableOpacity>
-            )}
+                  <View style={{ alignItems: 'flex-end' }}>
+                    <StatusChip status={item.status} />
+                    <Text style={styles.lastSeen} numberOfLines={1}>
+                      {item.last_seen_at ? `Seen ${fmtDateTime(item.last_seen_at)}` : 'Never seen'}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              );
+            }}
           />
         </>
       )}
@@ -368,7 +599,9 @@ export default function DiiwaanUsersList() {
             ]
           );
         }}
+        onPurge={() => selected && confirmAndPurgeSingle(selected)}
         acting={acting}
+        purging={purging}
       />
     </SafeAreaView>
   );
@@ -383,7 +616,9 @@ function UserDetailModal({
   onActivate,
   onDeactivate,
   onDelete,
+  onPurge,
   acting,
+  purging,
 }: {
   visible: boolean;
   onClose: () => void;
@@ -392,7 +627,9 @@ function UserDetailModal({
   onActivate: () => void;
   onDeactivate: () => void;
   onDelete: () => void;
+  onPurge: () => void;
   acting: boolean;
+  purging: boolean;
 }) {
   if (!user) return null;
 
@@ -403,7 +640,7 @@ function UserDetailModal({
         <TouchableOpacity
           style={[styles.btn, styles.btnGhost]}
           onPress={onClose}
-          disabled={acting}
+          disabled={acting || purging}
         >
           <Text style={[styles.btnGhostText]}>Close</Text>
         </TouchableOpacity>
@@ -411,7 +648,7 @@ function UserDetailModal({
         <TouchableOpacity
           style={[styles.btn, { backgroundColor: isActive ? WARN : SUCCESS, opacity: acting ? 0.6 : 1 }]}
           onPress={isActive ? onDeactivate : onActivate}
-          disabled={acting}
+          disabled={acting || purging}
         >
           {acting ? (
             <ActivityIndicator size="small" color="#fff" />
@@ -426,7 +663,7 @@ function UserDetailModal({
         <TouchableOpacity
           style={[styles.btn, { backgroundColor: DANGER, opacity: acting ? 0.6 : 1 }]}
           onPress={onDelete}
-          disabled={acting}
+          disabled={acting || purging}
         >
           {acting ? (
             <ActivityIndicator size="small" color="#fff" />
@@ -440,6 +677,25 @@ function UserDetailModal({
       </View>
     );
   };
+
+  const PurgeBar = () => (
+    <View style={[styles.actionRow, { marginTop: 8 }]}>
+      <TouchableOpacity
+        style={[styles.btn, { backgroundColor: '#B91C1C', opacity: purging ? 0.6 : 1 }]}
+        onPress={onPurge}
+        disabled={purging || acting}
+      >
+        {purging ? (
+          <ActivityIndicator size="small" color="#fff" />
+        ) : (
+          <>
+            <Feather name="x-octagon" size={16} color="#fff" />
+            <Text style={styles.btnTxt}>Purge (Delete All Data)</Text>
+          </>
+        )}
+      </TouchableOpacity>
+    </View>
+  );
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
@@ -487,24 +743,7 @@ function UserDetailModal({
 
           <View style={styles.line} />
 
-          <View style={styles.rowBetween}>
-            <Text style={styles.metaLabel}>Signup IP</Text>
-            <Text style={styles.metaValue}>{user.signup_ip || '—'}</Text>
-          </View>
-          <View style={styles.rowBetween}>
-            <Text style={styles.metaLabel}>Last IP</Text>
-            <Text style={styles.metaValue}>{user.last_ip || '—'}</Text>
-          </View>
-          <View style={styles.block}>
-            <Text style={styles.metaLabel}>User Agent</Text>
-            <Text style={[styles.metaValue, { textAlign: 'right' }]} numberOfLines={2}>
-              {user.last_user_agent || '—'}
-            </Text>
-          </View>
-
-          <View style={styles.line} />
-
-          <View className="block">
+          <View>
             <Text style={styles.metaLabel}>Location</Text>
             <Text style={[styles.metaValue, { textAlign: 'right' }]}>
               {[user.geo_city, user.geo_region, user.geo_country].filter(Boolean).join(', ') || '—'}
@@ -515,6 +754,7 @@ function UserDetailModal({
           </View>
 
           <ActionBar />
+          <PurgeBar />
         </View>
       </View>
     </Modal>
@@ -534,6 +774,14 @@ const styles = StyleSheet.create({
   },
   headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   headerTitle: { color: '#fff', fontSize: 16, fontWeight: '900' },
+
+  headerIconBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.25)',
+  },
 
   logoutBtn: {
     flexDirection: 'row',
@@ -585,6 +833,34 @@ const styles = StyleSheet.create({
   },
   searchInput: { flex: 1, color: TEXT, fontSize: 13, paddingVertical: 2 },
 
+  /* Selection toolbar */
+  selectionBar: {
+    marginHorizontal: 14,
+    marginBottom: 6,
+    backgroundColor: ACCENT,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: '#41518a',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  selectionBarText: { color: '#fff', fontSize: 12, fontWeight: '800' },
+  selectionBtn: {
+    flexDirection: 'row',
+    gap: 6,
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.25)',
+  },
+  selectionBtnTxt: { color: '#fff', fontWeight: '800', fontSize: 12 },
+
   userRow: {
     marginHorizontal: 14,
     marginTop: 8,
@@ -596,6 +872,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     flexDirection: 'row',
     gap: 10,
+  },
+  checkboxWrap: {
+    width: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   userName: { fontSize: 13, fontWeight: '800', color: TEXT },
   userSub: { fontSize: 11, color: MUTED, marginTop: 2 },

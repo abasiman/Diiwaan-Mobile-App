@@ -1,4 +1,4 @@
-// Vendor Payments Screen
+// Vendor Payments Screen (with ViewMode + infinite scroll)
 
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
@@ -8,9 +8,11 @@ import { useFocusEffect } from '@react-navigation/native';
 import dayjs from 'dayjs';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Alert, FlatList,
+  ActivityIndicator,
+  Alert,
+  FlatList,
   LayoutChangeEvent,
   Modal, Platform, StyleSheet,
   Text,
@@ -112,6 +114,7 @@ const fmtDateLocal = (iso?: string | null) => {
 const breakTxAtPlusForUI = (s: string) => s.replace(/\s*\+\s*/g, '\n+ ');
 
 const API_DATE_FMT = 'YYYY-MM-DD';
+type ViewMode = 'all' | 'base' | 'extras';
 
 export default function VendorPaymentsScreen() {
   const router = useRouter();
@@ -119,7 +122,7 @@ export default function VendorPaymentsScreen() {
   const { token } = useAuth();
 
   const [loading, setLoading] = useState(false);
-  const [refreshing, setRefreshing] = useState(false); // for pull-to-refresh
+  const [refreshing, setRefreshing] = useState(false); // pull-to-refresh
   const [items, setItems] = useState<VendorPaymentWithContext[]>([]);
   const [totals, setTotals] = useState<VendorPaymentTotals | null>(null);
 
@@ -132,57 +135,107 @@ export default function VendorPaymentsScreen() {
     endDate: dayjs().endOf('day').toDate(),
   });
 
-  // NEW: Truck plate filter
+  // View mode: All / Base (oil) / Extras
+  const [viewMode, setViewMode] = useState<ViewMode>('all');
+
+  // Truck plate filter
   const [platePickerOpen, setPlatePickerOpen] = useState(false);
   const [plateQuery, setPlateQuery] = useState('');
   const [selectedPlate, setSelectedPlate] = useState<string | null>(null);
 
+  // Pagination
+  const PAGE_SIZE = 100;
+  const [offset, setOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const fetchingRef = useRef(false);
+
   const headers = useMemo(() => (token ? { Authorization: `Bearer ${token}` } : undefined), [token]);
 
-  // ===== Data fetching with "silent refresh" support =====
-  const fetchData = useCallback(
-    async (opts?: { silent?: boolean; isRefresh?: boolean }) => {
-      const { silent = false, isRefresh = false } = opts || {};
-      try {
-        if (!silent && !isRefresh) setLoading(true);
-        if (isRefresh) setRefreshing(true);
+  // Build common params for API
+  const dateParams = useMemo(() => {
+    const start = dayjs(dateRange.startDate).startOf('day').format(API_DATE_FMT);
+    const end = dayjs(dateRange.endDate).endOf('day').format(API_DATE_FMT);
+    return {
+      order: 'created_desc' as const, // newest first
+      from_date: `${start}T00:00:00Z`,
+      to_date: `${end}T23:59:59Z`,
+    };
+  }, [dateRange]);
 
-        const start = dayjs(dateRange.startDate).startOf('day').format(API_DATE_FMT);
-        const end = dayjs(dateRange.endDate).endOf('day').format(API_DATE_FMT);
+  // ===== Fetch page helper =====
+  const fetchPage = useCallback(
+    async (pageOffset: number, opts?: { replace?: boolean; silent?: boolean }) => {
+      if (fetchingRef.current) return;
+      fetchingRef.current = true;
+      const { replace = false, silent = false } = opts || {};
+      try {
+        if (!silent && replace) setLoading(true);
+        if (!replace) setLoadingMore(true);
 
         const res = await api.get<VendorPaymentListResponse>('/diiwaanvendorpayments', {
           headers,
           params: {
-            order: 'created_desc', // newest first
-            limit: 200,
-            from_date: `${start}T00:00:00Z`,
-            to_date: `${end}T23:59:59Z`,
+            ...dateParams,
+            limit: PAGE_SIZE,
+            offset: pageOffset,
           },
         });
 
-        setItems(res?.data?.items ?? []);
+        const pageItems = res?.data?.items ?? [];
+        if (replace) {
+          setItems(pageItems);
+        } else {
+          setItems((prev) => [...prev, ...pageItems]);
+        }
         setTotals(res?.data?.totals ?? null);
+
+        // If fewer than page size, no more pages
+        setHasMore(pageItems.length === PAGE_SIZE);
+        setOffset(pageOffset + pageItems.length);
       } catch (e: any) {
         Alert.alert('Error', e?.message ?? 'Failed to load vendor payments.');
       } finally {
         setLoading(false);
-        setRefreshing(false);
+        setLoadingMore(false);
+        fetchingRef.current = false;
       }
     },
-    [headers, dateRange]
+    [headers, dateParams]
   );
 
   // Initial load + when dateRange changes
   useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+    // reset & refetch from start
+    setOffset(0);
+    setHasMore(true);
+    fetchPage(0, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fetchPage, dateParams.from_date, dateParams.to_date]);
 
-  // Always refresh on focus (no flicker)
+  // Always refresh on focus (silent)
   useFocusEffect(
     useCallback(() => {
-      fetchData({ silent: true });
-    }, [fetchData])
+      setOffset(0);
+      setHasMore(true);
+      fetchPage(0, { replace: true, silent: true });
+    }, [fetchPage])
   );
+
+  // Pull-to-refresh
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    setOffset(0);
+    setHasMore(true);
+    await fetchPage(0, { replace: true, silent: true });
+    setRefreshing(false);
+  }, [fetchPage]);
+
+  // Infinite scroll trigger
+  const onEndReached = useCallback(() => {
+    if (loadingMore || loading || !hasMore) return;
+    fetchPage(offset);
+  }, [loadingMore, loading, hasMore, fetchPage, offset]);
 
   /* ===== Plates list (unique from items) ===== */
   const allPlates = useMemo(() => {
@@ -200,40 +253,52 @@ export default function VendorPaymentsScreen() {
     return allPlates.filter((x) => x.toLowerCase().includes(q));
   }, [allPlates, plateQuery]);
 
-  /* ===== Row shaping ===== */
+  /* ===== Row shaping (classify base vs extra vs lot) ===== */
+  type RowKind = 'base' | 'extra' | 'lot';
   const rowsShaped = useMemo(() => {
     return items.map((p) => {
+      const kind: RowKind = p.extra_cost_id
+        ? 'extra'
+        : p.oil_id
+          ? 'base'
+          : 'lot';
+
       let tx = p.transaction_type || '';
-      if (!tx && !p.extra_cost_id) {
+      if (!tx && kind === 'base') {
         const oilType = p.supplier_due_context?.oil_type?.toLowerCase().trim();
-        if (oilType === 'diesel' || oilType === 'petrol') {
-          tx = `${oilType} cost`;
-        }
+        if (oilType === 'diesel' || oilType === 'petrol') tx = `${oilType} cost`;
       }
-      if (!tx) tx = '—';
+      if (!tx) tx = kind === 'base' ? 'oil cost' : '—';
 
       return {
         id: p.id,
+        kind,
         truckType: p.truck_type || '—',
         truckPlate: p.truck_plate || '—',
         datePretty: fmtDateLocal(p.payment_date),
         transactionForUI: breakTxAtPlusForUI(tx),
         amount: Number(p.amount || 0),
+        // Server already scopes amount_due correctly (base due for base rows; extra due for extra rows; lot for lot)
         balanceSnapshot: Number(p.amount_due || 0),
         rawDate: p.payment_date,
       };
     });
   }, [items]);
 
-  /* Filter (search + date already applied server-side) + plate filter + search */
+  /* Filter (plate + search + view mode) */
   const filteredRows = useMemo(() => {
     const q = search.trim().toLowerCase();
 
     return rowsShaped
       .filter((r) => {
+        // View mode
+        if (viewMode === 'base' && r.kind !== 'base') return false;
+        if (viewMode === 'extras' && r.kind !== 'extra') return false;
+
         // Plate filter
         if (selectedPlate && r.truckPlate.trim() !== selectedPlate) return false;
-        // Search filter
+
+        // Search
         if (!q) return true;
         const hay = `${r.truckType} ${r.truckPlate} ${r.transactionForUI}`.toLowerCase();
         return hay.includes(q);
@@ -242,7 +307,7 @@ export default function VendorPaymentsScreen() {
         key: `vp_${r.id}`,
         ...r,
       }));
-  }, [rowsShaped, search, selectedPlate]);
+  }, [rowsShaped, search, selectedPlate, viewMode]);
 
   const filteredTotals = useMemo(() => {
     let sumAmt = 0;
@@ -275,23 +340,37 @@ export default function VendorPaymentsScreen() {
     else if (key === 'month') setDateRange({ startDate: monthStart.toDate(), endDate: monthEnd.toDate() });
     else setDateRange({ startDate: yearStart.toDate(), endDate: yearEnd.toDate() });
     setShowFilters(false);
-    setTimeout(() => fetchData({ silent: true }), 0);
+    // reset paging and refetch silently
+    setOffset(0);
+    setHasMore(true);
+    fetchPage(0, { replace: true, silent: true });
   };
 
   const handleDateChange = (_: any, sel?: Date) => {
     const mode = showDatePicker;
     setShowDatePicker(null);
     if (!sel || !mode) return;
-    setDateRange((prev) =>
+    const nextRange =
       mode === 'start'
-        ? { ...prev, startDate: dayjs(sel).startOf('day').toDate() }
-        : { ...prev, endDate: dayjs(sel).endOf('day').toDate() }
-    );
+        ? { ...dateRange, startDate: dayjs(sel).startOf('day').toDate() }
+        : { ...dateRange, endDate: dayjs(sel).endOf('day').toDate() };
+    setDateRange(nextRange);
   };
 
   /* ========= Layout measurements ========= */
   const [headerH, setHeaderH] = useState(0);
   const onHeaderLayout = (e: LayoutChangeEvent) => setHeaderH(Math.ceil(e.nativeEvent.layout.height));
+
+  // Loading footer (infinite scroll)
+  const ListFooter = useMemo(() => {
+    if (!loadingMore) return <View style={{ height: 10 }} />;
+    return (
+      <View style={{ paddingVertical: 12, alignItems: 'center', justifyContent: 'center' }}>
+        <ActivityIndicator />
+        <Text style={{ color: COLOR_MUTED, fontSize: 11, marginTop: 6 }}>Loading more…</Text>
+      </View>
+    );
+  }, [loadingMore]);
 
   return (
     <View style={styles.page}>
@@ -314,15 +393,14 @@ export default function VendorPaymentsScreen() {
         </View>
 
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-          {/* Reload button */}
-          <TouchableOpacity onPress={() => fetchData({ isRefresh: true })} style={styles.headerFilterBtn}>
+          <TouchableOpacity onPress={onRefresh} style={styles.headerFilterBtn}>
             <Feather name="rotate-cw" size={14} color="#0B2447" />
             <Text style={styles.headerFilterTxt}>{refreshing ? 'Refreshing…' : 'Reload'}</Text>
           </TouchableOpacity>
         </View>
       </LinearGradient>
 
-      {/* Search */}
+      {/* Search + Filters Row */}
       <View style={styles.filterRow}>
         <View style={styles.searchBox}>
           <Feather name="search" size={14} color={COLOR_MUTED} />
@@ -348,16 +426,35 @@ export default function VendorPaymentsScreen() {
         </TouchableOpacity>
       </View>
 
+      {/* View Mode Chips */}
+      <View style={{ flexDirection: 'row', gap: 6, paddingHorizontal: 12, marginBottom: 6 }}>
+        {(['all', 'base', 'extras'] as ViewMode[]).map((mode) => (
+          <TouchableOpacity
+            key={mode}
+            onPress={() => setViewMode(mode)}
+            style={[styles.chip, viewMode === mode && styles.chipActive]}
+          >
+            <Text style={[styles.chipText, viewMode === mode && styles.chipTextActive]}>
+              {mode === 'all' ? 'All' : mode === 'base' ? 'Oil only' : 'Extras only'}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
       {/* Totals + Plate Picker */}
       <View style={styles.kpiRow}>
         <View style={styles.kpiCard}>
           {/* Left: totals stack */}
           <View style={{ flex: 1 }}>
-            <Text style={styles.kpiTitle}>Total Paid</Text>
+            <Text style={styles.kpiTitle}>
+              {viewMode === 'base' ? 'Total Paid (Oil)' : viewMode === 'extras' ? 'Total Paid (Extras)' : 'Total Paid'}
+            </Text>
             <Text style={[styles.kpiValue, { color: COLOR_GREEN }]}>{formatCurrency(filteredTotals.sumAmt)}</Text>
 
             <View style={{ marginTop: 8 }}>
-              <Text style={styles.kpiSubLabel}>Balance Due</Text>
+              <Text style={styles.kpiSubLabel}>
+                {viewMode === 'base' ? 'Base Due' : viewMode === 'extras' ? 'Extras Due' : 'Balance Due'}
+              </Text>
               <Text style={[styles.kpiDueValue]}>{formatCurrency(filteredTotals.sumBal)}</Text>
             </View>
           </View>
@@ -390,7 +487,9 @@ export default function VendorPaymentsScreen() {
           keyExtractor={(r) => r.key}
           style={{ flex: 1 }}
           refreshing={refreshing}
-          onRefresh={() => fetchData({ isRefresh: true })} // pull-to-refresh
+          onRefresh={onRefresh}
+          onEndReachedThreshold={0.3}
+          onEndReached={onEndReached}
           ListHeaderComponent={
             <View>
               {/* Table header */}
@@ -424,6 +523,7 @@ export default function VendorPaymentsScreen() {
               </View>
             );
           }}
+          ListFooterComponent={ListFooter}
           ListEmptyComponent={
             !loading ? (
               <View style={[styles.tr, { borderBottomWidth: 0 }]}>
@@ -502,7 +602,12 @@ export default function VendorPaymentsScreen() {
             <View className="filterActions" style={styles.filterActions}>
               <TouchableOpacity
                 style={styles.resetBtn}
-                onPress={() => setDateRange({ startDate: dayjs().startOf('month').toDate(), endDate: dayjs().endOf('day').toDate() })}
+                onPress={() => {
+                  const next = { startDate: dayjs().startOf('month').toDate(), endDate: dayjs().endOf('day').toDate() };
+                  setDateRange(next);
+                  setOffset(0);
+                  setHasMore(true);
+                }}
                 activeOpacity={0.9}
               >
                 <Text style={styles.resetTxt}>Reset</Text>
@@ -511,7 +616,9 @@ export default function VendorPaymentsScreen() {
                 style={styles.applyBtn}
                 onPress={() => {
                   setShowFilters(false);
-                  fetchData({ silent: true });
+                  setOffset(0);
+                  setHasMore(true);
+                  fetchPage(0, { replace: true, silent: true });
                 }}
                 activeOpacity={0.9}
               >
@@ -888,15 +995,4 @@ const styles = StyleSheet.create({
   plateItemTxt: { color: COLOR_TEXT, fontSize: 12, fontWeight: '800' },
   plateEmpty: { paddingVertical: 16, alignItems: 'center' },
   plateEmptyTxt: { color: COLOR_MUTED, fontSize: 12 },
-
-  /* Table */
-  thCell: { justifyContent: 'center', paddingVertical: 8, paddingHorizontal: 4 },
-  cell:   { justifyContent: 'center', paddingVertical: 7, paddingHorizontal: 4 },
-  th: { color: COLOR_TEXT, fontSize: 11, fontWeight: '800' },
-  td: { color: COLOR_TEXT, fontSize: 11 },
-  tdSub: { color: COLOR_MUTED, fontSize: 10, paddingTop: 1.5 },
-  txWrap: { flexShrink: 1, lineHeight: 14, includeFontPadding: false },
-  num: { textAlign: 'right' as const },
-  striped: { backgroundColor: '#FBFDFF' },
-  paid: { color: COLOR_GREEN, fontWeight: '900' },
 });

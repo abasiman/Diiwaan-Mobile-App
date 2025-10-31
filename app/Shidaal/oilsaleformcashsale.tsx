@@ -1,3 +1,5 @@
+// app/Shidaal/oilsaleformcashsale.tsx
+
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 import { Feather } from '@expo/vector-icons';
@@ -18,36 +20,45 @@ import {
   View
 } from 'react-native';
 
-import SaleCurrencyModal, { CurrencyKey } from './SaleCurrencyModal';
+import SaleCurrencyModal, { CurrencyKey } from './SaleCurrencyModalCashSale';
 
 const BORDER = '#CBD5E1';
 
 type SaleUnitType = 'liters' | 'fuusto' | 'caag';
 type SaleType = 'cashsale' | 'invoice';
 
-type OilSellOption = {
-  id: number;
+// ───────────────────────── Wakaalad Sell Option ─────────────────────────
+type WakaaladSellOption = {
+  wakaalad_id: number;
+  oil_id: number;
   oil_type: string;
+  wakaalad_name: string;
   truck_plate?: string | null;
-  sell_price_per_l?: number | null;
-  in_stock_l: number;
   currency?: string | null;
-  liter_price?: number | null;   // preview prices in lot currency
+
+  in_stock_l: number;
+  liter_price?: number | null;
   fuusto_price?: number | null;
   caag_price?: number | null;
+
+  fuusto_capacity_l?: number | null;
+  caag_capacity_l?: number | null;
 };
 
 type CreateSalePayload = {
   oil_id: number;
+  wakaalad_id: number;
   unit_type: SaleUnitType;
   unit_qty?: number;
   liters_sold?: number;
-  price_per_l?: number;           // per-L in SALE currency
+  price_per_l?: number;
   customer?: string | null;
   customer_contact?: string | null;
-  currency?: string;              // sale currency
-  fx_rate_to_usd?: number;        // only when sale currency is SOS
+  currency?: string;
+  fx_rate_to_usd?: number;
   sale_type: SaleType;
+  // NEW: send payment method to backend
+  payment_method?: 'cash' | 'bank';
 };
 
 type OilSaleRead = {
@@ -84,21 +95,24 @@ type Customer = {
   phone?: string | null;
 };
 
-const CAPACITY = { fuusto: 240, caag: 20 } as const;
+// Fallback capacities
+const DEFAULT_FUUSTO_L = 240;
+const DEFAULT_CAAG_L = 20;
 
 const DISPLAY_SYMBOL: Record<'USD' | 'SOS', string> = { USD: '$', SOS: 'Sh' };
-
-const CURRENCY_FROM_KEY: Record<CurrencyKey, 'USD' | 'SOS'> = {
-  USD: 'USD',
-  shimaal: 'SOS',
-};
-
+const CURRENCY_FROM_KEY: Record<CurrencyKey, 'USD' | 'SOS'> = { USD: 'USD', shimaal: 'SOS' };
 const SALE_TYPE: SaleType = 'cashsale';
 
 const fmtNum = (n: number, d = 2) => Number(n).toFixed(d);
 const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 const symbolFor = (cur?: string | null) =>
   (cur || 'USD').toUpperCase() === 'USD' ? DISPLAY_SYMBOL.USD : DISPLAY_SYMBOL.SOS;
+
+function capacityL(unit: SaleUnitType, opt?: WakaaladSellOption): number {
+  if (unit === 'fuusto') return (opt?.fuusto_capacity_l ?? DEFAULT_FUUSTO_L);
+  if (unit === 'caag')   return (opt?.caag_capacity_l ?? DEFAULT_CAAG_L);
+  return 1; // liter
+}
 
 /* ---------- Tiny toast ---------- */
 function useToast() {
@@ -166,7 +180,7 @@ function ValidationModal({
   );
 }
 
-/* ---------- Receipt modal ---------- */
+/* ---------- Receipt modal (Cash Sale) ---------- */
 function ReceiptModal({
   visible,
   receipt,
@@ -233,7 +247,7 @@ function ReceiptModal({
   );
 }
 
-/* ---------- Floating label input (bordered) ---------- */
+/* ---------- Floating label input ---------- */
 function FloatingInput({
   label,
   value,
@@ -290,7 +304,7 @@ function FloatingInput({
   );
 }
 
-/** Mini modal to change price (per liter / fuusto / caag). */
+/** ---------- Change Price mini modal ---------- */
 function ChangePriceMiniModal({
   visible,
   onClose,
@@ -327,7 +341,6 @@ function ChangePriceMiniModal({
     if (!valid) return;
     try {
       setBusy(true);
-
       const round = (x: number, d = 6) => Math.round(x * 10 ** d) / 10 ** d;
       const value = Number((amount || '').replace(',', '.'));
 
@@ -394,7 +407,6 @@ function ChangePriceMiniModal({
               }
               setAmount(cleaned);
             }}
-            keyboardType="decimal-pad"
             placeholder="25.00"
           />
 
@@ -427,33 +439,36 @@ export default function OilSaleCashSaleForm() {
   const { token } = useAuth();
   const { show: showToast, ToastView } = useToast();
 
-  const [options, setOptions] = useState<OilSellOption[]>([]);
+  const [options, setOptions] = useState<WakaaladSellOption[]>([]);
   const [loadingOptions, setLoadingOptions] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
-  const [selectedId, setSelectedId] = useState<number | null>(null);
-  const selected = useMemo(() => options.find((o) => o.id === selectedId) || null, [options, selectedId]);
+  const [selectedWkId, setSelectedWkId] = useState<number | null>(null);
+  const selected = useMemo(
+    () => options.find((o) => o.wakaalad_id === selectedWkId) || null,
+    [options, selectedWkId]
+  );
 
   const [unitType, setUnitType] = useState<SaleUnitType>('liters');
 
-  // floating inputs
   const [qty, setQty] = useState<string>('1');
-  const [priceDisplay, setPriceDisplay] = useState<string>(''); // per UNIT, in LOT currency
+  const [priceDisplay, setPriceDisplay] = useState<string>('');
 
-  // --- Change price mini modal state
   const [changeOpen, setChangeOpen] = useState(false);
 
-  // customer from route (optional)
   const { customer_name, customer_contact } =
     useLocalSearchParams<{ customer_name?: string; customer_contact?: string }>();
   const routeCustomerParam = typeof customer_name === 'string' ? customer_name : '';
   const [custName, setCustName] = useState<string>(routeCustomerParam || '');
-  const [custContact, setCustContact] = useState<string>(typeof customer_contact === 'string' ? customer_contact : '');
+  const [custContact, setCustContact] = useState<string>(
+    typeof customer_contact === 'string' ? customer_contact : ''
+  );
 
-  // helper route back
-  const goBack = () => router.replace('/oilsalespage');
+  const customerSegment = encodeURIComponent((custName || routeCustomerParam || '').trim());
+  const goToInvoices = () => {
+     router.replace('/oilsalespage');
+  };
 
-  // customer dropdown & paging
   const [openCustomer, setOpenCustomer] = useState(false);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [search, setSearch] = useState('');
@@ -511,16 +526,15 @@ export default function OilSaleCashSaleForm() {
     [token, search, limit]
   );
 
-  useEffect(() => { if (openCustomer) loadPage(true); }, [openCustomer, loadPage]);
+  useEffect(() => {
+    if (openCustomer) loadPage(true);
+  }, [openCustomer, loadPage]);
 
-  // oil & unit dropdowns
   const [openOil, setOpenOil] = useState(false);
   const [openUnit, setOpenUnit] = useState(false);
 
-  // oil local search (in-dropdown)
   const [oilQuery, setOilQuery] = useState('');
 
-  // receipt + validation + currency modal
   const [receipt, setReceipt] = useState<OilSaleRead | null>(null);
   const [receiptOpen, setReceiptOpen] = useState(false);
   const [valOpen, setValOpen] = useState(false);
@@ -529,48 +543,54 @@ export default function OilSaleCashSaleForm() {
   const [finalOpen, setFinalOpen] = useState(false);
   const [finalCurrencyKey, setFinalCurrencyKey] = useState<CurrencyKey>('USD');
   const [finalFxRate, setFinalFxRate] = useState<string>('');
+  // keep last-picked payment method (optional UX)
+  const [finalPaymentMethod, setFinalPaymentMethod] = useState<'cash' | 'bank' | null>(null);
 
-  const openValidation = (title: string, msg: string) => { setValTitle(title); setValMsg(msg); setValOpen(true); };
+  const openValidation = (title: string, msg: string) => {
+    setValTitle(title);
+    setValMsg(msg);
+    setValOpen(true);
+  };
 
-  // fetch sell options
   useEffect(() => {
     let mounted = true;
     (async () => {
       try {
         setLoadingOptions(true);
-        const res = await api.get<OilSellOption[]>('/diiwaanoil/sell-options', {
+        const res = await api.get<WakaaladSellOption[]>('/wakaalad_diiwaan/sell-options', {
           headers: { Authorization: `Bearer ${token}` },
           params: { only_available: true, order: 'created_desc' },
         });
         if (!mounted) return;
         setOptions(res.data || []);
       } catch (e: any) {
-        openValidation('Load failed', e?.response?.data?.detail || 'Failed to load oil sell options.');
+        openValidation('Load failed', e?.response?.data?.detail || 'Failed to load wakaalad sell options.');
       } finally {
         if (mounted) setLoadingOptions(false);
       }
     })();
-    return () => { mounted = false; };
+    return () => {
+      mounted = false;
+    };
   }, [token]);
 
-  function getUnitPrice(o: OilSellOption, u: SaleUnitType): number {
-    const r = (n: number, d = 6) => Math.round(n * 10 ** d) / 10 ** d;
-    if (u === 'liters') return o.liter_price != null ? r(o.liter_price, 6) : 0;
-    if (u === 'fuusto') return o.fuusto_price != null ? r(o.fuusto_price, 2) : 0;
-    if (u === 'caag') return o.caag_price != null ? r(o.caag_price, 2) : 0;
-    return 0;
-  }
-
-  // default price from selected lot (per UNIT, lot currency)
+  // price display derives from selected + unit
   useEffect(() => {
-    if (!selected) { setPriceDisplay(''); return; }
+    if (!selected) {
+      setPriceDisplay('');
+      return;
+    }
     const p = getUnitPrice(selected, unitType);
     setPriceDisplay(p > 0 ? String(p) : '');
   }, [selected, unitType]);
 
-  // default sale currency for the final modal from selected lot
+  // default sale currency based on lot currency
   useEffect(() => {
-    if (!selected) { setFinalCurrencyKey('USD'); setFinalFxRate(''); return; }
+    if (!selected) {
+      setFinalCurrencyKey('USD');
+      setFinalFxRate('');
+      return;
+    }
     const cur = (selected.currency || 'USD').toUpperCase();
     setFinalCurrencyKey(cur === 'USD' ? 'USD' : 'shimaal');
     setFinalFxRate('');
@@ -578,15 +598,39 @@ export default function OilSaleCashSaleForm() {
 
   const qtyNum = useMemo(() => Math.max(parseInt(qty || '0', 10) || 0, 0), [qty]);
 
+  // PHYSICAL liters for stock checking
   const estimatedLiters = useMemo(() => {
     if (!selected) return 0;
     if (unitType === 'liters') return qtyNum;
-    if (unitType === 'fuusto') return qtyNum * CAPACITY.fuusto;
-    if (unitType === 'caag') return qtyNum * CAPACITY.caag;
+    return qtyNum * capacityL(unitType, selected);
+  }, [selected, unitType, qtyNum]);
+
+  // BILLED liters (petrol fuusto bills 230L if cap is 240L ⇒ 10L shorts)
+  const billedLiters = useMemo(() => {
+    if (!selected) return 0;
+    if (unitType === 'liters') return qtyNum;
+    if (unitType === 'caag') return qtyNum * capacityL('caag', selected);
+    if (unitType === 'fuusto') {
+      const cap = capacityL('fuusto', selected);
+      const billedPer =
+        (selected.oil_type || '').toLowerCase() === 'petrol'
+          ? Math.max(0, cap - 10) // 230 if cap=240
+          : cap;
+      return qtyNum * billedPer;
+    }
     return 0;
   }, [selected, unitType, qtyNum]);
 
-  const unitLabel = useMemo(() => (unitType === 'liters' ? 'Liters' : unitType === 'fuusto' ? 'Fuusto' : 'Caag'), [unitType]);
+  // shorts per fuusto (only petrol)
+  const shortsPerFuusto = useMemo(() => {
+    if (!selected || unitType !== 'fuusto') return 0;
+    return (selected.oil_type || '').toLowerCase() === 'petrol' ? 10 : 0;
+  }, [selected, unitType]);
+
+  const unitLabel = useMemo(
+    () => (unitType === 'liters' ? 'Liters' : unitType === 'fuusto' ? 'Fuusto' : 'Caag'),
+    [unitType]
+  );
 
   const stockExceeded = useMemo(() => {
     if (!selected) return false;
@@ -594,17 +638,34 @@ export default function OilSaleCashSaleForm() {
     return estimatedLiters > stock + 1e-9;
   }, [selected, estimatedLiters]);
 
-  // priceDisplay is per UNIT, lot currency; convert to number
   const priceNum = useMemo(() => parseFloat((priceDisplay || '').replace(',', '.')) || 0, [priceDisplay]);
 
-  // preview total in LOT currency (unit price * qty)
+  function getUnitPrice(o: WakaaladSellOption, u: SaleUnitType): number {
+    const r = (n: number, d = 6) => Math.round(n * 10 ** d) / 10 ** d;
+    if (u === 'liters') return o.liter_price != null ? r(o.liter_price, 6) : 0;
+    if (u === 'fuusto') return o.fuusto_price != null ? r(o.fuusto_price, 2) : 0;
+    if (u === 'caag') return o.caag_price != null ? r(o.caag_price, 2) : 0;
+    return 0;
+  }
+
+  const lotCurrency = (selected?.currency || 'USD').toUpperCase() as 'USD' | 'SOS';
+  const saleCurrencyFromKey = (ck: CurrencyKey) => CURRENCY_FROM_KEY[ck];
+
+  // Canonical per-L in lot currency, derived from the displayed unit price
+  const perLInLotCurrency = useMemo(() => {
+    const r = (n: number, d = 6) => Math.round(n * 10 ** d) / 10 ** d;
+    if (!selected || priceNum <= 0) return 0;
+    if (unitType === 'liters') return r(priceNum, 6);
+    return r(priceNum / capacityL(unitType, selected), 6);
+  }, [selected, unitType, priceNum]);
+
+  // Line total must use BILLED liters (e.g., petrol fuusto bills 230L × per-L price)
   const lineTotal = useMemo(() => {
     if (!selected) return 0;
-    if (qtyNum <= 0 || priceNum <= 0) return 0;
-    return priceNum * qtyNum;
-  }, [selected, qtyNum, priceNum]);
+    if (billedLiters <= 0 || perLInLotCurrency <= 0) return 0;
+    return billedLiters * perLInLotCurrency;
+  }, [selected, billedLiters, perLInLotCurrency]);
 
-  // submit enabled?
   const canSubmit = useMemo(() => {
     if (!selected) return false;
     if (estimatedLiters <= 0) return false;
@@ -612,19 +673,6 @@ export default function OilSaleCashSaleForm() {
     if (priceNum <= 0) return false;
     return true;
   }, [selected, estimatedLiters, priceNum]);
-
-  // --- Currency helpers ---
-  const lotCurrency = (selected?.currency || 'USD').toUpperCase() as 'USD' | 'SOS';
-  const saleCurrencyFromKey = (ck: CurrencyKey) => CURRENCY_FROM_KEY[ck];
-
-  const perLInLotCurrency = useMemo(() => {
-    const r = (n: number, d = 6) => Math.round(n * 10 ** d) / 10 ** d;
-    if (!selected || priceNum <= 0) return 0;
-    if (unitType === 'liters') return r(priceNum, 6);
-    if (unitType === 'fuusto') return r(priceNum / CAPACITY.fuusto, 6);
-    if (unitType === 'caag')   return r(priceNum / CAPACITY.caag, 6);
-    return 0;
-  }, [selected, unitType, priceNum]);
 
   function convertPerL(lotCur: 'USD' | 'SOS', saleCur: 'USD' | 'SOS', perL_lot: number, fx: number | undefined) {
     if (perL_lot <= 0) return 0;
@@ -636,12 +684,23 @@ export default function OilSaleCashSaleForm() {
   }
 
   const handleSubmit = () => {
-    if (!selected) { openValidation('Select oil', 'Please choose an oil lot to sell from.'); return; }
-    if (!canSubmit) { openValidation('Invalid amount', 'Please check quantity, price, and stock limits.'); return; }
+    if (!selected) {
+      openValidation('Select wakaalad', 'Please choose a wakaalad to sell from.');
+      return;
+    }
+    if (!canSubmit) {
+      openValidation('Invalid amount', 'Please check quantity, price, and stock limits.');
+      return;
+    }
     setFinalOpen(true);
   };
 
-  const confirmAndCreate = async (pickedCurrencyKey: CurrencyKey, fxRateStr: string) => {
+  // ---------- Create with payment_method ----------
+  const confirmAndCreate = async (
+    pickedCurrencyKey: CurrencyKey,
+    fxRateStr: string,
+    paymentMethodServer: 'cash' | 'bank'
+  ) => {
     if (!selected) return;
 
     const saleCurrency = saleCurrencyFromKey(pickedCurrencyKey);
@@ -656,16 +715,18 @@ export default function OilSaleCashSaleForm() {
     }
 
     const payload: CreateSalePayload = {
-      oil_id: selected.id,
+      oil_id: selected.oil_id,
+      wakaalad_id: selected.wakaalad_id,
       unit_type: unitType,
       sale_type: SALE_TYPE,
       liters_sold: unitType === 'liters' ? qtyNum : undefined,
       unit_qty: unitType === 'fuusto' || unitType === 'caag' ? qtyNum : undefined,
-      price_per_l: perL_sale || undefined,
+      price_per_l: perL_sale || undefined, // server canonical per-L
       customer: custName?.trim() ? custName.trim() : undefined,
       customer_contact: custContact?.trim() ? custContact.trim() : undefined,
       currency: saleCurrency,
       fx_rate_to_usd: saleCurrency === 'USD' ? undefined : fxValid,
+      payment_method: paymentMethodServer,
     };
 
     setSubmitting(true);
@@ -677,75 +738,68 @@ export default function OilSaleCashSaleForm() {
       setReceiptOpen(true);
       showToast('Cash sale created successfully');
       setFinalOpen(false);
+      setFinalPaymentMethod(paymentMethodServer);
+      goToInvoices();
     } catch (e: any) {
       setFinalOpen(false);
-      openValidation('Create failed', String(e?.response?.data?.detail || e?.message || 'Unable to create cash sale.'));
+      openValidation(
+        'Create failed',
+        String(e?.response?.data?.detail || e?.message || 'Unable to create cash sale.')
+      );
     } finally {
       setSubmitting(false);
     }
   };
 
-  const previewConvertedTotal = useMemo(() => {
-    if (!selected || lineTotal <= 0) return null;
-    const saleCur = saleCurrencyFromKey(finalCurrencyKey);
-    if (saleCur === lotCurrency) return null;
+  // USD preview for summary (derived from lineTotal)
+  const amountUSD: number | null = useMemo(() => {
+    if (lineTotal <= 0) return null;
+    if (lotCurrency === 'USD') return lineTotal;
     const fx = parseFloat((finalFxRate || '').replace(',', '.'));
-    if (!(fx > 0)) return null;
-    const converted =
-      lotCurrency === 'USD' && saleCur === 'SOS' ? lineTotal * fx :
-      lotCurrency === 'SOS' && saleCur === 'USD' ? lineTotal / fx :
-      null;
-    if (converted == null) return null;
-    return { amount: converted, saleCur };
-  }, [selected, lineTotal, lotCurrency, finalCurrencyKey, finalFxRate]);
+    if (fx > 0) return lineTotal / fx; // convert SOS -> USD
+    return null;
+  }, [lineTotal, lotCurrency, finalFxRate]);
 
-  // Update options array after price change (per-liter canonical)
-  const applyPriceIntoOption = useCallback(
-    (oilId: number, update: { basis: SaleUnitType; value: number }) => {
-      setOptions(prev =>
-        prev.map(o => {
-          if (o.id !== oilId) return o;
-          const next = { ...o };
-          if (update.basis === 'liters') {
-            next.sell_price_per_l = update.value;
-            next.liter_price = update.value;
-            next.fuusto_price = update.value * CAPACITY.fuusto;
-            next.caag_price   = update.value * CAPACITY.caag;
-          } else if (update.basis === 'fuusto') {
-            next.fuusto_price = update.value;
-          } else {
-            next.caag_price = update.value;
-          }
-          return next;
-        })
-      );
-    },
-    []
-  );
+  // Update options after price change
+  const applyPriceIntoOption = useCallback((oilId: number, update: { basis: SaleUnitType; value: number }) => {
+    setOptions((prev) =>
+      prev.map((o) => {
+        if (o.oil_id !== oilId) return o;
+        const next: WakaaladSellOption = { ...o };
+        if (update.basis === 'liters') {
+          next.liter_price  = update.value;
+          next.fuusto_price = update.value * capacityL('fuusto', next);
+          next.caag_price   = update.value * capacityL('caag', next);
+        } else if (update.basis === 'fuusto') {
+          next.fuusto_price = update.value;
+        } else {
+          next.caag_price = update.value;
+        }
+        return next;
+      })
+    );
+  }, []);
 
-  // Oil dropdown filtering (only show type & plate)
   const filteredOptions = useMemo(() => {
     const q = oilQuery.trim().toLowerCase();
     if (!q) return options;
-    return options.filter(o =>
-      (o.oil_type || '').toLowerCase().includes(q) ||
-      (o.truck_plate || '').toLowerCase().includes(q)
-    );
+    return options.filter((o) => {
+      const a = (o.oil_type || '').toLowerCase();
+      const b = (o.wakaalad_name || '').toLowerCase();
+      const c = (o.truck_plate || '').toLowerCase();
+      return a.includes(q) || b.includes(q) || c.includes(q);
+    });
   }, [options, oilQuery]);
 
-  // determine if selected lot has price for current unit
-  const hasUnitPrice = useMemo(() => {
-    if (!selected) return false;
-    const p = getUnitPrice(selected, unitType);
-    return p > 0;
-  }, [selected, unitType]);
+  const currentUnitPrice = useMemo(() => (selected ? getUnitPrice(selected, unitType) : 0), [selected, unitType]);
+  const hasUnitPrice = currentUnitPrice > 0;
 
   return (
     <View style={{ flex: 1, backgroundColor: '#FFFFFF' }}>
       {/* Header */}
       <View style={styles.pageHeader}>
         <TouchableOpacity
-          onPress={goBack}
+          onPress={goToInvoices}
           hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
           style={styles.backBtn}
         >
@@ -779,7 +833,7 @@ export default function OilSaleCashSaleForm() {
         >
           {/* Customer */}
           <View style={styles.inlineRow}>
-            <View style={styles.inlineField}>
+            <View className="inlineField" style={styles.inlineField}>
               <InlineDropdown
                 label="Customer name"
                 value={custName || undefined}
@@ -821,7 +875,9 @@ export default function OilSaleCashSaleForm() {
                   ))}
 
                   {loading ? (
-                    <View style={{ padding: 10, alignItems: 'center' }}><ActivityIndicator /></View>
+                    <View style={{ padding: 10, alignItems: 'center' }}>
+                      <ActivityIndicator />
+                    </View>
                   ) : hasMore ? (
                     <TouchableOpacity
                       style={{ padding: 10, alignItems: 'center' }}
@@ -835,7 +891,7 @@ export default function OilSaleCashSaleForm() {
               </InlineDropdown>
             </View>
 
-            {/* Contact field */}
+            {/* Contact */}
             <View style={styles.inlineField}>
               <Text style={styles.label}>Contact</Text>
               <TextInput
@@ -849,12 +905,16 @@ export default function OilSaleCashSaleForm() {
             </View>
           </View>
 
-          {/* Oil type + Sell type */}
+          {/* Wakaalad + Sell type */}
           <View style={styles.inlineRow}>
             <View style={[styles.inlineField, { zIndex: 50 }]}>
               <InlineDropdown
-                label="Oil type"
-                value={selected ? `${selected.oil_type.toUpperCase()} • ${selected.truck_plate || '—'}` : undefined}
+                label="Wakaalad (Oil • Name)"
+                value={
+                  selected
+                    ? `${selected.oil_type.toUpperCase()} • ${selected.wakaalad_name} `
+                    : undefined
+                }
                 open={openOil}
                 onToggle={() => {
                   setOpenOil((s) => !s);
@@ -863,10 +923,9 @@ export default function OilSaleCashSaleForm() {
                 columnLabel
                 z={50}
               >
-                {/* Inline search for oil */}
                 <View style={{ padding: 10, borderBottomWidth: 1, borderBottomColor: '#E5E7EB' }}>
                   <TextInput
-                    placeholder="Search oil or plate…"
+                    placeholder="Search oil, wakaalad, or plate…"
                     placeholderTextColor="#64748B"
                     style={[styles.input, { height: 42 }]}
                     value={oilQuery}
@@ -875,17 +934,21 @@ export default function OilSaleCashSaleForm() {
                 </View>
 
                 {loadingOptions ? (
-                  <View style={{ padding: 10, alignItems: 'center' }}><ActivityIndicator /></View>
+                  <View style={{ padding: 10, alignItems: 'center' }}>
+                    <ActivityIndicator />
+                  </View>
                 ) : filteredOptions.length === 0 ? (
-                  <View style={{ padding: 12 }}><Text style={{ color: '#6B7280', fontSize: 12 }}>No matching lots.</Text></View>
+                  <View style={{ padding: 12 }}>
+                    <Text style={{ color: '#6B7280', fontSize: 12 }}>No matching wakaalad.</Text>
+                  </View>
                 ) : (
                   <ScrollView style={{ maxHeight: 260 }}>
                     {filteredOptions.map((o) => (
                       <TouchableOpacity
-                        key={o.id}
+                        key={`${o.wakaalad_id}`}
                         style={styles.optionRowSm}
                         onPress={() => {
-                          setSelectedId(o.id);
+                          setSelectedWkId(o.wakaalad_id);
                           const p = getUnitPrice(o, unitType);
                           setPriceDisplay(p > 0 ? String(p) : '');
                           setOpenOil(false);
@@ -893,7 +956,10 @@ export default function OilSaleCashSaleForm() {
                         activeOpacity={0.9}
                       >
                         <Text style={styles.pickerMain}>
-                          {o.oil_type.toUpperCase()} • {o.truck_plate || '—'}
+                          {o.oil_type.toUpperCase()} • {o.wakaalad_name} • {o.truck_plate || '—'}
+                        </Text>
+                        <Text style={styles.pickerSub}>
+                          Stock: {fmtNum(o.in_stock_l, 2)} L
                         </Text>
                       </TouchableOpacity>
                     ))}
@@ -904,7 +970,7 @@ export default function OilSaleCashSaleForm() {
 
             <View style={[styles.inlineField, { zIndex: 30 }]}>
               <InlineDropdown
-                label="Sell type"
+                label="dooro fuusto/caag/liters"
                 columnLabel
                 value={unitType === 'liters' ? 'Liters' : unitType === 'fuusto' ? 'Fuusto' : 'Caag'}
                 open={openUnit}
@@ -936,7 +1002,7 @@ export default function OilSaleCashSaleForm() {
             </View>
           </View>
 
-          {/* Qty + Price per unit (floating label) + Change/Add Price button */}
+          {/* Qty + Price */}
           <View style={styles.inlineRow}>
             <View style={styles.inlineField}>
               <FloatingInput
@@ -951,7 +1017,7 @@ export default function OilSaleCashSaleForm() {
 
             <View style={styles.inlineField}>
               <FloatingInput
-                label={`Price (per ${unitLabel})`}
+                label={`Price (per ${unitLabel}${unitType === 'fuusto' && (selected?.oil_type||'').toLowerCase()==='petrol' ? ' • 240L physical' : ''})`}
                 value={priceDisplay}
                 editable={false}
                 placeholder="—"
@@ -963,7 +1029,7 @@ export default function OilSaleCashSaleForm() {
                     activeOpacity={0.9}
                     style={[styles.addonBtn, !selected && { opacity: 0.5 }]}
                   >
-                    <Feather name="edit-3" size={12} color="#0B1221" />
+                    <Feather name={hasUnitPrice ? 'edit-3' : 'plus'} size={12} color="#0B1221" />
                     <Text style={styles.addonBtnText}>{hasUnitPrice ? 'Change' : 'Add price'}</Text>
                   </TouchableOpacity>
                 }
@@ -975,42 +1041,39 @@ export default function OilSaleCashSaleForm() {
           {selected && (
             <View style={styles.summaryCard}>
               <View style={styles.summaryRow}>
-                <Text style={styles.summaryKey}>Oil</Text>
+                <Text style={styles.summaryKey}>Wakaalad</Text>
                 <Text style={styles.summaryVal}>
-                  {selected.oil_type.toUpperCase()} • {selected.truck_plate || '—'}
+                  {selected.oil_type.toUpperCase()} • {selected.wakaalad_name} • {selected.truck_plate || '—'}
                 </Text>
               </View>
 
               <View style={styles.divider} />
+
               <View style={styles.summaryRow}>
-                <Text style={[styles.summaryKey, { fontWeight: '800' }]}>Total</Text>
-                <Text style={[styles.summaryVal, { fontWeight: '800' }]}>
-                  {symbolFor(selected?.currency)} {fmtNum(lineTotal, 2)}
+                <Text style={[styles.summaryKey, styles.bold]}>Amount (USD)</Text>
+                <Text style={[styles.summaryVal, styles.bold]}>
+                  {amountUSD != null ? `$${fmtNum(amountUSD, 2)}` : '—'}
                 </Text>
               </View>
 
-              {/* Converted preview (cosmetic) */}
-              {(() => {
-                const saleCur = finalCurrencyKey === 'USD' ? 'USD' : 'SOS';
-                if (!selected || lineTotal <= 0) return null;
-                if ((selected.currency || 'USD').toUpperCase() === saleCur) return null;
-                const fx = parseFloat((finalFxRate || '').replace(',', '.'));
-                if (!(fx > 0)) return null;
-                const converted =
-                  selected.currency?.toUpperCase() === 'USD' && saleCur === 'SOS'
-                    ? lineTotal * fx
-                    : selected.currency?.toUpperCase() === 'SOS' && saleCur === 'USD'
-                    ? lineTotal / fx
-                    : null;
-                if (converted == null) return null;
-                return (
-                  <View style={{ marginTop: 2 }}>
-                    <Text style={{ color: '#6B7280', fontSize: 11 }}>
-                      ≈ {(saleCur === 'USD' ? DISPLAY_SYMBOL.USD : DISPLAY_SYMBOL.SOS)} {fmtNum(converted, 2)} (with your rate)
-                    </Text>
-                  </View>
-                );
-              })()}
+              <View style={{ marginTop: 4 }}>
+                <Text style={{ color: '#64748B', fontSize: 10 }}>
+                  Base total: {symbolFor(selected?.currency)} {fmtNum(lineTotal, 2)}
+                </Text>
+                {lotCurrency !== 'USD' && amountUSD == null ? (
+                  <Text style={styles.tinyHint}>
+                    Enter USD rate at checkout to preview dollars.
+                  </Text>
+                ) : null}
+              </View>
+
+              {/* Shorts notice for PETROL fuusto */}
+              {unitType === 'fuusto' && shortsPerFuusto > 0 && (
+                <Text style={{ color: '#64748B', fontSize: 10, marginTop: 6 }}>
+                  Petrol fuusto: {capacityL('fuusto', selected)} L physical • <Text style={{fontWeight:'800'}}>230 L billed</Text> • {shortsPerFuusto} L shorts / fuusto
+                  {qtyNum > 0 ? `  (for ${qtyNum} fuusto → ${qtyNum * shortsPerFuusto} L total shorts)` : ''}
+                </Text>
+              )}
             </View>
           )}
 
@@ -1048,7 +1111,7 @@ export default function OilSaleCashSaleForm() {
       {/* Receipt Modal */}
       <ReceiptModal visible={receiptOpen} receipt={receipt} onClose={() => setReceiptOpen(false)} />
 
-      {/* Final currency/rate modal (position is controlled inside that component) */}
+      {/* Final currency/rate + payment method */}
       <SaleCurrencyModal
         visible={finalOpen}
         defaultFxRate={finalFxRate}
@@ -1057,32 +1120,32 @@ export default function OilSaleCashSaleForm() {
         unitType={unitType}
         baseCurrency={(selected?.currency || 'USD').toUpperCase() === 'USD' ? 'USD' : 'SOS'}
         onClose={() => setFinalOpen(false)}
-        onConfirm={(ck, fx) => {
+        onConfirm={(ck, fx, paymentMethod) => {
           setFinalCurrencyKey(ck);
           setFinalFxRate(fx);
-          confirmAndCreate(ck, fx);
+          setFinalPaymentMethod(paymentMethod);
+          confirmAndCreate(ck, fx, paymentMethod);
         }}
       />
 
-      {/* Change price mini modal */}
+      {/* Change price */}
       {selected && (
         <ChangePriceMiniModal
           visible={changeOpen}
           onClose={() => setChangeOpen(false)}
-          oilId={selected.id}
+          oilId={selected.oil_id}
           authToken={token || undefined}
           initialBasis={unitType}
           initialAmount={priceDisplay || ''}
           onSaved={({ basis, value }) => {
-            applyPriceIntoOption(selected.id, { basis, value });
+            applyPriceIntoOption(selected.oil_id, { basis, value });
 
-            // refresh currently viewed unit’s displayed price
             let fresh = value;
             if (basis !== unitType) {
               if (basis === 'liters') {
-                fresh = unitType === 'liters' ? value
-                      : unitType === 'fuusto' ? value * CAPACITY.fuusto
-                      :                         value * CAPACITY.caag;
+                fresh = unitType === 'liters'
+                  ? value
+                  : value * capacityL(unitType, selected);
                 setPriceDisplay(String(fresh));
               } else if (basis === unitType) {
                 setPriceDisplay(String(value));
@@ -1127,7 +1190,9 @@ function InlineDropdown({
         <TouchableOpacity style={styles.selectBtn} onPress={onToggle} activeOpacity={0.9}>
           {!columnLabel && <Text style={styles.selectLabel}>{label}</Text>}
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-            <Text style={styles.selectValue} numberOfLines={1}>{value || 'Select'}</Text>
+            <Text style={styles.selectValue} numberOfLines={1}>
+              {value || 'Select'}
+            </Text>
             <Feather name={open ? 'chevron-up' : 'chevron-down'} size={16} color="#0B1221" />
           </View>
         </TouchableOpacity>
@@ -1161,6 +1226,7 @@ const styles = StyleSheet.create({
   },
 
   floatWrap: { position: 'relative' },
+
   addonWrap: {
     position: 'absolute',
     right: 6,
@@ -1169,6 +1235,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingLeft: 6,
   },
+
   addonBtn: {
     height: 30,
     paddingHorizontal: 10,
@@ -1183,18 +1250,29 @@ const styles = StyleSheet.create({
   addonBtnText: { color: '#0B1221', fontWeight: '800', fontSize: 11 },
 
   backBtn: {
-    width: 32, height: 32, borderRadius: 8, backgroundColor: '#F3F4F6',
-    alignItems: 'center', justifyContent: 'center',
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    backgroundColor: '#F3F4F6',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   headerIconWrap: {
-    width: 26, height: 26, borderRadius: 8, backgroundColor: '#F3F4F6',
-    alignItems: 'center', justifyContent: 'center',
+    width: 26,
+    height: 26,
+    borderRadius: 8,
+    backgroundColor: '#F3F4F6',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   headerTitle: { fontSize: 16, fontWeight: '800', color: '#0B1221' },
 
   badge: {
-    marginLeft: 8, paddingHorizontal: 8, paddingVertical: 4,
-    borderRadius: 8, backgroundColor: '#111827',
+    marginLeft: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    backgroundColor: '#111827',
   },
   badgeText: { color: '#fff', fontWeight: '800', fontSize: 11 },
 
@@ -1203,8 +1281,14 @@ const styles = StyleSheet.create({
 
   label: { fontSize: 11, color: '#475569', marginBottom: 4 },
   input: {
-    height: 44, borderRadius: 10, borderWidth: 1, borderColor: BORDER,
-    paddingHorizontal: 10, backgroundColor: '#fff', fontSize: 13, color: '#0B1221',
+    height: 44,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: BORDER,
+    paddingHorizontal: 10,
+    backgroundColor: '#fff',
+    fontSize: 13,
+    color: '#0B1221',
   },
   inputDisabled: { backgroundColor: '#F3F4F6' },
 
@@ -1218,29 +1302,45 @@ const styles = StyleSheet.create({
     color: '#64748B',
     zIndex: 2,
   },
-  floatLabelActive: { color: '#334155', fontWeight: '700' },
+  floatLabelActive: {
+    color: '#334155',
+    fontWeight: '700',
+  },
 
   selectBtn: {
-    height: 44, borderRadius: 10, borderWidth: 1, borderColor: BORDER,
-    paddingHorizontal: 10, backgroundColor: '#fff',
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    height: 44,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: BORDER,
+    paddingHorizontal: 10,
+    backgroundColor: '#fff',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
   },
   selectLabel: { fontSize: 11, color: '#64748B' },
   selectValue: { fontSize: 13, fontWeight: '700', color: '#0B1221' },
 
   dropdownPanel: {
-    borderWidth: 1, borderColor: BORDER, borderTopWidth: 0,
-    borderBottomLeftRadius: 10, borderBottomRightRadius: 10,
-    backgroundColor: '#fff', overflow: 'hidden', position: 'relative',
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderTopWidth: 0,
+    borderBottomLeftRadius: 10,
+    borderBottomRightRadius: 10,
+    backgroundColor: '#fff',
+    overflow: 'hidden',
+    position: 'relative',
   },
   optionRowSm: {
-    paddingHorizontal: 10, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#E5E7EB',
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#E5E7EB',
   },
 
   pickerMain: { fontSize: 13, fontWeight: '700', color: '#0B1221' },
   pickerSub: { fontSize: 11, color: '#6B7280', marginTop: 2 },
 
-  // Small inline "Change price" styles (used in FloatingInput addon)
   smallBtn: {
     height: 28,
     paddingHorizontal: 12,
@@ -1256,37 +1356,78 @@ const styles = StyleSheet.create({
   smallBtnTxt: { color: '#0B1221', fontWeight: '800', fontSize: 11 },
 
   summaryCard: {
-    marginTop: 4, marginBottom: 10, padding: 12, borderRadius: 12,
-    backgroundColor: '#F9FAFB', borderWidth: 1, borderColor: BORDER,
+    marginTop: 4,
+    marginBottom: 10,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: '#F9FAFB',
+    borderWidth: 1,
+    borderColor: BORDER,
   },
-  summaryRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 3 },
-  summaryKey: { color: '#6B7280', fontSize: 12 },
-  summaryVal: { color: '#0B1221', fontWeight: '700', fontSize: 12 },
+  summaryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 2,
+  },
+  summaryKey: { color: '#6B7280', fontSize: 11 },
+  summaryVal: { color: '#0B1221', fontWeight: '700', fontSize: 11 },
+  bold: { fontWeight: '800' },
+  tinyHint: { color: '#94A3B8', fontSize: 10, marginTop: 2 },
   divider: { height: 1, backgroundColor: '#E5E7EB', marginVertical: 8 },
 
   submitBtn: {
-    marginTop: 6, height: 46, borderRadius: 12, backgroundColor: '#0F172A',
-    alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 8,
-    shadowColor: '#0F172A', shadowOpacity: 0.16, shadowRadius: 10,
-    shadowOffset: { width: 0, height: 7 }, elevation: 8,
+    marginTop: 6,
+    height: 46,
+    borderRadius: 12,
+    backgroundColor: '#0F172A',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    shadowColor: '#0F172A',
+    shadowOpacity: 0.16,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 7 },
+    elevation: 8,
   },
   submitText: { color: '#fff', fontWeight: '800', fontSize: 14 },
 
   inlineWarning: {
-    marginTop: -2, marginBottom: 10, paddingVertical: 8, paddingHorizontal: 10,
-    borderRadius: 10, backgroundColor: '#FFFBEB', borderWidth: 1, borderColor: '#FDE68A',
-    flexDirection: 'row', alignItems: 'center', gap: 8,
+    marginTop: -2,
+    marginBottom: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: '#FFFBEB',
+    borderWidth: 1,
+    borderColor: '#FDE68A',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
   },
   inlineWarningText: { color: '#92400E', fontSize: 11, flex: 1, lineHeight: 16 },
 
-  // modal base
   modalBackdrop: {
-    flex: 1, backgroundColor: 'rgba(2,6,23,0.55)', alignItems: 'center', justifyContent: 'center', padding: 16,
+    flex: 1,
+    backgroundColor: 'rgba(2,6,23,0.55)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 16,
   },
   modalCard: {
-    width: '100%', maxWidth: 420, backgroundColor: '#FFFFFF', borderRadius: 16,
-    borderWidth: 1, borderColor: '#E5E7EB', padding: 14, shadowColor: '#000',
-    shadowOpacity: 0.15, shadowRadius: 16, shadowOffset: { width: 0, height: 8 }, elevation: 10,
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    padding: 14,
+    shadowColor: '#000',
+    shadowOpacity: 0.15,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 10,
   },
   modalHeader: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 6 },
   modalHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
@@ -1294,11 +1435,15 @@ const styles = StyleSheet.create({
   modalBigTitle: { fontWeight: '800', color: '#0B1221', fontSize: 16 },
   modalMessage: { color: '#0B1221', fontSize: 13, lineHeight: 18, marginTop: 4 },
   modalBtn: {
-    height: 44, borderRadius: 12, backgroundColor: '#0F172A', alignItems: 'center', justifyContent: 'center', marginTop: 12,
+    height: 44,
+    borderRadius: 12,
+    backgroundColor: '#0F172A',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 12,
   },
   modalBtnText: { color: '#FFFFFF', fontWeight: '800', fontSize: 14 },
 
-  // change price segment buttons
   segmentBtn: {
     flex: 1,
     height: 36,
@@ -1313,15 +1458,72 @@ const styles = StyleSheet.create({
     borderColor: '#0B1221',
     backgroundColor: '#0B1221',
   },
+
+  modalActions: {
+    marginTop: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+
+  modalActionBtn: {
+    height: 44,
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  modalCancel: {
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    backgroundColor: '#FFFFFF',
+    marginRight: 8,
+  },
+  modalCancelText: {
+    color: '#0B1221',
+    fontWeight: '800',
+    fontSize: 14,
+  },
+
+  modalSave: {
+    backgroundColor: '#0F172A',
+    shadowColor: '#0F172A',
+    shadowOpacity: 0.16,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 6,
+    marginLeft: 8,
+  },
+  modalSaveText: {
+    color: '#FFFFFF',
+    fontWeight: '800',
+    fontSize: 14,
+  },
+
   segmentText: { fontWeight: '800', color: '#0B1221', fontSize: 12 },
   segmentTextActive: { color: '#FFFFFF' },
 
-  // toast
   toast: {
-    position: 'absolute', bottom: 14, left: 14, right: 14, paddingVertical: 10, paddingHorizontal: 12,
-    backgroundColor: '#ECFDF5', borderWidth: 1, borderColor: '#D1FAE5', borderRadius: 12,
-    flexDirection: 'row', alignItems: 'center', gap: 8, shadowColor: '#000',
-    shadowOpacity: 0.1, shadowRadius: 10, shadowOffset: { width: 0, height: 6 }, elevation: 8,
+    position: 'absolute',
+    bottom: 14,
+    left: 14,
+    right: 14,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    backgroundColor: '#ECFDF5',
+    borderWidth: 1,
+    borderColor: '#D1FAE5',
+    borderRadius: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    shadowColor: '#000',
+    shadowOpacity: 0.1,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 8,
   },
   toastText: { color: '#065F46', fontWeight: '700', fontSize: 12 },
 });

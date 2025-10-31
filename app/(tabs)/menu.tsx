@@ -60,7 +60,6 @@ export default function Menu() {
     {
       key: "oil-purchases",
       title: "Oil Purchases",
-     
       icon: <MaterialIcons name="shopping-cart" size={20} color={COLORS.amber} />,
       tint: COLORS.amber,
       path: "/TrackVendorBills/vendorbills",
@@ -69,7 +68,6 @@ export default function Menu() {
     {
       key: "oil-sales",
       title: "Oil Sales",
-
       icon: <MaterialCommunityIcons name="gas-station" size={20} color={COLORS.blue} />,
       tint: COLORS.blue,
       path: "/oilsalespage",
@@ -78,7 +76,6 @@ export default function Menu() {
     {
       key: "supplier-payments",
       title: "Wakaalad Dashboard",
-
       icon: <MaterialIcons name="account-balance-wallet" size={20} color={COLORS.teal} />,
       tint: COLORS.teal,
       path: "/Wakaalad/wakaalad_dashboard",
@@ -87,7 +84,6 @@ export default function Menu() {
     {
       key: "financial-reports",
       title: "Financial Reports",
-
       icon: <MaterialCommunityIcons name="file-chart-outline" size={20} color={COLORS.indigo} />,
       tint: COLORS.indigo,
       path: "/tenant-accounts",
@@ -115,8 +111,7 @@ export default function Menu() {
         <View style={styles.headerRow}>
           <View style={styles.headerSide} />
           <View style={styles.headerCenter}>
-            <Text style={styles.title}>Main Menu</Text>
-            
+            <Text style={styles.title}>Menu</Text>
           </View>
           <View style={[styles.headerSide, styles.clockWrap]}>
             <MaterialCommunityIcons name="clock-outline" size={18} color="#E0E7FF" />
@@ -163,7 +158,6 @@ export default function Menu() {
 
               <View style={{ flex: 1 }}>
                 <Text style={styles.tileTitle}>{item.title}</Text>
-              
               </View>
 
               <MaterialIcons name="keyboard-arrow-right" size={22} color={item.tint} />
@@ -198,7 +192,7 @@ const styles = StyleSheet.create({
   headerRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   headerSide: { width: 98, alignItems: "flex-start", justifyContent: "center" },
   headerCenter: { flex: 1, alignItems: "center", justifyContent: "center" },
-  title: { color: "white", fontSize: 1, fontWeight: "800", letterSpacing: 0.2 },
+  title: { color: "white", fontSize: 16, fontWeight: "800", letterSpacing: 0.2 },
   subtitle: { color: "#C7D2FE", fontSize: 12, marginTop: 2, fontWeight: "600" },
   clockWrap: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 6 },
   headerTime: { color: "#E0E7FF", fontSize: 13, fontWeight: "700" },

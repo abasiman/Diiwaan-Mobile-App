@@ -31,7 +31,6 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
-import ExtraCostsSheet from '../Shidaal/extracostspage';
 import OilActionsModal from '../Shidaal/OilActionsModal';
 import OilExtraCostModal from '../Shidaal/oilExtraCostModal';
 import VendorPaymentCreateSheet from '../Shidaal/vendorpayment';
@@ -176,11 +175,9 @@ function ChildOilBadge({
         <Text style={styles.badgeType}>{label}</Text>
       </View>
       <View style={{ flexDirection: 'row', gap: 10 }}>
+    
         <Text style={styles.badgeStat}>
-          Sold: <Text style={styles.badgeStatStrong}>{formatNumber(sold)}</Text>
-        </Text>
-        <Text style={styles.badgeStat}>
-          Stock: <Text style={styles.badgeStatStrong}>{formatNumber(instock)}</Text>
+          Stock: <Text style={styles.badgeStatStrong}>{formatNumber(instock)} liters</Text>
         </Text>
       </View>
     </View>
@@ -653,10 +650,33 @@ export default function VendorBillsScreen() {
                     })()}
 
                     {/* Extras popup (single list in its own tab) */}
-                    <TouchableOpacity style={styles.headerTabBtn} onPress={() => setExtrasPopupOpen(true)}>
-                      <Feather name="layers" size={12} color="#0B2447" />
-                      <Text style={styles.headerTabTxt}>Extra Costs</Text>
-                    </TouchableOpacity>
+                    <TouchableOpacity
+                    style={styles.headerTabBtn}
+                    onPress={() => {
+                      const lotId =
+                        (selected?.child_oils?.length ?? 0) > 0 && selected?.lot_id ? selected.lot_id : null;
+                      const oilId = selected?.oil_id ?? selected?.child_oils?.[0]?.oil_id ?? null;
+
+                      if (lotId) {
+                        // use replace(...) if you prefer replacing the current screen in history
+                        // router.replace({ pathname: '/TrackVendorBills/Shidaal/extracostspage', params: { lot_id: String(lotId) } });
+                        router.push({
+                          pathname: '/Shidaal/extracostspage',
+                          params: { lot_id: String(lotId) },
+                        });
+                      } else if (oilId) {
+                        // router.replace({ pathname: '/TrackVendorBills/Shidaal/extracostspage', params: { oil_id: String(oilId) } });
+                        router.push({
+                          pathname: '/Shidaal/extracostspage',
+                          params: { oil_id: String(oilId) },
+                        });
+                      }
+                    }}
+                  >
+                    <Feather name="layers" size={12} color="#0B2447" />
+                    <Text style={styles.headerTabTxt}>Extra Costs</Text>
+                  </TouchableOpacity>
+
                   </View>
                 </View>
 
@@ -737,24 +757,7 @@ export default function VendorBillsScreen() {
         </TouchableWithoutFeedback>
       </Modal>
 
-      {/* Single Extra Costs Sheet (own tab/sheet) */}
-      <ExtraCostsSheet
-        visible={extrasPopupOpen}
-        onClose={() => setExtrasPopupOpen(false)}
-        extraCosts={selected?.extra_costs ?? []}
-        onPayExtra={(ex) => {
-          if (!selected) return;
-          openPayForExtra(selected, ex);
-          setExtrasPopupOpen(false);
-        }}
-        onAddExtra={() => {
-          const oilIdForAdd = selected?.oil_id ?? selected?.child_oils?.[0]?.oil_id ?? null;
-          if (!oilIdForAdd) return;
-          setExtrasPopupOpen(false);
-          openExtraModal(oilIdForAdd);
-        }}
-        formatCurrency={formatCurrency}
-      />
+     
 
       {/* OilActionsModal */}
       <OilActionsModal

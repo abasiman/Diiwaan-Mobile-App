@@ -1,19 +1,18 @@
-// app/(tabs)/TrackVendorBills/vendorbills.tsx
-import { AntDesign, Feather } from '@expo/vector-icons';
-import DateTimePicker from '@react-native-community/datetimepicker';
-import { useFocusEffect } from '@react-navigation/native';
-import dayjs from 'dayjs';
-import { LinearGradient } from 'expo-linear-gradient';
-import { useRouter } from 'expo-router';
-import { StatusBar } from 'expo-status-bar';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+// VendorPaymentCreateSheet.tsx
+import api from '@/services/api';
+import { Feather, FontAwesome } from '@expo/vector-icons';
+import * as Sharing from 'expo-sharing';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  AppState,
+  Alert,
+  Animated,
   Dimensions,
+  Easing,
+  KeyboardAvoidingView,
+  Linking,
   Modal,
   Platform,
-  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -22,1119 +21,755 @@ import {
   TouchableWithoutFeedback,
   View,
 } from 'react-native';
-import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { captureRef } from 'react-native-view-shot';
+import { events, EVT_VENDOR_PAYMENT_CREATED } from './eventBus';
 
-import OilActionsModal from '../Shidaal/OilActionsModal';
+type Method = 'cash' | 'custom'; // UI-only; we will ALWAYS send 'equity' to backend
+type ExtraCosts = { truckRent: number; depotCost: number; tax: number; currency: string };
+type Props = {
+  visible: boolean;
+  onClose: () => void;
+  token: string | null;
 
-import api from '@/services/api';
-import { useAuth } from '@/src/context/AuthContext';
-import OilExtraCostModal from '../Shidaal/oilExtraCostModal';
-import VendorPaymentCreateSheet from '../Shidaal/vendorpayment';
+  /** Identify the item; if this oil belongs to a lot, we’ll auto-upgrade to lot scope */
+  oilId: number;
+  /** If provided, we’ll use lot scope explicitly */
+  lotId?: number;
 
-const { width } = Dimensions.get('window');
+  /** Optional: pay a specific extra-cost row */
+  extraCostId?: number;
 
-/** -------- Oil Summary types (from oildashboard) -------- */
-type OilType = 'diesel' | 'petrol';
-type OilStatus = 'in_transit' | 'in_depot' | 'available' | 'reserved' | 'sold' | 'returned' | 'discarded';
-
-type OilTypeTotals = {
-  count: number;
-  total_instock_l: number;
-  total_sold_l: number;
+  vendorNameOverride?: string | null;
+  currentPayable?: number;
+  onCreated?: () => void;
+  companyName?: string | null;
+  companyContact?: string | null;
+  extraCosts?: ExtraCosts;
 };
 
-type DiiwaanOilRead = {
-  id: number;
-  oil_type: OilType;
-  liters: number;
-  in_stock_l: number;
-  sold_l: number;
-  available_l: number;
-  depot: boolean;
-  depot_name?: string | null;
-  truck_plate?: string | null;
-  truck_type?: string | null;
-  currency: string;
-  oil_total_cost?: number | null;
-  status: OilStatus;
-  created_at: string;
-  updated_at: string;
-};
+// ───────────────────────── DEBUG ─────────────────────────
+const DEBUG = true;
+const mkTraceId = () => `vp-${Date.now().toString(36)}-${Math.round(Math.random() * 1e6).toString(36)}`;
+const dlog = (t: string, ...a: any[]) => DEBUG && console.log(`[VendorPayment][${t}]`, ...a);
+const derror = (t: string, ...a: any[]) => DEBUG && console.error(`[VendorPayment][${t}]`, ...a);
+// ────────────────────────────────────────────────────────
 
-type SummaryResponse = {
-  totals: Record<string, OilTypeTotals>;
-  depot_lots: number;
-  items: DiiwaanOilRead[];
-};
+const ACCENT = '#576CBC';
+const BORDER = '#E5E7EB';
+const BG = '#FFFFFF';
+const TEXT = '#0B1220';
+const MUTED = '#6B7280';
+const PAPER_W = 330;
 
-/** -------- Vendor (supplier dues) types -------- */
-type ExtraCostSummary = {
-  id: number;
-  category?: string | null;
-  description?: string | null;
-  amount: number;
-  total_paid: number;
-  due: number;
-};
-
-type SupplierDueItem = {
-  supplier_name: string;
-  oil_id?: number | null;
-  oil_type?: string | null;
-  liters?: number | null;
-
-  truck_plate?: string | null;
-  truck_type?: string | null;
-
-  oil_total_landed_cost: number;
-  total_extra_cost: number;
-  total_paid: number;
-  amount_due: number;
-
-  extra_costs: ExtraCostSummary[];
-  date?: string | null;
-};
-
-type SupplierDueResponse = { items: SupplierDueItem[] };
-
-const COLOR_BG = '#FFFFFF';
-const COLOR_TEXT = '#0B1221';
-const COLOR_MUTED = '#64748B';
-const COLOR_DIV = '#E5E7EB';
-const COLOR_CARD = '#F8FAFC';
-const COLOR_ACCENT = '#0B2447';
-const COLOR_SHADOW = 'rgba(2, 6, 23, 0.06)';
-
-function formatNumber(n?: number | null, fractionDigits = 0) {
-  if (n === undefined || n === null || isNaN(Number(n))) return '—';
-  return new Intl.NumberFormat(undefined, {
-    maximumFractionDigits: fractionDigits,
-    minimumFractionDigits: 0,
-  }).format(Number(n));
-}
-function formatDateLocal(iso?: string | null) {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return '—';
-  return new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric' }).format(d);
-}
-function billKey(it: SupplierDueItem, idx: number) {
-  const parts = [
-    it.oil_id ?? 'none',
-    (it.truck_plate ?? '').trim(),
-    (it.truck_type ?? '').trim(),
-    (it.supplier_name ?? '').trim(),
-    (it.oil_type ?? '').trim(),
-    (it.date ?? '').trim(),
-  ];
-  const base = parts.join('|').replace(/\s+/g, ' ');
-  return `${base}__${idx}`;
-}
-
-export default function VendorBillsScreen() {
-  const router = useRouter();
-  const { token } = useAuth();
-  const insets = useSafeAreaInsets();
-
-  const [loading, setLoading] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
-  const [items, setItems] = useState<SupplierDueItem[]>([]);
-
-  // Oil summary for KPI & in-stock lookup
-  const [summary, setSummary] = useState<SummaryResponse | null>(null);
-  const overall = summary?.totals?.__overall__;
-
-  // Details popup
-  const [selected, setSelected] = useState<SupplierDueItem | null>(null);
-  const detailsOpen = !!selected;
-
-  // Collapsible "Extras" inside details popup
-  const [showExtras, setShowExtras] = useState(false);
-
-  // Actions (OilActionsModal)
-  const [actionsOpen, setActionsOpen] = useState(false);
-
-  // Extra cost modal
-  const [extraModalOpen, setExtraModalOpen] = useState(false);
-  const [extraOilId, setExtraOilId] = useState<number | null>(null);
-
-  // Vendor payment sheet (extra or whole-oil)
-  const [payOpen, setPayOpen] = useState(false);
-  const [payOilId, setPayOilId] = useState<number | null>(null);
-  const [payExtraId, setPayExtraId] = useState<number | null>(null);
-  const [payVendorName, setPayVendorName] = useState<string | null>(null);
-  const [payCurrentDue, setPayCurrentDue] = useState<number>(0);
-
-  // Search + Filters (client-side)
-  const [search, setSearch] = useState('');
-  const [showFilters, setShowFilters] = useState(false);
-  const [showDatePicker, setShowDatePicker] = useState<'start' | 'end' | null>(null);
-  const [dateRange, setDateRange] = useState({
-    startDate: dayjs().startOf('month').toDate(),
-    endDate: dayjs().endOf('day').toDate(),
-  });
-
-  const headers = useMemo(
-    () => (token ? { Authorization: `Bearer ${token}` } : undefined),
-    [token]
-  );
-
-  function formatCurrency(n: number | undefined | null, currency = 'USD') {
-    const v = Number(n ?? 0);
-    const formatted = new Intl.NumberFormat('en-US', {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    }).format(v);
-    if ((currency || '').toUpperCase() === 'USD') {
-      return `$${formatted}`;
+export default function VendorPaymentCreateSheet({
+  visible,
+  onClose,
+  token,
+  oilId,
+  lotId,
+  extraCostId,
+  vendorNameOverride,
+  currentPayable = 0,
+  onCreated,
+  companyName,
+  companyContact,
+  extraCosts,
+}: Props) {
+  const traceIdRef = useRef<string>(mkTraceId());
+  useEffect(() => {
+    if (visible) {
+      traceIdRef.current = mkTraceId();
+      dlog(traceIdRef.current, 'Sheet opened', { oilId, lotId, extraCostId, vendorNameOverride, currentPayable });
     }
-    return `${currency} ${formatted}`;
+  }, [visible, oilId, lotId, extraCostId, vendorNameOverride, currentPayable]);
+
+  const insets = useSafeAreaInsets();
+  const bottomSafe = insets.bottom || 0;
+  const SCREEN_H = Dimensions.get('window').height;
+  const SHEET_H = Math.round(SCREEN_H * 0.92);
+
+  const [amount, setAmount] = useState<string>('');
+  const [method, setMethod] = useState<Method>('cash'); // UI only
+  const [customMethod, setCustomMethod] = useState<string>('');
+  const [submitting, setSubmitting] = useState(false);
+
+  // vendor/oil context
+  const [vendorName, setVendorName] = useState<string>('-');
+  const [oilType, setOilType] = useState<string | null>(null);
+  const [oilLotId, setOilLotId] = useState<number | null>(null); // ← NEW: detect lot from oil
+
+  // receipt states
+  const [showReceipt, setShowReceipt] = useState(false);
+  const [receiptUri, setReceiptUri] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<Date | null>(null);
+  const [paidAmt, setPaidAmt] = useState<number>(0);
+  const [prevDue, setPrevDue] = useState<number>(currentPayable);
+  const [newDue, setNewDue] = useState<number>(currentPayable);
+
+  const [shareOpen, setShareOpen] = useState(false);
+  const [shareMsg, setShareMsg] = useState('');
+
+  const paperRef = useRef<View>(null);
+
+  const authHeader = useMemo(() => (token ? { Authorization: `Bearer ${token}` } : {}), [token]);
+
+  const fmtMoney = (n: number) =>
+    new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(n || 0);
+
+  const fmtMoneyExtra = (n: number) =>
+    new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: extraCosts?.currency || 'USD',
+      maximumFractionDigits: 2,
+    }).format(n || 0);
+
+  // slide animation
+  const slideY = useRef(new Animated.Value(SHEET_H)).current;
+  useEffect(() => {
+    if (visible) {
+      Animated.timing(slideY, { toValue: 0, duration: 260, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
+    } else {
+      slideY.setValue(SHEET_H);
+    }
+  }, [visible, SHEET_H, slideY]);
+
+  const close = () => {
+    if (submitting) return;
+    dlog(traceIdRef.current, 'Sheet closed by user');
+    onClose();
+  };
+
+  /** Resolve vendor + detect lot_id from oil if present */
+  useEffect(() => {
+    let isMounted = true;
+    (async () => {
+      if (!visible) return;
+
+      try {
+        if (oilId) {
+          dlog(traceIdRef.current, 'Fetching oil', { oilId });
+          const r = await api.get(`/diiwaanoil/${oilId}`, { headers: authHeader });
+          const data = r?.data || {};
+          if (!isMounted) return;
+
+          const prefer =
+            (vendorNameOverride && vendorNameOverride.trim()) ||
+            (data?.oil_well && String(data.oil_well).trim()) ||
+            (data?.supplier_name && String(data.supplier_name).trim()) ||
+            '-';
+
+          setVendorName(prefer);
+          setOilType(data?.oil_type ?? null);
+          setOilLotId(Number.isFinite(data?.lot_id) ? Number(data.lot_id) : null); // ← store lot
+          dlog(traceIdRef.current, 'Resolved vendor/oil', {
+            vendorName: prefer,
+            oilType: data?.oil_type ?? null,
+            oilLotId: Number.isFinite(data?.lot_id) ? Number(data.lot_id) : null,
+          });
+          return;
+        }
+
+        if (lotId) {
+          dlog(traceIdRef.current, 'Fetching lot (for vendor)', { lotId });
+          const r = await api.get(`/diiwaanoil/lot/${lotId}`, { headers: authHeader });
+          const data = r?.data || {};
+          const prefer =
+            (vendorNameOverride && vendorNameOverride.trim()) ||
+            (data?.oil_well && String(data.oil_well).trim()) ||
+            (data?.supplier_name && String(data.supplier_name).trim()) ||
+            '-';
+          if (!isMounted) return;
+          setVendorName(prefer);
+          setOilType(data?.oil_type ?? null);
+          setOilLotId(lotId); // explicit lot
+          dlog(traceIdRef.current, 'Resolved vendor from lot', { vendorName: prefer, oilType: data?.oil_type ?? null, oilLotId: lotId });
+          return;
+        }
+
+        // no oil/lot provided
+        const prefer = (vendorNameOverride && vendorNameOverride.trim()) || '-';
+        if (isMounted) {
+          setVendorName(prefer);
+          setOilType(null);
+          setOilLotId(null);
+        }
+        dlog(traceIdRef.current, 'No oil/lot; using override vendor', { vendorName: prefer });
+      } catch (e: any) {
+        const prefer = (vendorNameOverride && vendorNameOverride.trim()) || '-';
+        if (!isMounted) return;
+        setVendorName(prefer);
+        setOilType(null);
+        setOilLotId(lotId ?? null); // keep whatever hint we had
+        derror(traceIdRef.current, 'Vendor detection failed', {
+          error: e?.message,
+          server: e?.response?.data,
+          status: e?.response?.status,
+        });
+      }
+    })();
+    return () => {
+      isMounted = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, oilId, lotId, vendorNameOverride, token]);
+
+  /** Prefill amount */
+  useEffect(() => {
+    if (visible) {
+      const due = Number.isFinite(currentPayable) ? currentPayable : 0;
+      setPrevDue(due);
+      setNewDue(due);
+      setAmount(due > 0 ? (Math.round(due * 100) / 100).toFixed(2) : '');
+      setMethod('cash');
+      dlog(traceIdRef.current, 'Prefill amount', { currentPayable: due });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, currentPayable]);
+
+  // helpers
+  const sanitizeAmount = (raw: string) => {
+    let cleaned = raw.replace(/[^0-9.]/g, '');
+    const firstDot = cleaned.indexOf('.');
+    if (firstDot !== -1) {
+      const before = cleaned.slice(0, firstDot + 1);
+      const after = cleaned.slice(firstDot + 1).replace(/\./g, '');
+      cleaned = before + after;
+    }
+    cleaned = cleaned.replace(/^0+(?=\d)/, '0');
+    return cleaned;
+  };
+  const sanitizeAmountToNumber = (raw: string) => {
+    const num = parseFloat(sanitizeAmount(raw));
+    return Number.isFinite(num) ? num : 0;
+  };
+
+  const typedAmt = sanitizeAmountToNumber(amount);
+  const remainingPreview = Math.max(0, (currentPayable || 0) - typedAmt);
+  const isOverpay = typedAmt > (currentPayable || 0);
+
+  // extras (display)
+  const extraItems = useMemo(() => {
+    if (!extraCosts) return [] as Array<{ label: string; amt: number }>;
+    return [
+      { label: 'Truck rent', amt: Number(extraCosts.truckRent || 0) },
+      { label: 'Depot cost', amt: Number(extraCosts.depotCost || 0) },
+      { label: 'Tax', amt: Number(extraCosts.tax || 0) },
+    ].filter(x => x.amt > 0.0001);
+  }, [extraCosts]);
+  const extraTotal = useMemo(() => extraItems.reduce((s, x) => s + x.amt, 0), [extraItems]);
+
+  const buildShareMessage = (paid: number, remain: number) => {
+    const paidStr = fmtMoney(paid);
+    const remainStr = fmtMoney(Math.max(0, remain));
+    const core = remain > 0
+      ? `Waxaad siisay ${vendorName} ${paidStr}. Haraaga waa ${remainStr}.`
+      : `Waxaad siisay ${vendorName} ${paidStr}. Dayntii waa la bixiyay. Mahadsanid.`;
+    if (extraItems.length) {
+      const extras =
+        `\n\nExtra costs recorded (${extraCosts?.currency || 'USD'}):\n` +
+        extraItems.map(it => `• ${it.label}: ${fmtMoneyExtra(it.amt)}`).join('\n') +
+        `\nTotal extras: ${fmtMoneyExtra(extraTotal)}`;
+      return core + extras;
+    }
+    return core;
+  };
+
+  async function sendWhatsAppText(phoneRaw: string | undefined, text: string) {
+    const digits = (phoneRaw || '').replace(/[^\d]/g, '');
+    theMsg: {
+      const msg = encodeURIComponent(text || '');
+      const deepLink = `whatsapp://send?phone=${digits}&text=${msg}`;
+      const webLink = `https://wa.me/${digits}?text=${msg}`;
+      const canDeep = await Linking.canOpenURL('whatsapp://send');
+      if (canDeep) {
+        try { await Linking.openURL(deepLink); break theMsg; } catch {}
+      }
+      const canWeb = await Linking.canOpenURL(webLink);
+      if (canWeb) { try { await Linking.openURL(webLink); } catch {} }
+      else { Alert.alert('WhatsApp unavailable', 'Could not open WhatsApp on this device.'); }
+    }
+  }
+  async function sendSmsText(text: string) {
+    const msg = encodeURIComponent(text || '');
+    const url = Platform.select({ ios: `sms:&body=${msg}`, android: `sms:?body=${msg}`, default: `sms:?body=${msg}` });
+    try { const can = await Linking.canOpenURL(url!); if (can) await Linking.openURL(url!); } catch {}
   }
 
-  /** Fetch supplier dues list */
-  const fetchVendorDues = useCallback(async () => {
-    try {
-      setLoading(true);
-      const res = await api.get<SupplierDueResponse>('/diiwaanvendorpayments/supplier-dues', {
-        headers: {
-          ...(headers || {}),
-          'Cache-Control': 'no-cache',
-          Pragma: 'no-cache',
-        },
-        params: { _ts: Date.now() },
-      });
-      setItems(res?.data?.items ?? []);
-    } catch {
-      // optionally toast/log
-    } finally {
-      setLoading(false);
-    }
-  }, [headers]);
+  const capturePaper = async () => {
+    if (!paperRef.current) return null;
+    const pixelRatio = Platform.OS === 'android' ? 3 : 2;
+    const uri = await captureRef(paperRef.current, {
+      format: 'png', quality: 1, fileName: 'vendor_payment_receipt', result: 'tmpfile', pixelRatio, backgroundColor: '#FFFFFF',
+    });
+    return uri;
+  };
 
-  /** Fetch oil summary for KPI & in-stock lookup */
-  const fetchOilSummary = useCallback(async () => {
-    try {
-      const res = await api.get<SummaryResponse>('/diiwaanoil/summary', {
-        headers: { ...(headers || {}) },
-      });
-      setSummary(res.data);
-    } catch (e) {
-      // ignore UI crash
-    }
-  }, [headers]);
-
-  const fetchAll = useCallback(async () => {
-    await Promise.all([fetchVendorDues(), fetchOilSummary()]);
-  }, [fetchVendorDues, fetchOilSummary]);
-
-  // Refetch whenever screen gains focus
-  useFocusEffect(
-    useCallback(() => {
-      fetchAll();
-    }, [fetchAll])
-  );
-
-  // Refetch when app returns to foreground
   useEffect(() => {
-    const sub = AppState.addEventListener('change', (state) => {
-      if (state === 'active') fetchAll();
-    });
-    return () => sub.remove();
-  }, [fetchAll]);
+    let t: NodeJS.Timeout | null = null;
+    if (showReceipt) {
+      t = setTimeout(async () => {
+        try {
+          const uri = await capturePaper();
+          setReceiptUri(uri);
+          if (uri) {
+            setShareMsg(buildShareMessage(paidAmt, newDue));
+            setShareOpen(true);
+          }
+        } catch (e: any) {
+          derror(traceIdRef.current, 'Receipt capture failed', e?.message || e);
+        }
+      }, 180);
+    }
+    return () => { if (t) clearTimeout(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showReceipt, newDue, paidAmt, extraItems, extraTotal, extraCosts?.currency]);
 
-  const onRefresh = useCallback(async () => {
-    setRefreshing(true);
-    await fetchAll();
-    setRefreshing(false);
-  }, [fetchAll]);
+  const onSave = async () => {
+    const T0 = Date.now();
+    const trace = traceIdRef.current;
 
-  const openExtraModal = (oilId?: number | null) => {
-    if (!oilId) return;
-    setExtraOilId(oilId);
-    setExtraModalOpen(true);
+    // must have at least one target: oil, lot, or a specific extra
+    const hasTarget =
+      !!oilId ||
+      !!lotId ||
+      (typeof extraCostId === 'number');
+
+    if (!hasTarget) {
+      derror(trace, 'No target (oil/lot/extra) provided; cannot proceed');
+      return Alert.alert('Fadlan', 'Wax aan bixinno lama helin (oil, lot, ama extra).');
+    }
+
+
+    const amtNum = sanitizeAmountToNumber(amount);
+    dlog(trace, 'User clicked Save', { rawAmount: amount, parsedAmount: amtNum, currentPayable, oilId, lotId, extraCostId, oilLotId });
+
+    if (!(amtNum > 0)) {
+      derror(trace, 'Invalid amount (<= 0)');
+      return Alert.alert('Fadlan', 'Geli lacag sax ah (ka weyn 0).');
+    }
+
+    const dueNow = Math.max(0, currentPayable || 0);
+    const payAmount = dueNow > 0 ? Math.min(amtNum, dueNow) : amtNum;
+
+    if (amtNum > dueNow && dueNow > 0) {
+      dlog(trace, 'Overpayment clamped', { amtNum, dueNow, payAmount });
+      Alert.alert('Overpayment adjusted', `Waxaad gelisay ${fmtMoney(amtNum)}, balse haraaga waa ${fmtMoney(dueNow)}. Waxaanu diiwaan gelinay ${fmtMoney(payAmount)}.`);
+    }
+
+    // ── SCOPE DECISION ─────────────────────────────────────────────
+    // priority: pay specific extra → explicit lotId → auto-upgrade to lot if oil has lot → else oil
+    let scope: 'extra' | 'lot' | 'oil' = 'oil';
+    let usedLotId: number | null = null;
+
+    if (typeof extraCostId === 'number') {
+      scope = 'extra';
+    } else if (typeof lotId === 'number') {
+      scope = 'lot';
+      usedLotId = lotId;
+    } else if (typeof oilLotId === 'number' && Number.isFinite(oilLotId)) {
+      scope = 'lot';
+      usedLotId = oilLotId; // ← AUTO-UPGRADE
+    } else {
+      scope = 'oil';
+    }
+
+    dlog(trace, 'scopeDecision', { scope, usedLotId, oilId, extraCostId });
+
+    setSubmitting(true);
+    try {
+      const body: any = {
+        amount: payAmount,
+        supplier_name: vendorName,
+        payment_method: 'equity' as const,
+        note: oilType ? `Payment for ${oilType} lot (funded by owner equity)` : 'Funded by owner equity',
+      };
+
+
+      // Tell backend how to apply this payment
+      if (scope === 'extra') {
+        // Paying a specific extra: only that extra should be touched
+        body.apply_to = 'extras_only';
+      } else if (scope === 'lot') {
+        // Pay ONLY the base part of the lot; do NOT spill into extras
+        body.apply_to = 'base_only';
+      } else {
+        // Single-oil fallback: leave default behavior (or force base-only if you prefer)
+        body.apply_to = 'base_only';
+      }
+
+
+      if (scope === 'extra') {
+        body.extra_cost_id = extraCostId;
+        if (typeof lotId === 'number') body.lot_id = lotId; // optional hint; backend will resolve from extra
+      } else if (scope === 'lot') {
+        body.lot_id = usedLotId;     // ← send lot_id ONLY
+      } else {
+        body.oil_id = oilId;         // ← single-oil scope
+      }
+
+      dlog(trace, 'POST /diiwaanvendorpayments request', { url: '/diiwaanvendorpayments', headersSet: !!authHeader.Authorization, body });
+
+      const resp = await api.post('/diiwaanvendorpayments', body, { headers: authHeader });
+      dlog(trace, 'POST /diiwaanvendorpayments response', { status: resp?.status, data: resp?.data, durationMs: Date.now() - T0 });
+
+      const remain = Math.max(0, dueNow - payAmount);
+      setPaidAmt(payAmount);
+      setPrevDue(dueNow);
+      setNewDue(remain);
+      setSavedAt(new Date());
+
+      events.emit(EVT_VENDOR_PAYMENT_CREATED, undefined);
+      dlog(trace, 'Emitted EVT_VENDOR_PAYMENT_CREATED');
+
+      onCreated?.();
+
+      setAmount('');
+      setMethod('cash');
+
+      onClose();
+      setShowReceipt(true);
+    } catch (e: any) {
+      const serverDetail = e?.response?.data?.detail;
+      const status = e?.response?.status;
+      const data = e?.response?.data;
+
+      derror(trace, 'Payment creation failed', {
+        status,
+        serverDetail,
+        serverData: data,
+        requestBodySnapshot: {
+          amount: sanitizeAmountToNumber(amount),
+          oil_id: scope === 'oil' ? oilId : null,
+          lot_id: scope === 'lot' ? usedLotId : null,
+          extra_cost_id: scope === 'extra' ? extraCostId : null,
+          payment_method: 'equity',
+          supplier_name: vendorName,
+        },
+        hint: 'Lot scope should omit oil_id; extra scope must include extra_cost_id.',
+        durationMs: Date.now() - T0,
+      });
+
+      Alert.alert('Error', String(serverDetail || e?.message || 'Save failed.'));
+    } finally {
+      setSubmitting(false);
+    }
   };
-  const onExtraCreated = () => {
-    setExtraModalOpen(false);
-    setExtraOilId(null);
-    fetchAll();
+
+  const shareImage = async () => {
+    if (!receiptUri) return;
+    try {
+      await Sharing.shareAsync(receiptUri, { mimeType: 'image/png', dialogTitle: 'Send Receipt', UTI: 'public.png' });
+      dlog(traceIdRef.current, 'Shared receipt image');
+    } catch (e: any) {
+      derror(traceIdRef.current, 'Share image failed', e?.message || e);
+    }
   };
 
-  const openPayForExtra = (parent: SupplierDueItem, extra: ExtraCostSummary) => {
-    if (!parent.oil_id) return;
-    setPayOilId(parent.oil_id);
-    setPayExtraId(extra.id);
-    setPayVendorName(parent.supplier_name || null);
-    setPayCurrentDue(Number(extra.due || 0));
-    setPayOpen(true);
-  };
-  const openPayForOil = (parent: SupplierDueItem) => {
-    if (!parent.oil_id) return;
-    setPayOilId(parent.oil_id);
-    setPayExtraId(null);
-    setPayVendorName(parent.supplier_name || null);
-    setPayCurrentDue(Number(parent.amount_due || 0));
-    setPayOpen(true);
-  };
-  const onPaymentCreated = async () => {
-    await fetchAll();
-    setPayOpen(false);
-    setPayOilId(null);
-    setPayExtraId(null);
-    setPayVendorName(null);
-    setPayCurrentDue(0);
-  };
-
-  const totalDue = useMemo(
-    () => items.reduce((acc, x) => acc + (x?.amount_due ?? 0), 0),
-    [items]
-  );
-
-  /** Build a quick lookup: oil_id -> in_stock_l */
-  const oilStockMap = useMemo(() => {
-    const map: Record<number, number> = {};
-    (summary?.items || []).forEach((it) => {
-      if (typeof it.id === 'number') map[it.id] = Number(it.in_stock_l || 0);
-    });
-    return map;
-  }, [summary]);
-
-  /* ======= Derived filtered list (search + date range) ======= */
-  const filteredItems = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    const from = dayjs(dateRange.startDate).startOf('day').valueOf();
-    const to = dayjs(dateRange.endDate).endOf('day').valueOf();
-
-    return items.filter((it) => {
-      const t = it.date ? new Date(it.date).getTime() : 0;
-      const dateOK = t >= from && t <= to;
-      if (!q) return dateOK;
-
-      const hay = `${it.supplier_name ?? ''} ${it.truck_plate ?? ''} ${it.truck_type ?? ''} ${it.oil_type ?? ''}`.toLowerCase();
-      return dateOK && hay.includes(q);
-    });
-  }, [items, search, dateRange]);
-
-  /* ======= Date filter helpers ======= */
-  const todayStart = dayjs().startOf('day');
-  const todayEnd = dayjs().endOf('day');
-  const monthStart = dayjs().startOf('month');
-  const monthEnd = dayjs().endOf('month');
-  const yearStart = dayjs().startOf('year');
-  const yearEnd = dayjs().endOf('day');
-
-  const sameRange = (s: Date, e: Date, s2: dayjs.Dayjs, e2: dayjs.Dayjs) =>
-    dayjs(s).startOf('day').valueOf() === s2.startOf('day').valueOf() &&
-    dayjs(e).endOf('day').valueOf() === e2.endOf('day').valueOf();
-
-  const isTodayActive = sameRange(dateRange.startDate, dateRange.endDate, todayStart, todayEnd);
-  const isMonthActive = sameRange(dateRange.startDate, dateRange.endDate, monthStart, monthEnd);
-  const isYearActive = sameRange(dateRange.startDate, dateRange.endDate, yearStart, yearEnd);
-
-  const applyQuickRange = (key: 'today' | 'month' | 'year') => {
-    if (key === 'today') setDateRange({ startDate: todayStart.toDate(), endDate: todayEnd.toDate() });
-    else if (key === 'month') setDateRange({ startDate: monthStart.toDate(), endDate: monthEnd.toDate() });
-    else setDateRange({ startDate: yearStart.toDate(), endDate: yearEnd.toDate() });
-    setShowFilters(false);
-  };
-
-  const handleDateChange = (_: any, sel?: Date) => {
-    const which = showDatePicker;
-    setShowDatePicker(null);
-    if (!sel || !which) return;
-    setDateRange((prev) =>
-      which === 'start'
-        ? { ...prev, startDate: dayjs(sel).startOf('day').toDate() }
-        : { ...prev, endDate: dayjs(sel).endOf('day').toDate() }
-    );
-  };
-
-  const closeDetails = () => {
-    setSelected(null);
-    setShowExtras(false);
+  const closeShareAndReceipt = () => {
+    setShareOpen(false);
+    setShowReceipt(false);
+    dlog(traceIdRef.current, 'Closed share & receipt');
   };
 
   return (
-    <View style={styles.page}>
-      {/* Header (match OilDashboard sizing & style) */}
-      <SafeAreaView edges={['top']} style={{ backgroundColor: '#0B2447' }}>
-        <StatusBar style="light" translucent />
-        <LinearGradient
-          colors={['#0B2447', '#0B2447']}
-          start={{ x: 0, y: 0 }}
-          end={{ x: 1, y: 0 }}
-          style={[styles.header, { paddingTop: insets.top }]}
-        >
-          <View style={styles.headerRowTop}>
-            {/* NEW: Back arrow button */}
-            <TouchableOpacity
-              style={styles.backBtn}
-              onPress={() => router.push('/customerslist')}
-              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-              activeOpacity={0.9}
-            >
-              <Feather name="arrow-left" size={18} color="#0B2447" />
-            </TouchableOpacity>
+    <>
+      {/* Bottom Sheet */}
+      <Modal visible={visible} transparent animationType="slide" presentationStyle="overFullScreen" onRequestClose={close}>
+        <TouchableWithoutFeedback onPress={close}>
+          <View style={styles.backdrop} />
+        </TouchableWithoutFeedback>
 
-            <Text style={styles.headerTitle}>Vendor Bills</Text>
+        <Animated.View style={[styles.sheetWrap, { height: SHEET_H, transform: [{ translateY: slideY }] }]}>
+          <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={Platform.OS === 'ios' ? 18 : 0} style={{ flex: 1 }}>
+            <View style={[styles.sheetCard, { paddingBottom: Math.max(16, bottomSafe) }]}>
+              <View style={styles.sheetHandle} />
+              <Text style={styles.title}>Record Payment</Text>
 
-            {/* Dalab Cusub (same as oildashboard) */}
-            <TouchableOpacity
-              style={styles.addBtn}
-              onPress={() => router.push('/Shidaal/oilcreate')}
-              activeOpacity={0.9}
-            >
-              <Feather name="plus" size={14} color="#0B2447" />
-              <Text style={styles.addBtnText}>Dalab Cusub</Text>
-            </TouchableOpacity>
-          </View>
+              {/* Vendor & AP banner */}
+              <View style={[dueStyles.banner, { marginBottom: 8 }]}>
+                <Text style={dueStyles.left}>Vendor</Text>
+                <Text style={dueStyles.right} numberOfLines={1}>{vendorName || '-'}</Text>
+              </View>
+              <View style={dueStyles.banner}>
+                <Text style={dueStyles.left}>Amount payable</Text>
+                <Text style={dueStyles.right}>{fmtMoney(Math.max(0, currentPayable || 0))}</Text>
+              </View>
 
-          {/* Dates row under the title to preserve height & feel */}
-          <Text style={styles.headerSub}>
-            {dayjs(dateRange.startDate).format('MMM D, YYYY')} – {dayjs(dateRange.endDate).format('MMM D, YYYY')}
-          </Text>
-        </LinearGradient>
-      </SafeAreaView>
-
-      {/* KPI cards (moved from oildashboard) */}
-      <View style={styles.cardsRow}>
-        <KpiCard
-          title="In-Stock (L)"
-          value={formatNumber(overall?.total_instock_l ?? 0)}
-          icon="database"
-          iconBg="#DBEAFE"
-          iconColor="#1D4ED8"
-        />
-        <KpiCard
-          title="Sold (L)"
-          value={formatNumber(overall?.total_sold_l ?? 0)}
-          icon="trending-up"
-          iconBg="#DCFCE7"
-          iconColor="#047857"
-        />
-        <KpiCard
-          title="Depot Lots"
-          value={formatNumber(summary?.depot_lots ?? 0)}
-          icon="home"
-          iconBg="#EDE9FE"
-          iconColor="#6D28D9"
-        />
-      </View>
-
-      {/* Totals Bar */}
-      <View style={styles.totalsBar}>
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-          <View style={styles.badge}>
-            <Feather name="credit-card" size={14} color={COLOR_TEXT} />
-          </View>
-          <Text style={styles.totalLabel}>Total Supplier Due</Text>
-        </View>
-        <Text style={styles.totalValue}>{formatCurrency(totalDue)}</Text>
-      </View>
-
-      {/* Search + (Filter moved here to keep header same as oil dashboard) */}
-      <View style={styles.searchRow}>
-        <View style={styles.searchBox}>
-          <Feather name="search" size={14} color={COLOR_MUTED} />
-          <TextInput
-            style={styles.searchInput}
-            placeholder="Search supplier, truck, oil type…"
-            placeholderTextColor={COLOR_MUTED}
-            value={search}
-            onChangeText={setSearch}
-            autoCapitalize="none"
-            autoCorrect={false}
-            returnKeyType="search"
-          />
-          {!!search && (
-            <TouchableOpacity onPress={() => setSearch('')}>
-              <Feather name="x-circle" size={14} color={COLOR_MUTED} />
-            </TouchableOpacity>
-          )}
-          <TouchableOpacity onPress={() => setShowFilters(true)} style={styles.headerFilterBtnSmall}>
-            <Feather name="filter" size={14} color="#0B2447" />
-            <Text style={styles.headerFilterTxtSmall}>Filter</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      {/* List */}
-      <ScrollView
-        contentContainerStyle={styles.scrollContent}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
-        keyboardShouldPersistTaps="handled"
-        showsVerticalScrollIndicator={false}
-      >
-        {loading ? (
-          <View style={styles.loading}>
-            <ActivityIndicator />
-          </View>
-        ) : filteredItems.length === 0 ? (
-          <View style={styles.empty}>
-            <Feather name="inbox" size={22} color={COLOR_MUTED} />
-            <Text style={styles.emptyText}>No vendor bills found.</Text>
-          </View>
-        ) : (
-          filteredItems.map((it, idx) => {
-            const plateOrSupplier = it.truck_plate?.trim() || it.supplier_name || '—';
-            const titlePieces = [it.truck_type?.trim(), plateOrSupplier].filter(Boolean) as string[];
-            const title = titlePieces.join(' · ');
-            const inStockForOil = it.oil_id ? oilStockMap[it.oil_id] ?? 0 : 0;
-
-            return (
-              <TouchableOpacity
-                key={billKey(it, idx)}
-                style={styles.card}
-                activeOpacity={0.9}
-                onPress={() => {
-                  setSelected(it);
-                  setShowExtras(false);
-                }}
-              >
-                {/* LEFT */}
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.supplier}>{title}</Text>
-
-                  <View style={styles.childRow}>
-                    <View style={styles.childPill}>
-                      <Feather name="calendar" size={12} color={COLOR_TEXT} />
-                      <Text style={styles.childText}>{formatDateLocal(it.date)}</Text>
+              {/* Extra costs (display) */}
+              {extraItems.length > 0 && (
+                <View style={[dueStyles.banner, { backgroundColor: '#F8FAFF' }]}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[dueStyles.left, { marginBottom: 6 }]}>Extra costs recorded</Text>
+                    {extraItems.map((it, idx) => (
+                      <View key={idx} style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                        <Text style={[dueStyles.left, { color: '#475569' }]}>{it.label}</Text>
+                        <Text style={[dueStyles.right]}>{fmtMoneyExtra(it.amt)}</Text>
+                      </View>
+                    ))}
+                    <View style={{ borderBottomWidth: StyleSheet.hairlineWidth, borderColor: BORDER, marginVertical: 6 }} />
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                      <Text style={[dueStyles.left, { fontWeight: '900' }]}>Total extras</Text>
+                      <Text style={[dueStyles.right]}>{fmtMoneyExtra(extraTotal)}</Text>
                     </View>
-                    <View style={styles.childPill}>
-                      <Feather name="droplet" size={12} color={COLOR_TEXT} />
-                      <Text style={styles.childText}>{it.oil_type ?? '—'}</Text>
-                    </View>
-                  </View>
-                </View>
-
-                {/* RIGHT: Supplier Due + In-Stock(L) */}
-                <View style={styles.rightCol}>
-                  <Text style={styles.dueValue}>{formatCurrency(it.oil_total_landed_cost)}</Text>
-
-                  <View style={{ marginTop: 6, alignItems: 'flex-end' }}>
-                    <Text style={{ fontSize: 10, color: COLOR_MUTED, fontWeight: '700' }}>In-Stock (L)</Text>
-                    <Text style={{ fontSize: 13, color: COLOR_TEXT, fontWeight: '800' }}>
-                      {formatNumber(inStockForOil)}
+                    <Text style={{ color: '#6B7280', fontSize: 11, marginTop: 6 }}>
+                      * To pay a specific extra, use the “Extra Cost” flow.
                     </Text>
                   </View>
                 </View>
-              </TouchableOpacity>
-            );
-          })
-        )}
-      </ScrollView>
+              )}
 
-      {/* Details Popup */}
-      <Modal visible={detailsOpen} onRequestClose={closeDetails} transparent animationType="fade">
-        <TouchableWithoutFeedback onPress={closeDetails}>
-          <View style={styles.modalBackdrop}>
-            <TouchableWithoutFeedback onPress={() => {}}>
-              <View style={styles.modalCard}>
-                <View style={[styles.modalHeader, { marginBottom: 8 }]}>
-                  <Text style={styles.modalTitle}>
-                    {(selected?.truck_plate && selected.truck_plate.trim()) || selected?.supplier_name || 'Details'}
-                  </Text>
-
-                  <TouchableOpacity
-                    style={styles.actionsChip}
-                    onPress={() => setActionsOpen(true)}
-                    disabled={!selected?.oil_id}
-                  >
-                    <Feather name="settings" size={12} color="#0B2447" />
-                    <Text style={styles.actionsChipTxt}>Actions</Text>
-                  </TouchableOpacity>
-                </View>
-
-                <View style={styles.inlineGrid}>
-                  <Field label="Truck Type" value={selected?.truck_type || '—'} />
-                  <Field label="Truck Plate" value={selected?.truck_plate || '—'} />
-                  <Field label="Supplier" value={selected?.supplier_name || '—'} />
-                  <Field label="Oil Type" value={selected?.oil_type || '—'} />
-                  <Field label="Date" value={formatDateLocal(selected?.date)} />
-                  {!!selected?.liters && <Field label="Liters" value={`${Number(selected.liters)}`} />}
-                </View>
-
-                <Divider />
-
-                <View style={styles.inlineGrid}>
-                  <Field label="Oil Cost" value={formatCurrency(selected?.oil_total_landed_cost)} />
-                  <Field label="Extras" value={formatCurrency(selected?.total_extra_cost)} />
-                  <Field label="Paid" value={formatCurrency(selected?.total_paid)} />
-                  <Field
-                    label="Amount Due"
-                    value={formatCurrency(selected?.amount_due)}
-                    valueStyle={{ fontWeight: '900' }}
-                  />
-                </View>
-
-                <TouchableOpacity
-                  style={styles.extrasToggle}
-                  onPress={() => setShowExtras((s) => !s)}
-                  activeOpacity={0.85}
-                >
-                  <Text style={styles.extrasToggleTxt}>Extra Costs ({selected?.extra_costs?.length ?? 0})</Text>
-                  <Feather name={showExtras ? 'chevron-up' : 'chevron-down'} size={16} color="#0B2447" />
-                </TouchableOpacity>
-
-                {showExtras ? (
-                  selected?.extra_costs?.length ? (
-                    selected.extra_costs.map((ex) => (
-                      <View key={`ex_${selected?.oil_id ?? 'none'}_${ex.id}`} style={styles.extraRow}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.extraTitle}>{ex.category || 'Extra'}</Text>
-                          {ex.description ? (
-                            <Text style={styles.extraDesc} numberOfLines={2}>
-                              {ex.description}
-                            </Text>
-                          ) : null}
-                          <View style={{ flexDirection: 'row', gap: 8, marginTop: 8 }}>
-                            <TouchableOpacity
-                              style={[styles.payBtn, (!selected?.oil_id || ex.due <= 0) && { opacity: 0.5 }]}
-                              disabled={!selected?.oil_id || ex.due <= 0}
-                              onPress={() => {
-                                if (!selected?.oil_id) return;
-                                openPayForExtra(selected, ex);
-                                closeDetails();
-                              }}
-                            >
-                              <Feather name="dollar-sign" size={14} color="#fff" />
-                              <Text style={styles.payBtnTxt}>Pay</Text>
-                            </TouchableOpacity>
-                          </View>
-                        </View>
-
-                        <View style={{ alignItems: 'flex-end' }}>
-                          <Text style={styles.extraLine}>Amount: {formatCurrency(ex.amount)}</Text>
-                          <Text style={styles.extraLine}>Paid: {formatCurrency(ex.total_paid)}</Text>
-                          <Text style={[styles.extraLine, { fontWeight: '800' }]}>
-                            Due: {formatCurrency(ex.due)}
-                          </Text>
-                        </View>
-                      </View>
-                    ))
-                  ) : (
-                    <View style={styles.noExtras}>
-                      <Feather name="file" size={14} color={COLOR_MUTED} />
-                      <Text style={styles.noExtrasText}>No extra costs.</Text>
-                    </View>
-                  )
-                ) : null}
-
-                <View style={[styles.modalFooter, { justifyContent: 'flex-end' }]}>
-                  <View style={{ flexDirection: 'row', gap: 10 }}>
+              <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: 18 }}>
+                {/* Amount */}
+                <View style={styles.row}>
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <Text style={styles.label}>Amount to pay</Text>
                     <TouchableOpacity
-                      style={[
-                        styles.primaryBtn,
-                        (!selected?.oil_id || (selected?.amount_due ?? 0) <= 0) && { opacity: 0.5 },
-                      ]}
-                      disabled={!selected?.oil_id || (selected?.amount_due ?? 0) <= 0}
                       onPress={() => {
-                        if (!selected) return;
-                        openPayForOil(selected);
-                        closeDetails();
+                        const v = (Math.round(Math.max(0, currentPayable || 0) * 100) / 100).toFixed(2);
+                        setAmount(v);
+                        dlog(traceIdRef.current, 'Quick fill full amount', { value: v });
                       }}
+                      style={dueStyles.quickFill}
+                      activeOpacity={0.8}
                     >
-                      <Feather name="dollar-sign" size={14} color="#fff" />
-                      <Text style={styles.primaryBtnTxt}>Pay Total</Text>
-                    </TouchableOpacity>
-
-                    <TouchableOpacity
-                      style={[styles.primaryBtn, !selected?.oil_id && { opacity: 0.5 }]}
-                      disabled={!selected?.oil_id}
-                      onPress={() => {
-                        if (!selected?.oil_id) return;
-                        openExtraModal(selected.oil_id);
-                        closeDetails();
-                      }}
-                    >
-                      <Feather name="plus-circle" size={14} color="#fff" />
-                      <Text style={styles.primaryBtnTxt}>Add Extra</Text>
+                      <Feather name="zap" size={14} color="#0B2447" />
+                      <Text style={dueStyles.quickFillTxt}>Full amount</Text>
                     </TouchableOpacity>
                   </View>
+
+                  <TextInput
+                    key={visible ? 'amount-open' : 'amount-closed'}
+                    value={amount}
+                    onChangeText={(t) => { const s = sanitizeAmount(t); setAmount(s); dlog(traceIdRef.current, 'Typing amount', { raw: t, sanitized: s }); }}
+                    placeholder="0.00"
+                    placeholderTextColor="#9CA3AF"
+                    style={[styles.input, isOverpay && currentPayable > 0 ? { borderColor: '#FCA5A5', backgroundColor: '#FFF7F7' } : null]}
+                    maxLength={18}
+                  />
+                  <Text style={{ marginTop: 6, fontSize: 12, fontWeight: '700', color: isOverpay && currentPayable > 0 ? '#DC2626' : '#059669' }}>
+                    {isOverpay && currentPayable > 0
+                      ? `Over by ${fmtMoney(typedAmt - Math.max(0, currentPayable || 0))} (will be adjusted)`
+                      : `Remaining after payment: ${fmtMoney(Math.max(0, remainingPreview))}`}
+                  </Text>
                 </View>
-              </View>
-            </TouchableWithoutFeedback>
-          </View>
-        </TouchableWithoutFeedback>
+
+                {/* Method (UI note only) */}
+                <View style={styles.row}>
+                  <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+                    <TouchableOpacity
+                      activeOpacity={0.8}
+                      onPress={() => { setMethod('cash'); dlog(traceIdRef.current, 'Method selected', { method: 'cash' }); }}
+                      style={[methodPillStyles.pill, method === 'cash' ? methodPillStyles.pillActive : null]}
+                    >
+                      <Feather name="dollar-sign" size={16} color={method === 'cash' ? '#fff' : TEXT} />
+                      <Text style={[methodPillStyles.pillTxt, method === 'cash' ? { color: '#fff' } : null]}>Cash</Text>
+                    </TouchableOpacity>
+
+                    <View style={{ flex: 1 }}>
+                      <TextInput
+                        value={customMethod}
+                        onChangeText={(t) => { setCustomMethod(t); setMethod(t.trim().length > 0 ? 'custom' : 'cash'); }}
+                        placeholder="Note: Equity (owner capital)"
+                        placeholderTextColor="#9CA3AF"
+                        style={styles.input}
+                      />
+                    </View>
+                  </View>
+                </View>
+
+                {/* Actions */}
+                <View style={[styles.actions, { marginTop: 0 }]}>
+                  <TouchableOpacity style={[styles.btn, styles.btnGhost]} onPress={close} disabled={submitting}>
+                    <Text style={styles.btnGhostText}>Cancel</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[styles.btn, submitting ? { opacity: 0.6 } : null]}
+                   onPress={onSave} 
+                   disabled={
+                    submitting ||
+                    (!oilId && !lotId && typeof extraCostId !== 'number')
+                  }>
+
+                   
+                    {submitting ? <ActivityIndicator size="small" color="#fff" /> : (<><Feather name="save" size={16} color="#fff" /><Text style={styles.btnTxt}>Save</Text></>)}
+                  </TouchableOpacity>
+                </View>
+              </ScrollView>
+            </View>
+          </KeyboardAvoidingView>
+        </Animated.View>
       </Modal>
 
-      {/* OilActionsModal */}
-      <OilActionsModal
-        visible={actionsOpen}
-        onClose={() => setActionsOpen(false)}
-        oilId={selected?.oil_id ?? 0}
-        supplierName={selected?.supplier_name ?? undefined}
-        truckPlate={selected?.truck_plate ?? undefined}
-        authToken={token ?? undefined}
-        onChanged={fetchAll}
-      />
+      {/* IMAGE-ONLY Receipt */}
+      <Modal visible={showReceipt} transparent animationType="fade" onRequestClose={() => setShowReceipt(false)}>
+        <TouchableWithoutFeedback onPress={() => setShowReceipt(false)}>
+          <View style={styles.backdrop} />
+        </TouchableWithoutFeedback>
 
-      {/* Oil Extra Cost Modal */}
-      <OilExtraCostModal
-        visible={extraModalOpen}
-        onClose={() => setExtraModalOpen(false)}
-        token={token ?? null}
-        oilId={extraOilId ?? 0}
-        onCreated={onExtraCreated}
-      />
+        <View style={styles.paperCenter}>
+          <View style={styles.paperNotchLeft} />
+          <View style={styles.paperNotchRight} />
 
-      {/* Vendor Payment Sheet */}
-      <VendorPaymentCreateSheet
-        visible={payOpen}
-        onClose={() => setPayOpen(false)}
-        token={token ?? null}
-        oilId={payOilId ?? 0}
-        vendorNameOverride={payVendorName ?? undefined}
-        currentPayable={payCurrentDue}
-        extraCostId={payExtraId ?? undefined}
-        onCreated={onPaymentCreated}
-        companyName={undefined}
-        companyContact={undefined}
-      />
+          <View ref={paperRef} collapsable={false} style={styles.paper}>
+            <Text style={styles.paperCompany} numberOfLines={1}>{(companyName || 'Rasiid Bixin-sameeye').toUpperCase()}</Text>
+            {!!companyContact && <Text style={styles.paperCompanySub} numberOfLines={1}>{companyContact}</Text>}
 
-      {/* Filters Modal */}
-      <Modal visible={showFilters} transparent animationType="slide" onRequestClose={() => setShowFilters(false)}>
-        <View style={[styles.modalOverlay, { paddingBottom: 70 }]}>
-          <View style={[styles.modalContent, { marginBottom: 8 }]}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Filters</Text>
-              <TouchableOpacity onPress={() => setShowFilters(false)}>
-                <AntDesign name="close" size={18} color="#1F2937" />
-              </TouchableOpacity>
-            </View>
+            <View style={styles.dots} />
 
-            <View style={styles.filterSection}>
-              <Text style={styles.filterLabel}>Quick Ranges</Text>
-              <View style={styles.quickChips}>
-                <TouchableOpacity
-                  onPress={() => applyQuickRange('today')}
-                  style={[styles.chip, isTodayActive && styles.chipActive]}
-                >
-                  <Text style={[styles.chipText, isTodayActive && styles.chipTextActive]}>
-                    Today ({dayjs().format('ddd')})
-                  </Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  onPress={() => applyQuickRange('month')}
-                  style={[styles.chip, isMonthActive && styles.chipActive]}
-                >
-                  <Text style={[styles.chipText, isMonthActive && styles.chipTextActive]}>
-                    This Month ({dayjs().format('MMM')})
-                  </Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  onPress={() => applyQuickRange('year')}
-                  style={[styles.chip, isYearActive && styles.chipActive]}
-                >
-                  <Text style={[styles.chipText, isYearActive && styles.chipTextActive]}>
-                    This Year ({dayjs().format('YYYY')})
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            </View>
+            <Text style={styles.paperTitle}>Vendor Payment Receipt</Text>
+            <Text style={styles.paperMeta}>{savedAt ? savedAt.toLocaleString() : new Date().toLocaleString()}</Text>
 
-            <View style={styles.filterSection}>
-              <Text style={styles.filterLabel}>Date Range</Text>
-              <View style={styles.dateRangeContainer}>
-                <TouchableOpacity style={styles.dateBtn} onPress={() => setShowDatePicker('start')}>
-                  <Text style={styles.dateBtnText}>{dayjs(dateRange.startDate).format('MMM D, YYYY')}</Text>
-                  <Feather name="calendar" size={14} color="#0B2447" />
-                </TouchableOpacity>
-                <Text style={styles.rangeSep}>to</Text>
-                <TouchableOpacity style={styles.dateBtn} onPress={() => setShowDatePicker('end')}>
-                  <Text style={styles.dateBtnText}>{dayjs(dateRange.endDate).format('MMM D, YYYY')}</Text>
-                  <Feather name="calendar" size={14} color="#0B2447" />
-                </TouchableOpacity>
-              </View>
-              {showDatePicker && (
-                <DateTimePicker
-                  value={showDatePicker === 'start' ? dateRange.startDate : dateRange.endDate}
-                  mode="date"
-                  display={Platform.OS === 'ios' ? 'spinner' : 'default'}
-                  onChange={handleDateChange}
-                />
-              )}
-            </View>
+            <View style={styles.dots} />
 
-            <View style={styles.filterActions}>
-              <TouchableOpacity
-                style={styles.resetBtn}
-                onPress={() =>
-                  setDateRange({
-                    startDate: dayjs().startOf('month').toDate(),
-                    endDate: dayjs().endOf('day').toDate(),
-                  })
-                }
-              >
-                <Text style={styles.resetTxt}>Reset</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.applyBtn} onPress={() => setShowFilters(false)}>
-                <Text style={styles.applyTxt}>Apply</Text>
-              </TouchableOpacity>
-            </View>
+            <View style={styles.rowKV}><Text style={styles.k}>Vendor</Text><Text style={styles.v} numberOfLines={1}>{vendorName || '-'}</Text></View>
+            {oilType ? (<View style={styles.rowKV}><Text style={styles.k}>Oil Type</Text><Text style={styles.v}>{oilType}</Text></View>) : null}
+            <View style={styles.rowKV}><Text style={styles.k}>Method</Text><Text style={styles.v}>{'Equity (Owner capital)'}</Text></View>
+
+            <View style={styles.dots} />
+
+            <View style={styles.amountBlock}><Text style={styles.amountLabel}>PAID</Text><Text style={styles.amountValue}>{fmtMoney(paidAmt)}</Text></View>
+
+            <View style={styles.rowKV}><Text style={styles.k}>Previous Payable</Text><Text style={styles.v}>{fmtMoney(prevDue)}</Text></View>
+            <View style={styles.rowKV}><Text style={[styles.k]}>New Payable</Text><Text style={[styles.v, newDue > 0 ? styles.vDanger : styles.vOk]}>{fmtMoney(newDue)}</Text></View>
+
+            {extraItems.length > 0 && (
+              <>
+                <View style={styles.dots} />
+                <Text style={[styles.k, { marginBottom: 4 }]}>Extra costs recorded</Text>
+                {extraItems.map((it, idx) => (<View key={`x-${idx}`} style={styles.rowKV}><Text style={styles.k}>{it.label}</Text><Text style={styles.v}>{fmtMoneyExtra(it.amt)}</Text></View>))}
+                <View style={styles.rowKV}><Text style={[styles.k, { fontWeight: '900' }]}>Total extras</Text><Text style={[styles.v, { fontWeight: '900' }]}>{fmtMoneyExtra(extraTotal)}</Text></View>
+              </>
+            )}
+
+            <View style={styles.dots} />
+            <Text style={styles.footerThanks}>Mahadsanid!</Text>
+            <Text style={styles.footerFine}>Rasiidkan waa caddeyn bixinta lacagta alaab-qeybiyaha (funded by owner equity).</Text>
           </View>
         </View>
       </Modal>
-    </View>
+
+      {/* Share chooser */}
+      <Modal visible={shareOpen} transparent animationType="slide" onRequestClose={closeShareAndReceipt}>
+        <TouchableWithoutFeedback onPress={closeShareAndReceipt}><View style={styles.sheetBackdrop} /></TouchableWithoutFeedback>
+        <View style={[styles.shareSheetContainer, { paddingBottom: Math.max(20, bottomSafe + 6) }]}>
+          <View style={styles.sheetHandle} />
+          <Text style={styles.sheetTitle}>Udir rasiidka</Text>
+          <Text style={styles.sheetDesc}>Dooro meesha aad ku wadaagi doonto rasiidka sawirka (PNG) iyo fariinta.</Text>
+
+          <View style={styles.sheetList}>
+            <TouchableOpacity style={styles.sheetItem} onPress={async () => { await shareImage(); closeShareAndReceipt(); }} activeOpacity={0.9}>
+              <View style={[styles.sheetIcon, { backgroundColor: '#F5F7FB' }]}><Feather name="share-2" size={18} color="#0B2447" /></View>
+              <View style={{ flex: 1 }}><Text style={styles.sheetItemTitle}>System Share</Text><Text style={styles.sheetItemSub}>Let the device choose an app</Text></View>
+              <Feather name="chevron-right" size={18} color="#6B7280" />
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.sheetItem} onPress={async () => { await shareImage(); await sendWhatsAppText(undefined, shareMsg); closeShareAndReceipt(); }} activeOpacity={0.9}>
+              <View style={[styles.sheetIcon, { backgroundColor: '#E7F9EF' }]}><FontAwesome name="whatsapp" size={18} color="#25D366" /></View>
+              <View style={{ flex: 1 }}><Text style={styles.sheetItemTitle}>WhatsApp</Text><Text style={styles.sheetItemSub}>Share image then open chat with text</Text></View>
+              <Feather name="chevron-right" size={18} color="#6B7280" />
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.sheetItem} onPress={async () => { await shareImage(); await sendSmsText(shareMsg); closeShareAndReceipt(); }} activeOpacity={0.9}>
+              <View style={[styles.sheetIcon, { backgroundColor: '#EEF2FF' }]}><Feather name="message-circle" size={18} color="#4F46E5" /></View>
+              <View style={{ flex: 1 }}><Text style={styles.sheetItemTitle}>SMS</Text><Text style={styles.sheetItemSub}>Share image via sheet, then prefill SMS</Text></View>
+              <Feather name="chevron-right" size={18} color="#6B7280" />
+            </TouchableOpacity>
+          </View>
+
+          <TouchableOpacity style={styles.sheetCancel} onPress={closeShareAndReceipt}>
+            <Text style={styles.sheetCancelTxt}>Close</Text>
+          </TouchableOpacity>
+        </View>
+      </Modal>
+    </>
   );
 }
 
-/** Small presentational helpers */
-function Field({
-  label,
-  value,
-  valueStyle,
-}: {
-  label: string;
-  value: string;
-  valueStyle?: any;
-}) {
-  return (
-    <View style={{ flexBasis: '48%', marginBottom: 8 }}>
-      <Text style={{ color: COLOR_MUTED, fontSize: 11, marginBottom: 4 }}>{label}</Text>
-      <Text style={[{ color: COLOR_TEXT, fontSize: 13, fontWeight: '800' }, valueStyle]} numberOfLines={2}>
-        {value}
-      </Text>
-    </View>
-  );
-}
+const dueStyles = StyleSheet.create({
+  banner: {
+    flexDirection: 'row', justifyContent: 'space-between', backgroundColor: '#FAFBFF',
+    borderWidth: 1, borderColor: BORDER, borderRadius: 12, paddingVertical: 10, paddingHorizontal: 12, marginBottom: 12,
+  },
+  left: { color: MUTED, fontWeight: '700' },
+  right: { color: TEXT, fontWeight: '900', maxWidth: 190 },
+  quickFill: {
+    flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 10, paddingVertical: 6,
+    borderRadius: 20, backgroundColor: '#EEF2FF', borderWidth: 1, borderColor: '#DDE3F0',
+  },
+  quickFillTxt: { color: '#0B2447', fontWeight: '800', fontSize: 12 },
+});
 
-function Divider() {
-  return <View style={{ height: 1, backgroundColor: COLOR_DIV, marginVertical: 12 }} />;
-}
-
-/** KPI Card (same style as OilDashboard) */
-function KpiCard({
-  title,
-  value,
-  icon,
-  iconBg = '#F3F4F6',
-  iconColor = '#111827',
-}: {
-  title: string;
-  value: string;
-  icon: any;
-  iconBg?: string;
-  iconColor?: string;
-}) {
-  return (
-    <View style={styles.cardKPI}>
-      <View style={[styles.cardIconWrap, { backgroundColor: iconBg }]}>
-        <Feather name={icon} size={16} color={iconColor} />
-      </View>
-      <Text style={styles.cardTitle}>{title}</Text>
-      <Text style={styles.cardValue}>{value}</Text>
-    </View>
-  );
-}
-
-const CARD_WIDTH = (width - 16 * 2 - 10 * 2) / 3;
+const methodPillStyles = StyleSheet.create({
+  pill: {
+    flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 12, height: 40,
+    borderRadius: 12, borderWidth: 1.5, borderColor: BORDER, backgroundColor: '#fff',
+  },
+  pillActive: { backgroundColor: '#0B2447', borderColor: '#0B2447' },
+  pillTxt: { color: TEXT, fontWeight: '800' },
+});
 
 const styles = StyleSheet.create({
-  page: { flex: 1, backgroundColor: COLOR_BG },
+  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.45)' },
+  sheetWrap: { position: 'absolute', left: 0, right: 0, bottom: 0 },
+  sheetCard: {
+    flex: 1, backgroundColor: BG, borderTopLeftRadius: 22, borderTopRightRadius: 22,
+    paddingHorizontal: 16, paddingTop: 10, borderTopWidth: 1, borderLeftWidth: 1, borderRightWidth: 1,
+    borderColor: BORDER, shadowColor: '#000', shadowOpacity: 0.18, shadowOffset: { width: 0, height: -8 },
+    shadowRadius: 16, elevation: 20,
+  },
+  sheetHandle: { alignSelf: 'center', width: 46, height: 5, borderRadius: 3, backgroundColor: '#E5E7EB', marginBottom: 8 },
+  title: { fontSize: 18, fontWeight: '800', marginBottom: 10, color: TEXT, textAlign: 'center' },
 
-  /* Header (match oildashboard) */
-  header: {
-    paddingBottom: 4,
-    paddingHorizontal: 16,
-    borderBottomLeftRadius: 20,
-    borderBottomRightRadius: 20,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.08,
-    shadowRadius: 10,
-    elevation: 3,
-  },
-  headerRowTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  headerTitle: { fontSize: 16, fontWeight: '800', color: '#E0E7FF' },
-  headerSub: { color: '#CBD5E1', fontSize: 11, marginTop: 6 },
+  row: { marginBottom: 14 },
+  label: { fontWeight: '700', color: TEXT, marginBottom: 6 },
+  input: { backgroundColor: '#fff', borderWidth: 1, borderColor: BORDER, borderRadius: 12, paddingHorizontal: 12, height: 48, color: TEXT },
 
-  /* NEW: back button */
-  backBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: 8,
-    backgroundColor: '#FFFFFF',
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: '#D8E0F5',
+  actions: { flexDirection: 'row', gap: 10 },
+  btn: {
+    flex: 1, height: 48, borderRadius: 12, backgroundColor: ACCENT,
+    alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 8,
   },
+  btnTxt: { color: '#fff', fontWeight: '800' },
+  btnGhost: { backgroundColor: '#fff', borderWidth: 1, borderColor: BORDER },
+  btnGhostText: { color: TEXT, fontWeight: '800' },
 
-  addBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    backgroundColor: '#FFFFFF',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#D8E0F5',
+  paperCenter: { ...StyleSheet.absoluteFillObject, padding: 18, justifyContent: 'center', alignItems: 'center' },
+  paperNotchLeft: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: 'rgba(0,0,0,0.05)', left: '50%', marginLeft: -(PAPER_W / 2) - 7, top: '20%' },
+  paperNotchRight: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: 'rgba(0,0,0,0.05)', right: '50%', marginRight: -(PAPER_W / 2) - 7, bottom: '22%' },
+  paper: {
+    width: PAPER_W, backgroundColor: '#FFFEFC', borderRadius: 12, borderWidth: 1, borderColor: '#E9EDF5',
+    paddingVertical: 14, paddingHorizontal: 14, shadowColor: '#000', shadowOpacity: 0.06,
+    shadowOffset: { width: 0, height: 8 }, shadowRadius: 12, elevation: 4,
   },
-  addBtnText: { color: '#0B2447', fontWeight: '800', fontSize: 12, letterSpacing: 0.2 },
+  paperCompany: { textAlign: 'center', fontSize: 14, fontWeight: '900', color: TEXT },
+  paperCompanySub: { textAlign: 'center', fontSize: 11, color: MUTED, marginTop: 2 },
+  paperTitle: { textAlign: 'center', fontSize: 13, color: '#475569', fontWeight: '800', marginTop: 2 },
+  paperMeta: { textAlign: 'center', fontSize: 11, color: MUTED, marginTop: 2 },
+  dots: { borderBottomWidth: 1, borderStyle: 'dotted', borderColor: '#C7D2FE', marginVertical: 10 },
+  rowKV: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
+  k: { color: '#475569', fontSize: 12, fontWeight: '700' },
+  v: { color: TEXT, fontSize: 12, fontWeight: '800' },
+  vDanger: { color: '#DC2626' },
+  vOk: { color: '#059669' },
+  amountBlock: { alignItems: 'center', marginVertical: 4 },
+  amountLabel: { fontSize: 11, color: '#64748B', fontWeight: '700', marginBottom: 2 },
+  amountValue: { fontSize: 20, fontWeight: '900', color: '#059669' },
 
-  /* KPI cards row */
-  cardsRow: { flexDirection: 'row', gap: 10, marginTop: 12, paddingHorizontal: 16 },
-  cardKPI: {
-    width: CARD_WIDTH,
-    backgroundColor: '#fff',
-    borderRadius: 14,
-    padding: 12,
-    borderWidth: 1,
-    borderColor: '#E8EDF4',
-    shadowColor: '#000',
-    shadowOpacity: 0.05,
-    shadowRadius: 5,
-    shadowOffset: { width: 0, height: 2 },
-    elevation: 1,
+  sheetBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.35)' },
+  shareSheetContainer: {
+    position: 'absolute', left: 0, right: 0, bottom: 0, backgroundColor: '#fff', borderTopLeftRadius: 22,
+    borderTopRightRadius: 22, paddingHorizontal: 16, paddingTop: 10, borderWidth: 1, borderColor: '#EEF1F6',
   },
-  cardIconWrap: {
-    width: 26,
-    height: 26,
-    borderRadius: 8,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: 6,
+  sheetTitle: { fontSize: 16, fontWeight: '900', color: '#111827', textAlign: 'center' },
+  sheetDesc: { fontSize: 12, color: '#6B7280', textAlign: 'center', marginTop: 4, marginBottom: 10 },
+  sheetList: { gap: 10 },
+  sheetItem: {
+    flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 12, paddingHorizontal: 10,
+    borderRadius: 14, backgroundColor: '#FAFBFF', borderWidth: 1, borderColor: '#EEF1F6',
   },
-  cardTitle: { color: '#6B7280', fontSize: 11, marginBottom: 1 },
-  cardValue: { fontSize: 16, fontWeight: '700', color: '#111827' },
-
-  /* Totals bar */
-  totalsBar: {
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderBottomColor: '#EEF2F7',
-    borderBottomWidth: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: '#FFFFFF',
-  },
-  badge: {
-    width: 26,
-    height: 26,
-    borderRadius: 8,
-    backgroundColor: '#EEF2F7',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  totalLabel: { color: COLOR_TEXT, fontWeight: '800' },
-  totalValue: { color: COLOR_TEXT, fontWeight: '900' },
-
-  /* Search row (with filter pill) */
-  searchRow: {
-    paddingHorizontal: 16,
-    paddingTop: 8,
-    paddingBottom: 8,
-  },
-  searchBox: {
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: COLOR_DIV,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    backgroundColor: '#FFFFFF',
-  },
-  searchInput: { flex: 1, fontSize: 12, paddingVertical: 4, color: COLOR_TEXT },
-  headerFilterBtnSmall: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    backgroundColor: '#EEF2FF',
-    paddingVertical: 6,
-    paddingHorizontal: 10,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#DDE3F0',
-  },
-  headerFilterTxtSmall: { color: '#0B2447', fontSize: 11, fontWeight: '900' },
-
-  /* List */
-  scrollContent: { padding: 14, paddingBottom: 28 },
-  loading: { padding: 24, alignItems: 'center', justifyContent: 'center' },
-  empty: { paddingVertical: 40, alignItems: 'center', justifyContent: 'center', gap: 8 },
-  emptyText: { color: COLOR_MUTED, fontSize: 13 },
-
-  /** Card */
-  card: {
-    backgroundColor: COLOR_CARD,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: '#EDF1F7',
-    padding: 14,
-    marginBottom: 12,
-    flexDirection: 'row',
-    gap: 14,
-    shadowColor: COLOR_SHADOW,
-    shadowOpacity: 1,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: 2 },
-    elevation: 2,
-  },
-  supplier: { fontSize: 15, fontWeight: '900', color: COLOR_TEXT },
-
-  childRow: { flexDirection: 'row', gap: 8, marginTop: 6, flexWrap: 'wrap' },
-  childPill: {
-    backgroundColor: '#fff',
-    borderWidth: 1,
-    borderColor: '#E7ECF3',
-    borderRadius: 999,
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  childText: { color: COLOR_TEXT, fontSize: 12, fontWeight: '700' },
-
-  rightCol: { alignItems: 'flex-end', justifyContent: 'center', minWidth: 140 },
-  dueLabel: { fontSize: 11, color: COLOR_MUTED, textAlign: 'right' },
-  dueValue: { fontSize: 16, fontWeight: '900', color: COLOR_TEXT, marginTop: 2 },
-
-  /** Modal (details) */
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: 'rgba(2,6,23,0.55)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 16,
-  },
-  modalCard: {
-    width: '100%',
-    backgroundColor: '#fff',
-    borderRadius: 16,
-    padding: 14,
-    borderWidth: 1,
-    borderColor: '#EBEFF5',
-  },
-  modalHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  modalTitle: { fontSize: 16, fontWeight: '900', color: COLOR_TEXT },
-  actionsChip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    backgroundColor: '#EEF2F7',
-    paddingVertical: 6,
-    paddingHorizontal: 10,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-  },
-  actionsChipTxt: { color: '#0B2447', fontSize: 11, fontWeight: '900' },
-
-  inlineGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'space-between',
-    marginTop: 8,
-  },
-
-  extrasToggle: {
-    marginTop: 12,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-    backgroundColor: '#F8FAFC',
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  extrasToggleTxt: { color: '#0B2447', fontSize: 12, fontWeight: '900' },
-
-  modalFooter: { marginTop: 12, flexDirection: 'row', alignItems: 'center' },
-
-  // Pay button inside extra block
-  payBtn: {
-    marginTop: 8,
-    backgroundColor: '#0F172A',
-    borderRadius: 10,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  payBtnTxt: { color: '#fff', fontWeight: '900', fontSize: 12 },
-
-  // Extras list styles
-  extraRow: {
-    marginTop: 10,
-    borderWidth: 1,
-    borderColor: '#E7ECF3',
-    borderRadius: 12,
-    padding: 10,
-    flexDirection: 'row',
-    gap: 10,
-    backgroundColor: '#FAFCFF',
-  },
-  extraTitle: { fontSize: 13, fontWeight: '800', color: COLOR_TEXT },
-  extraDesc: { fontSize: 12, color: COLOR_MUTED, marginTop: 2 },
-  extraLine: { fontSize: 12, color: COLOR_TEXT, marginTop: 2 },
-  noExtras: { marginTop: 8, flexDirection: 'row', alignItems: 'center', gap: 6 },
-  noExtrasText: { color: COLOR_MUTED, fontSize: 12 },
-
-  // Filters modal
-  modalOverlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.5)' },
-  modalContent: { backgroundColor: 'white', borderTopLeftRadius: 14, borderTopRightRadius: 14, padding: 16, maxHeight: '60%' },
-  filterSection: { marginBottom: 10 },
-  modalTitleFiltersOnly: { fontSize: 15, fontWeight: '800', color: '#1F2937' },
-  filterLabel: {
-    fontSize: 10,
-    fontWeight: '900',
-    letterSpacing: 0.3,
-    color: '#6B7280',
-    marginBottom: 6,
-    textTransform: 'uppercase',
-  },
-  quickChips: { flexDirection: 'row', flexWrap: 'wrap' },
-  chip: {
-    paddingVertical: 6,
-    paddingHorizontal: 10,
-    borderRadius: 18,
-    borderWidth: 1,
-    borderColor: '#CBD5E1',
-    backgroundColor: '#F1F5F9',
-    marginRight: 6,
-    marginBottom: 6,
-  },
-  chipActive: { backgroundColor: '#0B2447', borderColor: '#0B2447' },
-  chipText: { fontSize: 11, color: '#334155', fontWeight: '800' },
-  chipTextActive: { color: '#fff' },
-  dateRangeContainer: { flexDirection: 'row', alignItems: 'center' },
-  dateBtn: {
-    flex: 1,
-    padding: 10,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#E5E7EB',
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: '#F9FAFB',
-  },
-  dateBtnText: { color: '#1F2937', fontSize: 12, fontWeight: '700' },
-  rangeSep: { fontSize: 11, color: '#6B7280', marginHorizontal: 8 },
-  filterActions: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 6 },
-  resetBtn: {
-    flex: 1,
-    padding: 10,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#E5E7EB',
-    marginRight: 8,
-    alignItems: 'center',
-    backgroundColor: 'white',
-  },
-  resetTxt: { fontSize: 12, fontWeight: '800', color: '#1F2937' },
-  applyBtn: { flex: 1, padding: 10, borderRadius: 8, backgroundColor: '#0B2447', alignItems: 'center' },
-  applyTxt: { fontSize: 12, fontWeight: '800', color: 'white' },
+  sheetIcon: { width: 36, height: 36, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
+  sheetItemTitle: { fontSize: 14, fontWeight: '800', color: '#0B1220' },
+  sheetItemSub: { fontSize: 11, color: '#6B7280' },
+  sheetCancel: { marginTop: 12, alignSelf: 'center', paddingVertical: 10, paddingHorizontal: 16 },
+  sheetCancelTxt: { fontWeight: '800', color: '#6B7280' },
 });

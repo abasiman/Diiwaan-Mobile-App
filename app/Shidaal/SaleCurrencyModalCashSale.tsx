@@ -1,16 +1,17 @@
-// components/SaleCurrencyModal.tsx
+// components/SaleCurrencyModalCashSale.tsx
 import { Feather } from '@expo/vector-icons';
 import { useEffect, useMemo, useState } from 'react';
 import {
-  Modal,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    Modal,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from 'react-native';
 
 export type CurrencyKey = 'USD' | 'shimaal';
+export type PaymentMethodKey = 'cash' | 'baankisat';
 type SaleUnitType = 'liters' | 'fuusto' | 'caag';
 
 const BORDER = '#CBD5E1';
@@ -25,16 +26,22 @@ const SERVER_CODE_FROM_KEY: Record<CurrencyKey, 'USD' | 'SOS'> = {
   shimaal: 'SOS',
 };
 
+// Map UI payment choices to server enum
+const PAYMENT_SERVER_FROM_KEY: Record<PaymentMethodKey, 'cash' | 'bank'> = {
+  cash: 'cash',
+  baankisat: 'bank',
+};
+
 const unitTitle = (u?: SaleUnitType) =>
   u === 'fuusto' ? 'Fuusto' : u === 'caag' ? 'Caag' : u === 'liters' ? 'Liters' : 'Qty';
 
 export default function SaleCurrencyModal({
   visible,
   defaultFxRate = '',
-  lineTotal = 0,                 // total from the form (in baseCurrency)
-  qty,                           // quantity from the form
-  unitType,                      // 'liters' | 'fuusto' | 'caag'  (for "3 fuusto")
-  baseCurrency = 'USD',          // currency of lineTotal (defaults to USD)
+  lineTotal = 0,
+  qty,
+  unitType,
+  baseCurrency = 'USD',
   onClose,
   onConfirm,
 }: {
@@ -45,20 +52,25 @@ export default function SaleCurrencyModal({
   unitType?: SaleUnitType;
   baseCurrency?: 'USD' | 'SOS';
   onClose: () => void;
-  onConfirm: (currencyKey: CurrencyKey, fxRate: string) => void;
+  // now also returns the chosen payment method (server enum)
+  onConfirm: (currencyKey: CurrencyKey, fxRate: string, paymentMethodServer: 'cash' | 'bank') => void;
 }) {
-  // IMPORTANT: start as "no selection" to show placeholder "select currency"
+  // currency + payment method state
   const [currencyKey, setCurrencyKey] = useState<CurrencyKey | null>(null);
+  const [paymentKey, setPaymentKey] = useState<PaymentMethodKey | null>(null);
   const [fxRate, setFxRate] = useState<string>(defaultFxRate);
 
   // dropdown open/close
   const [openCurrency, setOpenCurrency] = useState(false);
+  const [openPayment, setOpenPayment] = useState(false);
 
   useEffect(() => {
     if (visible) {
-      setCurrencyKey(null);           // default: "select currency"
+      setCurrencyKey(null);     // force user to pick
+      setPaymentKey(null);      // force user to pick
       setFxRate(defaultFxRate || '');
       setOpenCurrency(false);
+      setOpenPayment(false);
     }
   }, [visible, defaultFxRate]);
 
@@ -68,10 +80,9 @@ export default function SaleCurrencyModal({
   );
 
   const baseSymbol = baseCurrency === 'USD' ? DISPLAY_SYMBOL.USD : DISPLAY_SYMBOL.SOS;
-
   const fmt2 = (n: number) => Number(n || 0).toFixed(2);
 
-  // Sanitize to allow only numbers and a single dot (default keyboard, no keyboardType set)
+  // Sanitize to allow only numbers and one dot
   const sanitizeRate = (s: string) => {
     let out = s.replace(/[^\d.]/g, '');
     const firstDot = out.indexOf('.');
@@ -81,16 +92,14 @@ export default function SaleCurrencyModal({
     return out;
   };
 
-  // fx as SOS per 1 USD (your existing convention)
   const parsedFx = useMemo(() => {
     const n = parseFloat((fxRate || '').replace(',', '.'));
     return Number.isFinite(n) && n > 0 ? n : undefined;
   }, [fxRate]);
 
-  // Live converted total (only meaningful when target is SOS)
   const convertedSOS = useMemo(() => {
     if (targetServerCode !== 'SOS') return null;
-    if (baseCurrency === 'SOS') return lineTotal; // already SOS
+    if (baseCurrency === 'SOS') return lineTotal;
     if (baseCurrency === 'USD') {
       if (!parsedFx) return null;
       return lineTotal * parsedFx;
@@ -98,9 +107,11 @@ export default function SaleCurrencyModal({
     return null;
   }, [targetServerCode, baseCurrency, lineTotal, parsedFx]);
 
-  // Disable confirm if: no currency selected OR (selected SOS but fx invalid)
+  // Disable confirm if: no currency OR (SOS without valid fx) OR no payment method
   const disabledConfirm =
-    !currencyKey || (targetServerCode === 'SOS' && (!parsedFx || parsedFx <= 0));
+    !currencyKey ||
+    (targetServerCode === 'SOS' && (!parsedFx || parsedFx <= 0)) ||
+    !paymentKey;
 
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
@@ -112,65 +123,123 @@ export default function SaleCurrencyModal({
               <View style={styles.headerIconWrap}>
                 <Feather name="dollar-sign" size={14} color="#0F172A" />
               </View>
-              <Text style={styles.headerTitle}>Confirm Currency</Text>
+              <Text style={styles.headerTitle}>Confirm Currency & Payment</Text>
             </View>
             <TouchableOpacity onPress={onClose} style={styles.closeBtn}>
               <Feather name="x" size={16} color="#0B1221" />
             </TouchableOpacity>
           </View>
 
-          {/* Currency dropdown */}
-          <Text style={styles.sectionTitle}>Currency</Text>
-          <View style={{ marginBottom: 8 }}>
-            <TouchableOpacity
-              style={styles.selectBtn}
-              onPress={() => setOpenCurrency((s) => !s)}
-              activeOpacity={0.9}
-            >
-              <Text style={[styles.selectValue, !currencyKey && { color: '#64748B', fontWeight: '600' }]}>
-                {currencyKey
-                  ? currencyKey === 'USD'
-                    ? 'doller (USD)'
-                    : 'shimaali sh (SOS)'
-                  : 'select currency'}
-              </Text>
-              <Feather name={openCurrency ? 'chevron-up' : 'chevron-down'} size={16} color="#0B1221" />
-            </TouchableOpacity>
+          {/* Row: Currency + Payment (same size, compact values) */}
+          <View style={{ flexDirection: 'row', gap: 8 }}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.sectionTitle}>Currency</Text>
+              <TouchableOpacity
+                style={styles.selectBtn}
+                onPress={() => {
+                  setOpenCurrency((s) => !s);
+                  setOpenPayment(false);
+                }}
+                activeOpacity={0.9}
+              >
+                <Text
+                  style={[
+                    styles.selectValueSm,
+                    !currencyKey && { color: '#64748B', fontWeight: '600' },
+                  ]}
+                  numberOfLines={1}
+                >
+                  {currencyKey
+                    ? currencyKey === 'USD'
+                      ? 'doller (USD)'
+                      : 'shimaali sh (SOS)'
+                    : 'select currency'}
+                </Text>
+                <Feather name={openCurrency ? 'chevron-up' : 'chevron-down'} size={16} color="#0B1221" />
+              </TouchableOpacity>
 
-            {openCurrency && (
-              <View style={styles.dropdownPanel}>
-                <TouchableOpacity
-                  style={styles.optionRow}
-                  activeOpacity={0.9}
-                  onPress={() => {
-                    setCurrencyKey('USD');
-                    setOpenCurrency(false);
-                  }}
+              {openCurrency && (
+                <View style={styles.dropdownPanel}>
+                  <TouchableOpacity
+                    style={styles.optionRow}
+                    activeOpacity={0.9}
+                    onPress={() => {
+                      setCurrencyKey('USD');
+                      setOpenCurrency(false);
+                    }}
+                  >
+                    <Text style={styles.optionText}>doller (USD)</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.optionRow, { borderBottomWidth: 0 }]}
+                    activeOpacity={0.9}
+                    onPress={() => {
+                      setCurrencyKey('shimaal');
+                      setOpenCurrency(false);
+                    }}
+                  >
+                    <Text style={styles.optionText}>shimaali sh (SOS)</Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+            </View>
+
+            <View style={{ flex: 1 }}>
+              <Text style={styles.sectionTitle}>Payment</Text>
+              <TouchableOpacity
+                style={styles.selectBtn}
+                onPress={() => {
+                  setOpenPayment((s) => !s);
+                  setOpenCurrency(false);
+                }}
+                activeOpacity={0.9}
+              >
+                <Text
+                  style={[
+                    styles.selectValueSm,
+                    !paymentKey && { color: '#64748B', fontWeight: '600' },
+                  ]}
+                  numberOfLines={1}
                 >
-                  <Text style={styles.optionText}>doller (USD)</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.optionRow, { borderBottomWidth: 0 }]}
-                  activeOpacity={0.9}
-                  onPress={() => {
-                    setCurrencyKey('shimaal');
-                    setOpenCurrency(false);
-                  }}
-                >
-                  <Text style={styles.optionText}>shimaali sh (SOS)</Text>
-                </TouchableOpacity>
-              </View>
-            )}
+                  {paymentKey ? (paymentKey === 'cash' ? 'cash' : 'baankisat') : 'select payment method'}
+                </Text>
+                <Feather name={openPayment ? 'chevron-up' : 'chevron-down'} size={16} color="#0B1221" />
+              </TouchableOpacity>
+
+              {openPayment && (
+                <View style={styles.dropdownPanel}>
+                  <TouchableOpacity
+                    style={styles.optionRow}
+                    activeOpacity={0.9}
+                    onPress={() => {
+                      setPaymentKey('cash');
+                      setOpenPayment(false);
+                    }}
+                  >
+                    <Text style={styles.optionText}>cash</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.optionRow, { borderBottomWidth: 0 }]}
+                    activeOpacity={0.9}
+                    onPress={() => {
+                      setPaymentKey('baankisat');
+                      setOpenPayment(false);
+                    }}
+                  >
+                    <Text style={styles.optionText}>baankisat</Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+            </View>
           </View>
 
-          {/* If SHIMAALI is selected, the exchange rate appears ABOVE the amounts container */}
+          {/* If SHIMAALI is selected, show exchange rate */}
           {targetServerCode === 'SOS' && (
             <>
               <Text style={styles.sectionTitleTight}>Exchange Rate (SOS per 1 USD)</Text>
               <TextInput
                 value={fxRate}
                 onChangeText={(t) => setFxRate(sanitizeRate(t))}
-                // NOTE: no keyboardType prop (uses default full keyboard)
                 placeholder="geli rate-ka"
                 placeholderTextColor="#64748B"
                 style={styles.input}
@@ -180,7 +249,6 @@ export default function SaleCurrencyModal({
 
           {/* Qty + amounts container (COMPACT) */}
           <View style={styles.card}>
-            {/* Qty + Sell type */}
             <View style={styles.rowBetween}>
               <Text style={styles.labelSm}>Qty</Text>
               <Text style={styles.valueSm}>
@@ -190,7 +258,6 @@ export default function SaleCurrencyModal({
 
             <View style={styles.divider} />
 
-            {/* Row: Original amount | Converted (ONLY for shimaali) */}
             <View style={[styles.amountRow, targetServerCode !== 'SOS' && { gap: 6 }]}>
               <View style={[styles.amountCol, targetServerCode !== 'SOS' && { flex: 1 }]}>
                 <Text style={styles.amountLabel}>Amount (doller)</Text>
@@ -221,7 +288,10 @@ export default function SaleCurrencyModal({
             <TouchableOpacity
               style={[styles.confirmBtn, disabledConfirm && { opacity: 0.5 }]}
               disabled={disabledConfirm}
-              onPress={() => currencyKey && onConfirm(currencyKey, fxRate)}
+              onPress={() => {
+                if (!currencyKey || !paymentKey) return;
+                onConfirm(currencyKey, fxRate, PAYMENT_SERVER_FROM_KEY[paymentKey]);
+              }}
               activeOpacity={0.92}
             >
               <Feather name="check" size={16} color="#fff" />
@@ -277,7 +347,6 @@ const styles = StyleSheet.create({
   sectionTitle: { marginTop: 10, marginBottom: 6, fontWeight: '800', color: '#0B1221', fontSize: 13 },
   sectionTitleTight: { marginTop: 6, marginBottom: 6, fontWeight: '800', color: '#0B1221', fontSize: 13 },
 
-  // Dropdown styles
   selectBtn: {
     height: 44,
     borderRadius: 10,
@@ -289,7 +358,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
   },
-  selectValue: { fontSize: 13, fontWeight: '800', color: '#0B1221' },
+  // Smaller value text for both dropdowns
+  selectValueSm: { fontSize: 12, fontWeight: '700', color: '#0B1221' },
+
   dropdownPanel: {
     borderWidth: 1,
     borderColor: BORDER,
@@ -318,7 +389,6 @@ const styles = StyleSheet.create({
     color: '#0B1221',
   },
 
-  // COMPACT totals card
   card: {
     marginTop: 8,
     marginBottom: 8,

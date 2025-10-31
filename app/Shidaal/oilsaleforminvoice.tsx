@@ -40,7 +40,7 @@ type WakaaladSellOption = {
   fuusto_price?: number | null;
   caag_price?: number | null;
 
-  // NEW: capacities (server-provided, optional)
+  // capacities from server (fallbacks below)
   fuusto_capacity_l?: number | null;
   caag_capacity_l?: number | null;
 };
@@ -93,7 +93,7 @@ type Customer = {
   phone?: string | null;
 };
 
-// REMOVE hard-coded CAPACITY. Provide fallbacks only.
+// Fallback capacities (server is the source of truth)
 const DEFAULT_FUUSTO_L = 240;
 const DEFAULT_CAAG_L = 20;
 
@@ -112,6 +112,15 @@ function capacityL(unit: SaleUnitType, opt?: WakaaladSellOption): number {
   if (unit === 'caag')   return (opt?.caag_capacity_l ?? DEFAULT_CAAG_L);
   return 1; // liter
 }
+
+
+function billableFuustoL(opt?: WakaaladSellOption): number {
+  const physical = capacityL('fuusto', opt); // usually 240
+  const isPetrol = (opt?.oil_type || '').toLowerCase() === 'petrol';
+  // bill 230 for petrol fuusto, otherwise full physical
+  return isPetrol ? Math.max(0, physical - 10) : physical;
+}
+
 
 /* ---------- Tiny toast ---------- */
 function useToast() {
@@ -406,7 +415,6 @@ function ChangePriceMiniModal({
               }
               setAmount(cleaned);
             }}
-            keyboardType="decimal-pad"
             placeholder="25.00"
           />
 
@@ -612,11 +620,33 @@ export default function OilSaleInvoiceForm() {
 
   const qtyNum = useMemo(() => Math.max(parseInt(qty || '0', 10) || 0, 0), [qty]);
 
+  // PHYSICAL liters used for stock checking (e.g., 240L per petrol fuusto)
   const estimatedLiters = useMemo(() => {
     if (!selected) return 0;
     if (unitType === 'liters') return qtyNum;
     return qtyNum * capacityL(unitType, selected);
   }, [selected, unitType, qtyNum]);
+
+  // BILLED liters (e.g., 230L per petrol fuusto due to 10L shorts)
+  const billedLiters = useMemo(() => {
+    if (!selected) return 0;
+    if (unitType === 'liters') return qtyNum;
+    if (unitType === 'caag') return qtyNum * capacityL('caag', selected);
+    if (unitType === 'fuusto') {
+      const cap = capacityL('fuusto', selected); // usually 240
+      const billedPer =
+        (selected.oil_type || '').toLowerCase() === 'petrol'
+          ? Math.max(0, cap - 10) // 230 billed for petrol
+          : cap;                  // others bill full capacity
+      return qtyNum * billedPer;
+    }
+    return 0;
+  }, [selected, unitType, qtyNum]);
+
+  const shortsPerFuusto = useMemo(() => {
+    if (!selected || unitType !== 'fuusto') return 0;
+    return (selected.oil_type || '').toLowerCase() === 'petrol' ? 10 : 0;
+  }, [selected, unitType]);
 
   const unitLabel = useMemo(
     () => (unitType === 'liters' ? 'Liters' : unitType === 'fuusto' ? 'Fuusto' : 'Caag'),
@@ -631,11 +661,25 @@ export default function OilSaleInvoiceForm() {
 
   const priceNum = useMemo(() => parseFloat((priceDisplay || '').replace(',', '.')) || 0, [priceDisplay]);
 
+  // Canonical per-liter in LOT currency, derived from the displayed unit price
+  const perLInLotCurrency = useMemo(() => {
+  const r = (n: number, d = 6) => Math.round(n * 10 ** d) / 10 ** d;
+  if (!selected || priceNum <= 0) return 0;
+
+  if (unitType === 'liters') return r(priceNum, 6);
+  if (unitType === 'fuusto') return r(priceNum / billableFuustoL(selected), 6); // <-- was capacityL
+  if (unitType === 'caag')   return r(priceNum / capacityL('caag', selected), 6);
+
+  return 0;
+}, [selected, unitType, priceNum]);
+
+
+  // Line total should use BILLED liters (so petrol fuusto bills 230L × per-L price)
   const lineTotal = useMemo(() => {
     if (!selected) return 0;
-    if (qtyNum <= 0 || priceNum <= 0) return 0;
-    return priceNum * qtyNum;
-  }, [selected, qtyNum, priceNum]);
+    if (billedLiters <= 0 || perLInLotCurrency <= 0) return 0;
+    return billedLiters * perLInLotCurrency;
+  }, [selected, billedLiters, perLInLotCurrency]);
 
   const canSubmit = useMemo(() => {
     if (!selected) return false;
@@ -663,19 +707,12 @@ export default function OilSaleInvoiceForm() {
         `Requested ${fmtNum(estimatedLiters, 2)} L exceeds available ${fmtNum(selected?.in_stock_l ?? 0, 2)} L.`
       );
     }
-    if (!stockExceeded) lastWarnKeyRef.current = '';
+  if (!stockExceeded) lastWarnKeyRef.current = '';
   }, [stockExceeded, selected, unitType, qtyNum, estimatedLiters]);
 
   // --- Currency helpers ---
   const lotCurrency = (selected?.currency || 'USD').toUpperCase() as 'USD' | 'SOS';
   const saleCurrencyFromKey = (ck: CurrencyKey) => CURRENCY_FROM_KEY[ck];
-
-  const perLInLotCurrency = useMemo(() => {
-    const r = (n: number, d = 6) => Math.round(n * 10 ** d) / 10 ** d;
-    if (!selected || priceNum <= 0) return 0;
-    if (unitType === 'liters') return r(priceNum, 6);
-    return r(priceNum / capacityL(unitType, selected), 6);
-  }, [selected, unitType, priceNum]);
 
   function convertPerL(lotCur: 'USD' | 'SOS', saleCur: 'USD' | 'SOS', perL_lot: number, fx: number | undefined) {
     if (perL_lot <= 0) return 0;
@@ -719,7 +756,7 @@ export default function OilSaleInvoiceForm() {
       sale_type: SALE_TYPE,
       liters_sold: unitType === 'liters' ? qtyNum : undefined,
       unit_qty: unitType === 'fuusto' || unitType === 'caag' ? qtyNum : undefined,
-      price_per_l: perL_sale || undefined,   // optional; server will compute if omitted
+      price_per_l: perL_sale || undefined,   // server canonical per-L
       customer: custName?.trim() ? custName.trim() : undefined,
       customer_contact: custContact?.trim() ? custContact.trim() : undefined,
       currency: saleCurrency,
@@ -747,42 +784,46 @@ export default function OilSaleInvoiceForm() {
     }
   };
 
-  const previewConvertedTotal = useMemo(() => {
-    if (!selected || lineTotal <= 0) return null;
-    const saleCur = saleCurrencyFromKey(finalCurrencyKey);
-    if (saleCur === lotCurrency) return null;
+  // Amount (USD) for the summary — derived from lineTotal
+  const amountUSD: number | null = useMemo(() => {
+    if (lineTotal <= 0) return null;
+    if (lotCurrency === 'USD') return lineTotal;
     const fx = parseFloat((finalFxRate || '').replace(',', '.'));
-    if (!(fx > 0)) return null;
-    const converted =
-      lotCurrency === 'USD' && saleCur === 'SOS'
-        ? lineTotal * fx
-        : lotCurrency === 'SOS' && saleCur === 'USD'
-        ? lineTotal / fx
-        : null;
-    if (converted == null) return null;
-    return { amount: converted, saleCur };
-  }, [selected, lineTotal, lotCurrency, finalCurrencyKey, finalFxRate]);
+    if (fx > 0) return lineTotal / fx; // convert SOS -> USD
+    return null;
+  }, [lineTotal, lotCurrency, finalFxRate]);
 
   // Update options array after price change (per-liter canonical).
   // IMPORTANT: multiple wakaalads can share the same oil_id — update all of them.
   const applyPriceIntoOption = useCallback((oilId: number, update: { basis: SaleUnitType; value: number }) => {
-    setOptions((prev) =>
-      prev.map((o) => {
-        if (o.oil_id !== oilId) return o;
-        const next: WakaaladSellOption = { ...o };
-        if (update.basis === 'liters') {
-          next.liter_price  = update.value;
-          next.fuusto_price = update.value * capacityL('fuusto', next);
-          next.caag_price   = update.value * capacityL('caag', next);
-        } else if (update.basis === 'fuusto') {
-          next.fuusto_price = update.value;
-        } else {
-          next.caag_price = update.value;
-        }
-        return next;
-      })
-    );
-  }, []);
+  setOptions((prev) =>
+    prev.map((o) => {
+      if (o.oil_id !== oilId) return o;
+      const next: WakaaladSellOption = { ...o };
+      const fuustoBillable = billableFuustoL(next);    // <-- 230 for petrol
+      const fuustoPhysical = capacityL('fuusto', next); // 240 (exposed capacity, left unchanged)
+
+      if (update.basis === 'liters') {
+        // user set per-liter → derive correct per-unit prices
+        next.liter_price  = update.value;
+        next.fuusto_price = update.value * fuustoBillable;  // <-- use 230 for petrol
+        next.caag_price   = update.value * capacityL('caag', next);
+      } else if (update.basis === 'fuusto') {
+        // user set per-fuusto → derive per-liter from BILLABLE fuusto
+        next.fuusto_price = update.value;
+        next.liter_price  = update.value / fuustoBillable;  // <-- use 230 for petrol
+        next.caag_price   = next.liter_price * capacityL('caag', next);
+      } else {
+        // user set per-caag
+        next.caag_price   = update.value;
+        next.liter_price  = update.value / capacityL('caag', next);
+        next.fuusto_price = next.liter_price * fuustoBillable; // <-- use 230 for petrol
+      }
+      return next;
+    })
+  );
+}, []);
+
 
   // Filtering (oil_type, wakaalad_name, truck_plate)
   const filteredOptions = useMemo(() => {
@@ -1045,9 +1086,10 @@ export default function OilSaleInvoiceForm() {
             </View>
           </View>
 
-          {/* Summary */}
+          {/* Summary – primary is Amount (USD), base total smaller */}
           {selected && (
             <View style={styles.summaryCard}>
+              {/* Wakaalad row (small) */}
               <View style={styles.summaryRow}>
                 <Text style={styles.summaryKey}>Wakaalad</Text>
                 <Text style={styles.summaryVal}>
@@ -1056,35 +1098,33 @@ export default function OilSaleInvoiceForm() {
               </View>
 
               <View style={styles.divider} />
+
+              {/* Amount in Dollar (primary) */}
               <View style={styles.summaryRow}>
-                <Text style={[styles.summaryKey, { fontWeight: '800' }]}>Total</Text>
-                <Text style={[styles.summaryVal, { fontWeight: '800' }]}>
-                  {symbolFor(selected?.currency)} {fmtNum(lineTotal, 2)}
+                <Text style={[styles.summaryKey, styles.bold]}>Amount (USD)</Text>
+                <Text style={[styles.summaryVal, styles.bold]}>
+                  {amountUSD != null ? `$${fmtNum(amountUSD, 2)}` : '—'}
                 </Text>
               </View>
 
-              {/* Converted preview (cosmetic) */}
-              {(() => {
-                const saleCur = finalCurrencyKey === 'USD' ? 'USD' : 'SOS';
-                if (!selected || lineTotal <= 0) return null;
-                if ((selected.currency || 'USD').toUpperCase() === saleCur) return null;
-                const fx = parseFloat((finalFxRate || '').replace(',', '.'));
-                if (!(fx > 0)) return null;
-                const converted =
-                  selected.currency?.toUpperCase() === 'USD' && saleCur === 'SOS'
-                    ? lineTotal * fx
-                    : selected.currency?.toUpperCase() === 'SOS' && saleCur === 'USD'
-                    ? lineTotal / fx
-                    : null;
-                if (converted == null) return null;
-                return (
-                  <View style={{ marginTop: 2 }}>
-                    <Text style={{ color: '#6B7280', fontSize: 11 }}>
-                      ≈ {(saleCur === 'USD' ? DISPLAY_SYMBOL.USD : DISPLAY_SYMBOL.SOS)} {fmtNum(converted, 2)} (with your rate)
-                    </Text>
-                  </View>
-                );
-              })()}
+              {/* Base total (smaller / muted) */}
+              <View style={styles.summaryInlineSmall}>
+                <Text style={styles.smallMuted}>
+                  Base total: {symbolFor(selected?.currency)} {fmtNum(lineTotal, 2)}
+                </Text>
+                {(selected?.currency || 'USD').toUpperCase() !== 'USD' && amountUSD == null ? (
+                  <Text style={styles.tinyHint}>
+                    Enter USD rate at checkout to preview dollars.
+                  </Text>
+                ) : null}
+              </View>
+
+              {/* Simple shorts note for petrol fuusto */}
+              {unitType === 'fuusto' && shortsPerFuusto > 0 && (
+                <Text style={[styles.smallMuted, { marginTop: 6 }]}>
+                  Shorts: 10 L per fuusto
+                </Text>
+              )}
             </View>
           )}
 
@@ -1353,7 +1393,6 @@ const styles = StyleSheet.create({
   pickerMain: { fontSize: 13, fontWeight: '700', color: '#0B1221' },
   pickerSub: { fontSize: 11, color: '#6B7280', marginTop: 2 },
 
-  // Small inline "Change price" button
   smallBtn: {
     height: 28,
     paddingHorizontal: 12,
@@ -1377,9 +1416,18 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: BORDER,
   },
-  summaryRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 3 },
-  summaryKey: { color: '#6B7280', fontSize: 12 },
-  summaryVal: { color: '#0B1221', fontWeight: '700', fontSize: 12 },
+  summaryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 2,
+  },
+  summaryKey: { color: '#6B7280', fontSize: 11 },
+  summaryVal: { color: '#0B1221', fontWeight: '700', fontSize: 11 },
+  bold: { fontWeight: '800' },
+  summaryInlineSmall: { marginTop: 4 },
+  smallMuted: { color: '#64748B', fontSize: 10 },
+  tinyHint: { color: '#94A3B8', fontSize: 10, marginTop: 2 },
   divider: { height: 1, backgroundColor: '#E5E7EB', marginVertical: 8 },
 
   submitBtn: {
@@ -1463,8 +1511,8 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
   },
   segmentBtnActive: {
-    borderColor: '#0B1221',
-    backgroundColor: '#0B1221',
+    borderColor: '#0B122A',
+    backgroundColor: '#0B122A',
   },
   segmentText: { fontWeight: '800', color: '#0B1221', fontSize: 12 },
   segmentTextActive: { color: '#FFFFFF' },

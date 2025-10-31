@@ -57,15 +57,19 @@ const CURRENCY_OPTIONS: { label: string; key: CurrencyKey; code: string }[] = [
    Small utils
 ────────────────────────────────────────────────────────── */
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/** Allow digits + single dot; also normalize commas to dots */
 const filterNumeric = (s: string) => {
-  let out = s.replace(/[^0-9.]/g, '');
+  let out = s.replace(/,/g, '.').replace(/[^0-9.]/g, '');
   const parts = out.split('.');
   if (parts.length > 2) {
     out = parts[0] + '.' + parts.slice(1).join('');
+    // ensure only the *first* dot remains
     out = out.replace(/\./g, (m, i) => (i === out.indexOf('.') ? '.' : ''));
   }
   return out;
 };
+
 const filterInt = (s: string) => s.replace(/[^0-9]/g, '');
 
 /* ──────────────────────────────────────────────────────────
@@ -293,6 +297,20 @@ const GridCol = ({ children }: { children: React.ReactNode }) => (
 );
 
 /* ──────────────────────────────────────────────────────────
+   Allocation types (for payment sheets)
+────────────────────────────────────────────────────────── */
+type Allocation = {
+  oilCost: number;
+  extras: { category: string; amount: number }[];
+  currency: string;
+  total: number;
+};
+type RowAlloc = {
+  oilId: number;
+  allocation: Allocation;
+};
+
+/* ──────────────────────────────────────────────────────────
    Page (Two-step Tabs)
 ────────────────────────────────────────────────────────── */
 export default function OilCreatePage() {
@@ -310,7 +328,7 @@ export default function OilCreatePage() {
   const [oilType, setOilType] = useState<OilTypeOrBoth | undefined>(undefined);
   const [qty, setQty] = useState('');
   const [liters, setLiters] = useState('');
-  const [supplierName, setSupplierName] = useState(''); // (optional field, kept if you need it later)
+  const [supplierName, setSupplierName] = useState(''); // optional
   const [fromLocation, setFromLocation] = useState('');
   const [toLocation, setToLocation] = useState('');
   const [oilWell, setOilWell] = useState('');
@@ -328,6 +346,8 @@ export default function OilCreatePage() {
   const [dieselCostPerL, setDieselCostPerL] = useState('');
   const [petrolCostPerL, setPetrolCostPerL] = useState('');
 
+  const [createdLotId, setCreatedLotId] = useState<number | null>(null);  // NEW
+
   // Summary modal
   const [summaryOpen, setSummaryOpen] = useState(false);
 
@@ -337,6 +357,10 @@ export default function OilCreatePage() {
   const [vendorSheetOpen, setVendorSheetOpen] = useState(false);
   const [vendorDisplayName, setVendorDisplayName] = useState<string | null>(null);
   const [currentPayable, setCurrentPayable] = useState<number>(0);
+
+  // Allocations to drive "Pay now" correct split
+  const [singleAllocation, setSingleAllocation] = useState<Allocation | null>(null);
+  const [multiAllocations, setMultiAllocations] = useState<RowAlloc[] | null>(null);
 
   // Multi sheet states (for "both")
   const [multiSheetOpen, setMultiSheetOpen] = useState(false);
@@ -505,7 +529,26 @@ export default function OilCreatePage() {
         setMultiVendorName(vendor);
         setMultiCurrency(currencyCode || 'USD');
 
+        // Build per-row allocations so the multi sheet pays oil + extras accurately
         if (rows.length >= 1) {
+          const halfTruck = Number(truckRent || 0) / (rows.length || 1);
+          const halfDepot = Number(depotCost || 0) / (rows.length || 1);
+          const halfTax = Number(tax || 0) / (rows.length || 1);
+
+          const allocationsPerRow: RowAlloc[] = rows.map((r) => ({
+            oilId: r.oilId,
+            allocation: {
+              oilCost: Number(r.currentPayable || 0),
+              extras: [
+                { category: 'truck_rent', amount: halfTruck },
+                { category: 'depot_cost', amount: halfDepot },
+                { category: 'tax', amount: halfTax },
+              ],
+              currency: currencyCode,
+              total: Number(r.currentPayable || 0) + halfTruck + halfDepot + halfTax,
+            },
+          }));
+          setMultiAllocations(allocationsPerRow);
           setChoiceMode('multi');
           setChoiceOpen(true);
         } else {
@@ -514,6 +557,7 @@ export default function OilCreatePage() {
         return;
       }
 
+      // SINGLE
       const payload: any = {
         oil_type: oilType,
         qty: Number(qty),
@@ -531,6 +575,22 @@ export default function OilCreatePage() {
       const oil = res?.data || {};
       const newId = Number(oil?.id);
 
+      // --- resolve the LOT id so the first payment can allocate by LOT (extras → base) ---
+      let newLotId: number | null =
+        Number.isFinite(oil?.lot_id) ? Number(oil.lot_id) :
+        Number.isFinite(oil?.lot?.id) ? Number(oil.lot.id) : null;
+
+      if (!newLotId && Number.isFinite(newId)) {
+        try {
+          const r = await api.get(`/diiwaanoil/${newId}`, { headers: { Authorization: `Bearer ${token}` } });
+          const d = r?.data || {};
+          newLotId =
+            Number.isFinite(d?.lot_id) ? Number(d.lot_id) :
+            Number.isFinite(d?.lot?.id) ? Number(d.lot.id) : null;
+        } catch {}
+      }
+
+
       if (Number.isFinite(newId)) {
         await createExtra(newId, 'truck_rent', Number(truckRent || 0));
         await createExtra(newId, 'depot_cost', Number(depotCost || 0));
@@ -543,14 +603,34 @@ export default function OilCreatePage() {
         (supplierName || '').trim() ||
         null;
 
-      const payableGuess = (typeof oil?.total_landed_cost === 'number' ? Number(oil.total_landed_cost) : undefined) ?? 0;
+      // include extras so the VendorPaymentCreateSheet sees the same figure as vendorbills
+      const extrasSum =
+        Number(truckRent || 0) + Number(depotCost || 0) + Number(tax || 0);
 
+      const payableGuess =
+        Number(oil?.total_landed_cost || 0) + extrasSum;
+
+      // Build allocation for single flow
+      const allocation: Allocation = {
+        oilCost: Number(oil?.total_landed_cost || 0),
+        extras: [
+          { category: 'truck_rent', amount: Number(truckRent || 0) },
+          { category: 'depot_cost', amount: Number(depotCost || 0) },
+          { category: 'tax', amount: Number(tax || 0) },
+        ],
+        currency: currencyCode,
+        total: Number(oil?.total_landed_cost || 0) + extrasSum,
+      };
+
+      setSingleAllocation(allocation);
       setCreatedOilId(Number.isFinite(newId) ? newId : null);
+      setCreatedLotId(newLotId);  // <— store the LOT id
       setVendorDisplayName(vendor);
       setCurrentPayable(Math.max(0, payableGuess));
 
       setChoiceMode('single');
       setChoiceOpen(true);
+
     } catch (e: any) {
       setSubmitting(false);
       // TODO: toast/snackbar
@@ -632,7 +712,7 @@ export default function OilCreatePage() {
                 </GridCol>
               </GridRow>
 
-              {/* Row: Truck type + Supplier (renamed from Ceelka Shidaalka) */}
+              {/* Row: Truck type + Supplier */}
               <GridRow>
                 <GridCol>
                   <FloatingSelect label="Truck type" value={truckType} onSelect={setTruckType} options={TRUCK_TYPES} renderLabel={(v) => (v === 'pulin' ? 'Pulin' : 'Samateral')} containerStyle={styles.inputCompact} />
@@ -673,13 +753,25 @@ export default function OilCreatePage() {
             </>
           ) : (
             <>
-              {/* Extras common: Truck rent + Depot cost */}
+              {/* Extras common: Truck rent + Depot cost (DEFAULT keyboard + sanitize) */}
               <GridRow>
                 <GridCol>
-                  <FloatingTextInput label="Truck rent" value={truckRent} onChangeText={(t) => setTruckRent(filterNumeric(t))} keyboardType="decimal-pad" returnKeyType="next" containerStyle={styles.inputCompact} />
+                  <FloatingTextInput
+                    label="Truck rent"
+                    value={truckRent}
+                    onChangeText={(t) => setTruckRent(filterNumeric(t))}
+                    returnKeyType="next"
+                    containerStyle={styles.inputCompact}
+                  />
                 </GridCol>
                 <GridCol>
-                  <FloatingTextInput label="Depot cost" value={depotCost} onChangeText={(t) => setDepotCost(filterNumeric(t))} keyboardType="decimal-pad" returnKeyType="next" containerStyle={styles.inputCompact} />
+                  <FloatingTextInput
+                    label="Qarashka Ceelka"
+                    value={depotCost}
+                    onChangeText={(t) => setDepotCost(filterNumeric(t))}
+                    returnKeyType="next"
+                    containerStyle={styles.inputCompact}
+                  />
                 </GridCol>
               </GridRow>
 
@@ -687,7 +779,12 @@ export default function OilCreatePage() {
               {!isBoth ? (
                 <GridRow>
                   <GridCol>
-                    <FloatingTextInput label="Cost / Liter *" value={landedCostPerL} onChangeText={(t) => setLandedCostPerL(filterNumeric(t))} keyboardType="decimal-pad" containerStyle={styles.inputCompact} />
+                    <FloatingTextInput
+                      label="Cost / Liter *"
+                      value={landedCostPerL}
+                      onChangeText={(t) => setLandedCostPerL(filterNumeric(t))}
+                      containerStyle={styles.inputCompact}
+                    />
                   </GridCol>
                   <GridCol><View /></GridCol>
                 </GridRow>
@@ -696,20 +793,42 @@ export default function OilCreatePage() {
                   <Text style={{ color: COLOR_TEXT, fontWeight: '800', marginBottom: 6 }}>Diesel</Text>
                   <GridRow>
                     <GridCol>
-                      <FloatingTextInput label="Liters *" value={dieselLiters} onChangeText={(t) => setDieselLiters(filterInt(t))} keyboardType="number-pad" containerStyle={styles.inputCompact} />
+                      <FloatingTextInput
+                        label="Liters *"
+                        value={dieselLiters}
+                        onChangeText={(t) => setDieselLiters(filterInt(t))}
+                        keyboardType="number-pad"
+                        containerStyle={styles.inputCompact}
+                      />
                     </GridCol>
                     <GridCol>
-                      <FloatingTextInput label="Cost / L *" value={dieselCostPerL} onChangeText={(t) => setDieselCostPerL(filterNumeric(t))} keyboardType="decimal-pad" containerStyle={styles.inputCompact} />
+                      <FloatingTextInput
+                        label="Cost / L *"
+                        value={dieselCostPerL}
+                        onChangeText={(t) => setDieselCostPerL(filterNumeric(t))}
+                        containerStyle={styles.inputCompact}
+                      />
                     </GridCol>
                   </GridRow>
 
                   <Text style={{ color: COLOR_TEXT, fontWeight: '800', marginBottom: 6, marginTop: 6 }}>Petrol</Text>
                   <GridRow>
                     <GridCol>
-                      <FloatingTextInput label="Liters *" value={petrolLiters} onChangeText={(t) => setPetrolLiters(filterInt(t))} keyboardType="number-pad" containerStyle={styles.inputCompact} />
+                      <FloatingTextInput
+                        label="Liters *"
+                        value={petrolLiters}
+                        onChangeText={(t) => setPetrolLiters(filterInt(t))}
+                        keyboardType="number-pad"
+                        containerStyle={styles.inputCompact}
+                      />
                     </GridCol>
                     <GridCol>
-                      <FloatingTextInput label="Cost / L *" value={petrolCostPerL} onChangeText={(t) => setPetrolCostPerL(filterNumeric(t))} keyboardType="decimal-pad" containerStyle={styles.inputCompact} />
+                      <FloatingTextInput
+                        label="Cost / L *"
+                        value={petrolCostPerL}
+                        onChangeText={(t) => setPetrolCostPerL(filterNumeric(t))}
+                        containerStyle={styles.inputCompact}
+                      />
                     </GridCol>
                   </GridRow>
                 </>
@@ -718,10 +837,22 @@ export default function OilCreatePage() {
               {/* Currency + Tax */}
               <GridRow>
                 <GridCol>
-                  <FloatingSelect label="Currency" value={currencyKey} onSelect={setCurrencyKey} options={['USD', 'shimaal'] as CurrencyKey[]} renderLabel={(v) => CURRENCY_OPTIONS.find((c) => c.key === v)?.label || v} containerStyle={styles.inputCompact} />
+                  <FloatingSelect
+                    label="Currency"
+                    value={currencyKey}
+                    onSelect={setCurrencyKey}
+                    options={['USD', 'shimaal'] as CurrencyKey[]}
+                    renderLabel={(v) => CURRENCY_OPTIONS.find((c) => c.key === v)?.label || v}
+                    containerStyle={styles.inputCompact}
+                  />
                 </GridCol>
                 <GridCol>
-                  <FloatingTextInput label="Tax" value={tax} onChangeText={(t) => setTax(filterNumeric(t))} keyboardType="decimal-pad" containerStyle={styles.inputCompact} />
+                  <FloatingTextInput
+                    label="Tax"
+                    value={tax}
+                    onChangeText={(t) => setTax(filterNumeric(t))}
+                    containerStyle={styles.inputCompact}
+                  />
                 </GridCol>
               </GridRow>
 
@@ -849,14 +980,17 @@ export default function OilCreatePage() {
         visible={vendorSheetOpen}
         onClose={() => setVendorSheetOpen(false)}
         token={token ?? null}
-        oilId={createdOilId ?? 0}
+        oilId={createdOilId ?? 0}                 // fallback
+        lotId={createdLotId ?? undefined}         // <— ADD THIS: forces lot-allocated payment
         vendorNameOverride={vendorDisplayName ?? undefined}
         currentPayable={currentPayable}
         onCreated={onVendorPaymentDone}
         companyName={undefined}
         companyContact={undefined}
         extraCosts={extraCostsSingle}
+        allocation={singleAllocation ?? undefined}
       />
+
       <VendorPaymentMultiSheet
         visible={multiSheetOpen}
         onClose={() => setMultiSheetOpen(false)}
@@ -864,6 +998,7 @@ export default function OilCreatePage() {
         vendorName={multiVendorName || '-'}
         currencyCode={multiCurrency}
         rows={multiRows}
+        allocations={multiAllocations ?? undefined} // <-- per-row allocations for both flow
         onCreated={() => {
           setMultiSheetOpen(false);
           router.push('/TrackVendorBills/vendorbills');
