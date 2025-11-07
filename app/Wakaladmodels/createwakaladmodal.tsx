@@ -1,4 +1,3 @@
-// app/Wakaalad/createwakaladmodal.tsx
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 import { Feather } from '@expo/vector-icons';
@@ -20,6 +19,7 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import OilExtraCostModal from '../Shidaal/oilExtraCostModal';
 
 const COLOR_BG = '#FFFFFF';
 const COLOR_TEXT = '#0B1221';
@@ -38,9 +38,11 @@ const CAAG_L = 20;
 const fuustoCap = (oilType?: string) =>
   (oilType || '').toLowerCase() === 'petrol' ? 240 : FUUSTO_DEFAULT_L;
 
-
+/** Types */
 type OilSellOption = {
   id: number;
+  oil_id: number;
+  lot_id?: number | null;
   oil_type: string;
   truck_plate?: string | null;
   in_stock_l: number;
@@ -61,6 +63,7 @@ type WakaaladCreatePayload = {
 
 type Props = { visible: boolean; onClose: () => void; onCreated?: (id: number) => void };
 
+/** Toast */
 function useToast() {
   const [message, setMessage] = useState<string | null>(null);
   const anim = useRef(new Animated.Value(0)).current;
@@ -88,6 +91,7 @@ function useToast() {
   return { show, ToastView };
 }
 
+/** Floating Input & Picker */
 function FloatingInput({
   label,
   value,
@@ -160,6 +164,7 @@ function PickerField({
   );
 }
 
+/** Component */
 export default function CreateWakaaladModal({ visible, onClose, onCreated }: Props) {
   const { token } = useAuth();
   const { show: showToast, ToastView } = useToast();
@@ -167,7 +172,7 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
   const insets = useSafeAreaInsets();
   const bottomSafe = insets.bottom || 0;
   const SCREEN_H = Dimensions.get('window').height;
-  const SHEET_H = Math.round(SCREEN_H * 0.96); // larger, closer to top
+  const SHEET_H = Math.round(SCREEN_H * 0.96);
   const slideY = useRef(new Animated.Value(SHEET_H)).current;
 
   useEffect(() => {
@@ -189,9 +194,51 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
 
   const [wkName, setWkName] = useState('');
   const [allocAmt, setAllocAmt] = useState('');
-  const [unitPickerOpen, setUnitPickerOpen] = useState(false);
   const [unit, setUnit] = useState<'fuusto' | 'liters' | 'caag'>('fuusto');
+  const [unitPickerOpen, setUnitPickerOpen] = useState(false);
 
+  // creation + extra-costs
+  const [creating, setCreating] = useState(false);
+  const [showExtraCosts, setShowExtraCosts] = useState(false);
+
+  // Decoupled IDs for extras (so we can clear form without unmounting modal)
+  const [extraOilId, setExtraOilId] = useState<number | undefined>(undefined);
+  const [extraLotId, setExtraLotId] = useState<number | undefined>(undefined);
+
+  // Prefills for OilExtraCostModal (persist even if form resets)
+  const [extraPrefillName, setExtraPrefillName] = useState<string | null>(null);
+  const [extraPrefillQty, setExtraPrefillQty] = useState<number | null>(null);
+
+  // fetch options
+  useEffect(() => {
+    if (!visible) return;
+    let mounted = true;
+    (async () => {
+      try {
+        setLoadingOptions(true);
+        const res = await api.get<OilSellOption[]>('/diiwaanoil/sell-options', {
+          headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+          params: { only_available: true, order: 'created_desc' },
+        });
+        if (!mounted) return;
+        setOptions(res.data || []);
+      } catch (e: any) {
+        showToast(String(e?.response?.data?.detail || 'Failed to load oil lots'));
+      } finally {
+        if (mounted) setLoadingOptions(false);
+      }
+    })();
+    return () => { mounted = false; };
+  }, [visible, token]);
+
+  const toDecimal = (s: string) => {
+    let out = s.replace(/[^0-9.]/g, '');
+    const firstDot = out.indexOf('.');
+    if (firstDot !== -1) out = out.slice(0, firstDot + 1) + out.slice(firstDot + 1).replace(/\./g, '');
+    return out;
+  };
+
+  // helpers
   const filteredOptions = useMemo(() => {
     const q = oilQuery.trim().toLowerCase();
     if (!q) return options;
@@ -211,74 +258,78 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
   }, [allocAmt, unit, selected?.oil_type]);
 
   const availableInUnit = useMemo(() => {
-  if (!selected) return 0;
-  if (unit === 'liters') return Number(selected.in_stock_l || 0);
-  if (unit === 'fuusto') return Math.floor(Number(selected.in_stock_fuusto || 0));
-  return Math.floor(Number(selected.in_stock_caag || 0));
-}, [selected, unit]);
+    if (!selected) return 0;
+    if (unit === 'liters') return Number(selected.in_stock_l || 0);
+    if (unit === 'fuusto') return Math.floor(Number(selected.in_stock_fuusto || 0));
+    return Math.floor(Number(selected.in_stock_caag || 0));
+  }, [selected, unit]);
 
+  const exceeds = useMemo(
+    () => (selected ? allocLiters > (Number(selected.in_stock_l || 0) + 1e-9) : false),
+    [selected, allocLiters]
+  );
 
-  const exceeds = useMemo(() => (selected ? allocLiters > (Number(selected.in_stock_l || 0) + 1e-9) : false), [
-    selected,
-    allocLiters,
-  ]);
+  const canSubmit = !!(selected && wkName.trim() && allocLiters > 0 && !exceeds);
 
-  const canSubmit = selected && wkName.trim() && allocLiters > 0 && !exceeds;
+  // wakaalada → “fuusto” count for extra-costs
+  const qtyBarrels = useMemo(() => {
+    const count = parseFloat((allocAmt || '').replace(',', '.')) || 0;
+    const fCap = fuustoCap(selected?.oil_type);
+    if (unit === 'fuusto') return Math.floor(count);
+    if (unit === 'liters') return Math.floor(allocLiters / fCap);
+    return Math.floor((count * CAAG_L) / fCap);
+  }, [allocAmt, unit, selected?.oil_type, allocLiters]);
 
-  useEffect(() => {
-    if (!visible) return;
-    let mounted = true;
-    (async () => {
-      try {
-        setLoadingOptions(true);
-        const res = await api.get<OilSellOption[]>('/diiwaanoil/sell-options', {
-          headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-          params: { only_available: true, order: 'created_desc' },
-        });
-        if (!mounted) return;
-        setOptions(res.data || []);
-      } catch (e: any) {
-        showToast(String(e?.response?.data?.detail || 'Failed to load oil lots'));
-      } finally {
-        if (mounted) setLoadingOptions(false);
-      }
-    })();
-    return () => {
-      mounted = false;
+  /** Create wakaalad, then TRIGGER OilExtraCostModal (keep this modal open) */
+  async function handleSaveOpenExtras() {
+    if (!selected || !canSubmit || creating) return;
+
+    const prefillName = `${wkName.trim()} - wakaalad`;
+    const prefillQty = qtyBarrels;
+
+    // capture IDs for the extras modal BEFORE clearing form state
+    const oilIdForExtras = selected.lot_id ? undefined : (selected.oil_id ?? selected.id);
+    const lotIdForExtras = selected.lot_id ?? undefined;
+
+    const payload: WakaaladCreatePayload = {
+      oil_id: selected.oil_id ?? selected.id,
+      wakaalad_name: wkName.trim(),
+      allocate_liters: allocLiters,
     };
-  }, [visible, token]);
 
-  const toDecimal = (s: string) => {
-    let out = s.replace(/[^0-9.]/g, '');
-    const firstDot = out.indexOf('.');
-    if (firstDot !== -1) out = out.slice(0, firstDot + 1) + out.slice(firstDot + 1).replace(/\./g, '');
-    return out;
-  };
-
-  async function handleCreate() {
-    if (!selected || !canSubmit) return;
     try {
-      const payload: WakaaladCreatePayload = {
-        oil_id: selected.id,
-        wakaalad_name: wkName.trim(),
-        allocate_liters: allocLiters,
-      };
+      setCreating(true);
+
       const res = await api.post('/wakaalad_diiwaan', payload, {
         headers: token ? { Authorization: `Bearer ${token}` } : undefined,
       });
+
       onCreated?.(Number(res?.data?.id || 0));
-      onClose();
+      showToast('Wakaalad saved');
+
+      // prime the extras modal
+      setExtraOilId(oilIdForExtras);
+      setExtraLotId(lotIdForExtras);
+      setExtraPrefillName(prefillName);
+      setExtraPrefillQty(prefillQty);
+
+      // open extras immediately
+      setShowExtraCosts(true);
+
+      // reset inputs for next entry (safe because extras modal is now decoupled from `selected`)
       setSelectedId(null);
       setWkName('');
       setAllocAmt('');
       setUnit('fuusto');
-      showToast('Wakaalad saved');
     } catch (e: any) {
       showToast(String(e?.response?.data?.detail || e?.message || 'Unable to save wakaalad'));
+    } finally {
+      setCreating(false);
     }
   }
 
   const handleCloseAll = () => {
+    if (showExtraCosts) return; // block dismiss while extra modal is up
     setOilPickerOpen(false);
     setUnitPickerOpen(false);
     onClose();
@@ -294,7 +345,7 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
         <Animated.View style={[styles.sheetWrapAbs, { height: SHEET_H, transform: [{ translateY: slideY }] }]}>
           <KeyboardAvoidingView
             behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-            keyboardVerticalOffset={Platform.OS === 'ios' ? 40 : 0} // lift a bit on iOS; Android resizes height
+            keyboardVerticalOffset={Platform.OS === 'ios' ? 40 : 0}
             style={{ flex: 1 }}
           >
             <View style={[styles.sheetCard, { paddingBottom: Math.max(18, bottomSafe) }]}>
@@ -302,8 +353,13 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
 
               {/* Header */}
               <View style={styles.headerRow}>
-                <Text style={styles.titleCenter}>Save Wakalalad</Text>
-                <TouchableOpacity onPress={handleCloseAll} style={styles.closeBtn} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                <Text style={styles.titleCenter}>Save Wakaalad</Text>
+                <TouchableOpacity
+                  onPress={handleCloseAll}
+                  disabled={showExtraCosts}
+                  style={[styles.closeBtn, showExtraCosts && { opacity: 0.4 }]}
+                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                >
                   <Feather name="x" size={20} color={COLOR_TEXT} />
                 </TouchableOpacity>
               </View>
@@ -315,7 +371,7 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
                 showsVerticalScrollIndicator={false}
               >
                 <PickerField
-                  label="Oil lot"
+                  label="Dooro Gaariga Shidaalka"
                   value={selected ? `${(selected.oil_type || '').toUpperCase()} • ${selected.truck_plate || '—'}` : undefined}
                   onPress={() => {
                     setOilQuery('');
@@ -323,8 +379,6 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
                   }}
                   style={{ marginTop: 14 }}
                 />
-
-                {/* Removed unit-type stock chips as requested */}
 
                 <View style={{ flexDirection: 'row', gap: 16, marginBottom: 20 }}>
                   <FloatingInput
@@ -356,21 +410,25 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
                   <View style={styles.inlineWarning}>
                     <Feather name="alert-triangle" size={14} color="#92400E" />
                     <Text style={styles.inlineWarningText}>
-                      {`Requested ${unit === 'liters' ? allocLiters.toFixed(2) + ' L' : `${Number(allocAmt || 0)} ${unit}`} exceeds available ${
-                        unit === 'liters' ? Number(selected.in_stock_l || 0).toFixed(2) + ' L' : `${Math.floor(availableInUnit)} ${unit}`
+                      {`Requested ${unit === 'liters' ? `${allocLiters.toFixed(2)} L` : `${Number(allocAmt || 0)} ${unit}`} exceeds available ${
+                        unit === 'liters' ? `${Number(selected.in_stock_l || 0).toFixed(2)} L` : `${Math.floor(availableInUnit)} ${unit}`
                       }.`}
                     </Text>
                   </View>
                 )}
 
                 <TouchableOpacity
-                  style={[styles.submitBtn, (!canSubmit) && { opacity: 0.7 }]}
-                  disabled={!canSubmit}
-                  onPress={handleCreate}
+                  style={[styles.submitBtn, (!canSubmit || creating) && { opacity: 0.7 }]}
+                  disabled={!canSubmit || creating}
+                  onPress={handleSaveOpenExtras}
                   activeOpacity={0.9}
                 >
-                  <Feather name="save" size={16} color="#fff" style={{ marginRight: 6 }} />
-                  <Text style={styles.submitText}>Save Wakalalad</Text>
+                  {creating ? (
+                    <ActivityIndicator color="#fff" style={{ marginRight: 6 }} />
+                  ) : (
+                    <Feather name="save" size={16} color="#fff" style={{ marginRight: 6 }} />
+                  )}
+                  <Text style={styles.submitText}>Save Wakaalad</Text>
                 </TouchableOpacity>
               </ScrollView>
             </View>
@@ -455,10 +513,7 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
             <TouchableOpacity style={styles.optionRowSm} onPress={() => { setUnit('fuusto'); setUnitPickerOpen(false); }}>
               <Text style={styles.pickerMain}>Fuusto (×{fuustoCap(selected?.oil_type)} L)</Text>
               {selected ? (
-                // Fuusto available — after (use server value)
-              <Text style={styles.pickerSub}>
-                Available: {Math.floor(Number(selected.in_stock_fuusto || 0))} fuusto
-              </Text>
+                <Text style={styles.pickerSub}>Available: {Math.floor(Number(selected.in_stock_fuusto || 0))} fuusto</Text>
               ) : null}
             </TouchableOpacity>
 
@@ -474,6 +529,17 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
           </View>
         </View>
       </Modal>
+
+      {/* Extra Costs Modal (triggered right after creation; parent stays open) */}
+      <OilExtraCostModal
+        visible={showExtraCosts}
+        onClose={() => setShowExtraCosts(false)}
+        oilId={extraOilId}
+        lotId={extraLotId}
+        defaultCategoryName={extraPrefillName ?? `${wkName.trim()} - wakaalad`}
+        defaultQtyBarrel={extraPrefillQty ?? 0}
+        // Do NOT auto-close the parent; let caller decide after finishing extra costs.
+      />
     </>
   );
 }
@@ -514,9 +580,6 @@ const styles = StyleSheet.create({
   inputBase: { minHeight: 48, alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between' },
   inputPadded: { paddingHorizontal: 12, paddingVertical: 10 },
   inputText: { fontSize: 15, color: COLOR_TEXT },
-  inputDisabled: { backgroundColor: '#F3F4F6' },
-
-  // (infoCard removed)
 
   inlineWarning: {
     marginTop: -2,
@@ -548,7 +611,6 @@ const styles = StyleSheet.create({
   },
   submitText: { color: 'white', fontSize: 15, fontWeight: '800' },
 
-  // Centering wrapper for popups
   popupCenterWrap: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: 'center',
@@ -582,9 +644,15 @@ const styles = StyleSheet.create({
   toast: {
     position: 'absolute', bottom: 14, left: 14, right: 14,
     paddingVertical: 10, paddingHorizontal: 12, backgroundColor: '#ECFDF5',
-    borderWidth: 1, borderColor: '#D1FAE5', borderRadius: 12,
-    flexDirection: 'row', alignItems: 'center', gap: 8,
-    shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 10, shadowOffset: { width: 0, height: 6 },
+    borderWidth: 1, borderColor: '#D1FAE5',
+    borderRadius: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    shadowColor: '#000',
+    shadowOpacity: 0.1,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 6 },
     elevation: 8,
   },
   toastText: { color: '#065F46', fontWeight: '700', fontSize: 12 },

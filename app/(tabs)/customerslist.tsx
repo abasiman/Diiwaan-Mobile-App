@@ -1,9 +1,16 @@
 // app/(tabs)/customerslist.tsx
 import { Feather } from '@expo/vector-icons';
+import NetInfo from '@react-native-community/netinfo';
 import { useFocusEffect } from '@react-navigation/native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 
 import api from '@/services/api';
 import {
@@ -26,18 +33,15 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuth } from '../../src/context/AuthContext';
-
-type Customer = {
-  id: number;
-  name: string | null;
-  phone: string | null;
-  address?: string | null;
-  status?: string | null;
-  amount_due: number;
-  amount_paid: number;
-  created_at: string;
-  updated_at: string;
-};
+import {
+  createOrUpdateCustomerLocal,
+  getCustomersLocal,
+  hardDeleteCustomerLocal,
+  markCustomerDeletedLocal,
+  syncCustomersWithServer,
+  upsertCustomersFromServer,
+  type CustomerRow as Customer,
+} from '../db/customerRepo';
 
 const BRAND_BLUE = '#0B2447';
 const BRAND_BLUE_2 = '#0B2447';
@@ -49,22 +53,21 @@ const DANGER = '#EF4444';
 const SUCCESS = '#10B981';
 const BORDER = '#E5E7EB';
 
-
 const { height: SCREEN_H } = Dimensions.get('window');
 const TOP_GAP = 80;
 const SHEET_H = Math.min(SCREEN_H - TOP_GAP, SCREEN_H * 0.9);
 const MINI_SHEET_H = 180;
 
 export default function CustomersList() {
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const router = useRouter();
 
+  const [online, setOnline] = useState(true);
 
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
 
   const [search, setSearch] = useState('');
   const [offset, setOffset] = useState(0);
@@ -74,14 +77,11 @@ export default function CustomersList() {
   const offsetRef = useRef(0);
   const loadingRef = useRef(false);
 
-
-
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const selectedCustomer = useMemo(
     () => customers.find((c) => c.id === selectedId) || null,
     [selectedId, customers]
   );
-
 
   const settingsY = useRef(new Animated.Value(SCREEN_H)).current;
   const addY = useRef(new Animated.Value(SCREEN_H)).current;
@@ -91,13 +91,32 @@ export default function CustomersList() {
   const [formMode, setFormMode] = useState<'add' | 'edit'>('add');
   const [formName, setFormName] = useState('');
   const [formPhone, setFormPhone] = useState('');
-  const [formAmountDue, setFormAmountDue] = useState<string>('0');
+  const [formAmountDue, setFormAmountDue] = useState<string>('0'); // still unused, kept for compatibility
   const [formStatus, setFormStatus] = useState<'active' | 'inactive' | ''>('active');
   const [formAddress, setFormAddress] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
- 
   const formScrollRef = useRef<ScrollView>(null);
+
+  console.log('[CustomersList] render', {
+    hasUser: !!user,
+    userId: user?.id,
+    hasToken: !!token,
+  });
+
+  // ---- network status (offline/online) ----
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      console.log('[CustomersList] NetInfo changed', {
+        isConnected: state.isConnected,
+        isInternetReachable: state.isInternetReachable,
+        online: ok,
+      });
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
 
   const resetForm = useCallback(() => {
     setFormMode('add');
@@ -114,6 +133,7 @@ export default function CustomersList() {
       const safe = (name ?? '').trim();
       if (!safe) return Alert.alert('Xulasho khaldan', 'Magaca macaamiilka waa madhan.');
       const encoded = encodeURIComponent(safe);
+      console.log('[CustomersList] navigate to invoices for', safe);
       router.push({ pathname: '/(Transactions)/[customer]', params: { customer: encoded } });
     },
     [router]
@@ -129,6 +149,7 @@ export default function CustomersList() {
   }, [settingsY]);
 
   const openAdd = useCallback(() => {
+    console.log('[CustomersList] openAdd');
     setFormMode('add');
     resetForm();
     setIsAddOpen(true);
@@ -144,6 +165,7 @@ export default function CustomersList() {
 
   const openEdit = useCallback(
     (c: Customer) => {
+      console.log('[CustomersList] openEdit for', c.id, c.name);
       setFormMode('edit');
       setFormName(c.name || '');
       setFormPhone(c.phone || '');
@@ -174,6 +196,7 @@ export default function CustomersList() {
   );
 
   const closeAdd = useCallback(() => {
+    console.log('[CustomersList] closeAdd');
     Animated.timing(addY, {
       toValue: SCREEN_H,
       duration: 240,
@@ -182,78 +205,199 @@ export default function CustomersList() {
     }).start(({ finished }) => finished && setIsAddOpen(false));
   }, [addY]);
 
-
-const loadPage = useCallback(
-  async (reset = false) => {
-    if (!token) return;
-    if (loadingRef.current) return;
-    loadingRef.current = true;
-
-    try {
-      if (reset) {
-        setLoading(true);
-        setHasMore(true);
-        offsetRef.current = 0; 
-        setOffset(0);          
+  // ---- Local page loader (SQLite only) ----
+  const loadPage = useCallback(
+    (reset = false) => {
+      if (user?.id == null) {
+        console.log('[CustomersList] loadPage aborted: no user id');
+        setLoading(false);
+        setCustomers([]);
+        setHasMore(false);
+        return;
+      }
+      if (loadingRef.current) {
+        console.log('[CustomersList] loadPage skipped (already loading)');
+        return;
       }
 
-      const res = await api.get<Customer[]>('/diiwaancustomers', {
-        params: {
-          q: search || undefined,
-          offset: reset ? 0 : offsetRef.current,
-          limit,
-        },
-      });
-      const data = res.data || [];
+      loadingRef.current = true;
 
-      setCustomers((prev) => {
-        if (reset) return data;
-        
-        const map = new Map(prev.map((c) => [c.id, c]));
-        data.forEach((c) => map.set(c.id, c));
-        return Array.from(map.values());
-      });
+      try {
+        if (reset) {
+          console.log('[CustomersList] loadPage(reset=true)', {
+            userId: user.id,
+            search,
+            limit,
+          });
+          setLoading(true);
+          setHasMore(true);
+          offsetRef.current = 0;
+          setOffset(0);
+        } else {
+          console.log('[CustomersList] loadPage(reset=false)', {
+            userId: user.id,
+            search,
+            limit,
+            currentOffset: offsetRef.current,
+          });
+        }
 
-      setHasMore(data.length === limit);
-      offsetRef.current += data.length;  
-      setOffset(offsetRef.current);     
-      setError(null);
-    } catch (e: any) {
-      setError(e?.response?.data?.detail || 'Failed to load customers.');
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-      loadingRef.current = false;
+        const localOffset = reset ? 0 : offsetRef.current;
+        const data = getCustomersLocal(search, limit, localOffset, user.id);
+
+        console.log('[CustomersList] getCustomersLocal returned', data.length, 'rows');
+
+        setCustomers((prev) => {
+          if (reset) return data;
+          return [...prev, ...data];
+        });
+
+        setHasMore(data.length === limit);
+        offsetRef.current = localOffset + data.length;
+        setOffset(offsetRef.current);
+        setError(null);
+      } catch (e: any) {
+        console.log('[CustomersList] loadPage error', e?.message);
+        setError(e?.message || 'Failed to load customers from local db.');
+      } finally {
+        setLoading(false);
+        loadingRef.current = false;
+      }
+    },
+    [search, limit, user?.id]
+  );
+
+  // ---- Pull fresh data from server → SQLite ----
+  const pullLatestFromServer = useCallback(async () => {
+    if (!token || !user?.id) {
+      console.log('[CustomersList] pullLatestFromServer aborted: missing token or user id', {
+        hasToken: !!token,
+        userId: user?.id,
+      });
+      return;
     }
-  },
-  [token, search, limit] 
-);
 
+    console.log('[CustomersList] pullLatestFromServer START', {
+      userId: user.id,
+    });
 
- useEffect(() => {
-  if (token) loadPage(true);
-}, [token, loadPage]);
+    try {
+      const all: any[] = [];
+      const pageSize = 100;
+      let pageOffset = 0;
 
+      while (pageOffset < 5000) {
+        console.log('[CustomersList] fetching /diiwaancustomers', {
+          offset: pageOffset,
+          limit: pageSize,
+        });
 
- useEffect(() => {
-  const t = setTimeout(() => {
-    if (token) loadPage(true);
-  }, 300);
-  return () => clearTimeout(t);
-}, [search, token, loadPage]);
+        const res = await api.get('/diiwaancustomers', {
+          params: {
+            offset: pageOffset,
+            limit: pageSize,
+          },
+        });
 
+        const raw: any = res.data;
+        const page: any[] = Array.isArray(raw?.items)
+          ? raw.items
+          : Array.isArray(raw)
+          ? raw
+          : [];
 
-  const onRefresh = useCallback(() => {
-    setRefreshing(true);
+        console.log('[CustomersList] page length', page.length);
+
+        if (!page.length) break;
+
+        all.push(...page);
+        if (page.length < pageSize) break;
+
+        pageOffset += page.length;
+      }
+
+      console.log('[CustomersList] total customers from server', all.length);
+
+      if (all.length) {
+        upsertCustomersFromServer(all, user.id);
+        console.log('[CustomersList] upserted into SQLite', all.length, 'customers');
+      } else {
+        console.log('[CustomersList] no customers to upsert');
+      }
+    } catch (e: any) {
+      console.log(
+        '[CustomersList] pullLatestFromServer error',
+        e?.response?.data || e?.message || e
+      );
+    }
+  }, [token, user?.id]);
+
+  // Initial load
+  useEffect(() => {
+    console.log('[CustomersList] initial effect', {
+      userId: user?.id,
+      hasToken: !!token,
+    });
+
+    if (user?.id == null) {
+      setLoading(false);
+      return;
+    }
+
+    // 1) always load from local db
     loadPage(true);
-  }, [loadPage]);
 
- const loadMore = useCallback(() => {
-  if (!loading && hasMore && !loadingRef.current) {
-    loadPage(false);
-  }
-}, [hasMore, loading, loadPage]);
+    // 2) sync dirty → server and pull fresh list whenever we have a token
+    if (token) {
+      (async () => {
+        try {
+          console.log('[CustomersList] initial sync+pull START');
+          await syncCustomersWithServer(api);
+          await pullLatestFromServer();
+          loadPage(true);
+          console.log('[CustomersList] initial sync+pull DONE');
+        } catch (e) {
+          console.log('[CustomersList] initial sync+pull failed', (e as any)?.message);
+        }
+      })();
+    }
+  }, [token, user?.id, loadPage, pullLatestFromServer]);
 
+  // Re-run local query on search change
+  useEffect(() => {
+    if (!user?.id) return;
+    const t = setTimeout(() => {
+      console.log('[CustomersList] search changed → reload', search);
+      loadPage(true);
+    }, 200);
+    return () => clearTimeout(t);
+  }, [search, loadPage, user?.id]);
+
+  const onRefresh = useCallback(async () => {
+    console.log('[CustomersList] onRefresh');
+    setRefreshing(true);
+    try {
+      if (token && user?.id) {
+        await syncCustomersWithServer(api);
+        await pullLatestFromServer();
+      }
+      loadPage(true);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [token, user?.id, loadPage, pullLatestFromServer]);
+
+  const loadMore = useCallback(() => {
+    console.log('[CustomersList] loadMore called', {
+      loading,
+      hasMore,
+      loadingRef: loadingRef.current,
+      offset: offsetRef.current,
+    });
+    if (!loading && hasMore && !loadingRef.current) {
+      loadPage(false);
+    }
+  }, [hasMore, loading, loadPage]);
 
   const fmtMoney = (n: number) =>
     new Intl.NumberFormat('en-US', {
@@ -267,32 +411,76 @@ const loadPage = useCallback(
       Alert.alert('Fadlan geli magaca macaamiilka');
       return;
     }
-    const payload: any = {
+    if (!user?.id) {
+      Alert.alert('Error', 'No tenant selected.');
+      return;
+    }
+
+    const payload = {
       name: formName.trim(),
       phone: formPhone.trim() || null,
       address: formAddress.trim() || null,
       status: formStatus || 'active',
     };
 
+    console.log('[CustomersList] handleCreateOrUpdate', {
+      mode: formMode,
+      online,
+      hasToken: !!token,
+      payload,
+      selectedId: selectedCustomer?.id,
+    });
+
     setSubmitting(true);
     try {
-      if (formMode === 'add') {
-        await api.post('/diiwaancustomers', payload);
-        closeAdd();
-        loadPage(true);
-      } else if (formMode === 'edit' && selectedCustomer) {
-        await api.patch(`/diiwaancustomers/${selectedCustomer.id}`, payload);
-        closeAdd();
-        loadPage(true);
+      if (online && token) {
+        // Online: hit API, then cache into SQLite
+        if (formMode === 'add') {
+          const res = await api.post('/diiwaancustomers', payload);
+          upsertCustomersFromServer([res.data], user.id);
+          console.log('[CustomersList] created customer on server', res.data?.id);
+        } else if (formMode === 'edit' && selectedCustomer) {
+          const res = await api.patch(
+            `/diiwaancustomers/${selectedCustomer.id}`,
+            payload
+          );
+          upsertCustomersFromServer([res.data], user.id);
+          console.log('[CustomersList] updated customer on server', res.data?.id);
+        }
+      } else {
+        // Offline: write to SQLite only; server will get it on next sync
+        if (formMode === 'add') {
+          const row = createOrUpdateCustomerLocal(payload, user.id);
+          console.log('[CustomersList] created customer locally (offline)', row.id);
+        } else if (formMode === 'edit' && selectedCustomer) {
+          const row = createOrUpdateCustomerLocal(payload, user.id, selectedCustomer);
+          console.log('[CustomersList] updated customer locally (offline)', row.id);
+        }
       }
+
+      closeAdd();
+      loadPage(true);
     } catch (e: any) {
+      console.log('[CustomersList] handleCreateOrUpdate error', e?.response?.data || e?.message);
       Alert.alert('Error', e?.response?.data?.detail || 'Operation failed.');
     } finally {
       setSubmitting(false);
     }
-  }, [formName, formPhone, formAddress, formStatus, formMode, selectedCustomer, closeAdd, loadPage]);
+  }, [
+    formName,
+    formPhone,
+    formAddress,
+    formStatus,
+    formMode,
+    selectedCustomer,
+    closeAdd,
+    online,
+    token,
+    loadPage,
+    user?.id,
+  ]);
 
-  const handleDelete = useCallback(async () => {
+  const handleDelete = useCallback(() => {
     if (!selectedCustomer) return;
     Alert.alert('Delete', `Delete ${selectedCustomer.name || 'this customer'}?`, [
       { text: 'Cancel', style: 'cancel' },
@@ -300,19 +488,33 @@ const loadPage = useCallback(
         text: 'Delete',
         style: 'destructive',
         onPress: async () => {
+          console.log('[CustomersList] handleDelete CONFIRMED', {
+            id: selectedCustomer.id,
+            online,
+            hasToken: !!token,
+          });
           try {
-            await api.delete(`/diiwaancustomers/${selectedCustomer.id}`);
+            if (online && token && selectedCustomer.id > 0) {
+              // online delete: tell server, then hard delete from local
+              await api.delete(`/diiwaancustomers/${selectedCustomer.id}`);
+              hardDeleteCustomerLocal(selectedCustomer.id);
+              console.log('[CustomersList] deleted customer on server & local', selectedCustomer.id);
+            } else {
+              // offline: mark deleted + dirty, so sync can send DELETE later
+              markCustomerDeletedLocal(selectedCustomer.id);
+              console.log('[CustomersList] marked customer deleted locally (offline)', selectedCustomer.id);
+            }
             closeSettings();
-            setCustomers((prev) => prev.filter((c) => c.id !== selectedCustomer.id));
+            loadPage(true);
             setSelectedId(null);
           } catch (e: any) {
+            console.log('[CustomersList] handleDelete error', e?.response?.data || e?.message);
             Alert.alert('Error', e?.response?.data?.detail || 'Delete failed.');
           }
         },
       },
     ]);
-  }, [selectedCustomer, closeSettings]);
-
+  }, [selectedCustomer, closeSettings, online, token, loadPage]);
 
   useFocusEffect(
     useCallback(() => {
@@ -338,6 +540,17 @@ const loadPage = useCallback(
     return (
       <TouchableOpacity
         onPress={() => goToInvoices(item.name)}
+        onLongPress={() => {
+          console.log('[CustomersList] longPress on customer', item.id, item.name);
+          setSelectedId(item.id);
+          setIsSettingsOpen(true);
+          Animated.timing(settingsY, {
+            toValue: SCREEN_H - MINI_SHEET_H,
+            duration: 260,
+            easing: Easing.out(Easing.cubic),
+            useNativeDriver: false,
+          }).start();
+        }}
         style={[styles.itemRow, selected && styles.itemRowSelected]}
         activeOpacity={0.7}
       >
@@ -381,6 +594,11 @@ const loadPage = useCallback(
           </Text>
           <View style={{ width: 32 }} />
         </View>
+        {!online && (
+          <Text style={{ color: '#FBBF24', marginTop: 6, textAlign: 'center', fontSize: 11 }}>
+            Offline – xogta waxa laga soo qaaday kaydka gudaha
+          </Text>
+        )}
       </LinearGradient>
 
       {/* Actions */}
@@ -407,7 +625,7 @@ const loadPage = useCallback(
         <TextInput
           value={search}
           onChangeText={setSearch}
-          placeholder="raadi macaamiil"
+          placeholder="raadi macaamiil (offline/online)"
           placeholderTextColor="#9CA3AF"
           style={styles.searchInputOuter}
           autoCorrect={false}
@@ -423,32 +641,36 @@ const loadPage = useCallback(
             {error ? <Text style={styles.errorText}>{error}</Text> : null}
           </View>
         ) : (
-          // 1) FlatList: add style, helpful props, and a simple footer
-        <FlatList
-          data={customers}
-          keyExtractor={(it) => String(it.id)}
-          renderItem={renderItem}
-          ItemSeparatorComponent={() => <View style={styles.separator} />}
-          style={{ flex: 1 }}                         // ← gives it height so it can scroll
-          contentContainerStyle={{ paddingBottom: 24, paddingTop: 8 }}
-          onEndReachedThreshold={0.4}
-          onEndReached={loadMore}
-          keyboardShouldPersistTaps="handled"
-          keyboardDismissMode="on-drag"
-          showsVerticalScrollIndicator
-          refreshControl={
-            <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={ACCENT} />
-          }
-          ListEmptyComponent={!loading ? <Text style={styles.emptyText}>No customers yet.</Text> : null}
-          ListFooterComponent={
-            loading || hasMore ? (
-              <View style={{ paddingVertical: 16, alignItems: 'center' }}>
-                {hasMore ? <ActivityIndicator color={ACCENT} /> : <Text style={styles.emptyText}>— end —</Text>}
-              </View>
-            ) : null
-          }
-        />
-
+          <FlatList
+            data={customers}
+            keyExtractor={(it) => String(it.id)}
+            renderItem={renderItem}
+            ItemSeparatorComponent={() => <View style={styles.separator} />}
+            style={{ flex: 1 }}
+            contentContainerStyle={{ paddingBottom: 24, paddingTop: 8 }}
+            onEndReachedThreshold={0.4}
+            onEndReached={loadMore}
+            keyboardShouldPersistTaps="handled"
+            keyboardDismissMode="on-drag"
+            showsVerticalScrollIndicator
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={onRefresh}
+                tintColor={ACCENT}
+              />
+            }
+            ListEmptyComponent={
+              !loading ? <Text style={styles.emptyText}>No customers yet.</Text> : null
+            }
+            ListFooterComponent={
+              hasMore ? (
+                <View style={{ paddingVertical: 16, alignItems: 'center' }}>
+                  <ActivityIndicator color={ACCENT} />
+                </View>
+              ) : null
+            }
+          />
         )}
       </View>
 
@@ -463,10 +685,9 @@ const loadPage = useCallback(
 
       {/* Settings Bottom Sheet */}
       <Animated.View
-  style={[styles.sheet, { height: MINI_SHEET_H, top: settingsY }]}
-  pointerEvents={isSettingsOpen ? 'auto' : 'none'}
->
-
+        style={[styles.sheet, { height: MINI_SHEET_H, top: settingsY }]}
+        pointerEvents={isSettingsOpen ? 'auto' : 'none'}
+      >
         <View style={styles.sheetHandle} />
         <Text style={styles.sheetTitle}>{selectedCustomer?.name || 'Actions'}</Text>
         <View style={styles.sheetRow}>
@@ -492,12 +713,11 @@ const loadPage = useCallback(
         </TouchableOpacity>
       </Animated.View>
 
-      {/* Add/Edit Bottom Sheet (scrollable) */}
+      {/* Add/Edit Bottom Sheet */}
       <Animated.View
-  style={[styles.sheet, { height: SHEET_H, top: addY }]}
-  pointerEvents={isAddOpen ? 'auto' : 'none'}
->
-
+        style={[styles.sheet, { height: SHEET_H, top: addY }]}
+        pointerEvents={isAddOpen ? 'auto' : 'none'}
+      >
         <View style={styles.sheetHandle} />
         <Text style={styles.sheetTitle}>
           {formMode === 'add' ? 'Add macaamiil' : 'Edit macaamiil'}
@@ -540,7 +760,6 @@ const loadPage = useCallback(
               />
             </View>
 
-            {/* Address moved here (always visible) */}
             <View style={styles.formRow}>
               <Text style={styles.label}>Address</Text>
               <TextInput
@@ -554,9 +773,12 @@ const loadPage = useCallback(
               />
             </View>
 
-            {/* Actions */}
             <View style={styles.formActions}>
-              <TouchableOpacity style={[styles.btn, styles.btnGhost]} onPress={closeAdd} disabled={submitting}>
+              <TouchableOpacity
+                style={[styles.btn, styles.btnGhost]}
+                onPress={closeAdd}
+                disabled={submitting}
+              >
                 <Text style={[styles.btnTxt, { color: TEXT }]}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity
@@ -564,7 +786,9 @@ const loadPage = useCallback(
                 onPress={handleCreateOrUpdate}
                 disabled={submitting}
               >
-                <Text style={styles.btnTxt}>{formMode === 'add' ? 'Save' : 'Update'}</Text>
+                <Text style={styles.btnTxt}>
+                  {formMode === 'add' ? 'Save' : 'Update'}
+                </Text>
               </TouchableOpacity>
             </View>
           </ScrollView>
@@ -573,7 +797,6 @@ const loadPage = useCallback(
     </SafeAreaView>
   );
 }
-
 
 function Backdrop({ visible, onPress }: { visible: boolean; onPress: () => void }) {
   const opacity = useRef(new Animated.Value(0)).current;
@@ -592,7 +815,6 @@ function Backdrop({ visible, onPress }: { visible: boolean; onPress: () => void 
     </Animated.View>
   );
 }
-
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: BG },
@@ -719,7 +941,13 @@ const styles = StyleSheet.create({
     backgroundColor: '#E5E7EB',
     marginBottom: 10,
   },
-  sheetTitle: { fontSize: 16, fontWeight: '800', color: TEXT, textAlign: 'center', marginBottom: 8 },
+  sheetTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: TEXT,
+    textAlign: 'center',
+    marginBottom: 8,
+  },
   sheetRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -750,7 +978,6 @@ const styles = StyleSheet.create({
     height: 44,
     color: TEXT,
   },
-  hint: { fontSize: 11, color: MUTED, marginTop: 6 },
 
   formActions: { flexDirection: 'row', gap: 10, marginTop: 8 },
   btn: {

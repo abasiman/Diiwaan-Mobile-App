@@ -1,9 +1,16 @@
 // app/(customer)/CustomerInvoicesPage.tsx
 import { useAuth } from '@/src/context/AuthContext';
 
+import {
+  getCustomerDetailsLocalByName,
+  getCustomerInvoiceReportLocal,
+  getSaleLocal,
+  upsertCustomerInvoicesFromServer,
+} from '@/app/db/CustomerInvoicesPagerepo';
 import PaymentCreateSheet from '@/app/ManageInvoice/PaymentCreateSheet';
 import api from '@/services/api';
 import { Feather, FontAwesome } from '@expo/vector-icons';
+import NetInfo from '@react-native-community/netinfo';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useGlobalSearchParams, useRouter } from 'expo-router';
 import * as Sharing from 'expo-sharing';
@@ -22,7 +29,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  View
+  View,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { captureRef } from 'react-native-view-shot';
@@ -126,7 +133,7 @@ const PAPER_BORDER = '#EAE7DC';
 export default function CustomerInvoicesPage() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { token } = useAuth();
+  const { token, user } = useAuth(); // user.id is your tenant / owner_id
 
   const { customer_name: raw } = useGlobalSearchParams<{ customer_name?: string | string[] }>();
   const customerName = Array.isArray(raw) ? raw[0] : raw;
@@ -146,9 +153,11 @@ export default function CustomerInvoicesPage() {
   const [search, setSearch] = useState('');
   const [shareOpen, setShareOpen] = useState(false);
 
+  const [online, setOnline] = useState(true);
+
   // 📌 Capture refs
-  const scrollRef = useRef<ScrollView>(null);   // <— capture THIS to get full content
-  const sheetRef = useRef<View>(null);          // inner paper (kept for layout measurement)
+  const scrollRef = useRef<ScrollView>(null); // capture THIS to get full content
+  const sheetRef = useRef<View>(null); // inner paper (kept for layout measurement)
   const [paperHeight, setPaperHeight] = useState(0);
 
   // Receipt modal state
@@ -162,6 +171,15 @@ export default function CustomerInvoicesPage() {
     [token]
   );
 
+  // NetInfo: track connectivity
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
+
   // Profile
   const fetchProfile = useCallback(async () => {
     if (!token) return;
@@ -173,18 +191,24 @@ export default function CustomerInvoicesPage() {
     }
   }, [token, authHeader]);
 
-  // Data: oilsale summary by customer name + fetch Macaamiil for amount_due/paid & phone
-  const fetchReport = useCallback(
-    async (name: string) => {
-      setError(null);
-      setLoading(true);
-      try {
+// inside CustomerInvoicesPage.tsx
+const fetchReport = useCallback(
+  async (name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+
+    setError(null);
+    setLoading(true);
+
+    try {
+      // ONLINE → API + cache to sqlite
+      if (online && token && user?.id) {
         const res = await api.get<OilSaleCustomerReport>(
           '/oilsale/summary/by-customer-name',
           {
             headers: authHeader,
             params: {
-              customer_name: name,
+              customer_name: trimmed,
               match: 'exact',
               case_sensitive: false,
               order: 'created_desc',
@@ -193,30 +217,80 @@ export default function CustomerInvoicesPage() {
             },
           }
         );
+
+        // 1) use server data for current view
         setReport(res.data);
 
-        // fetch Macaamiil for KPIs & contact
-        if (res.data?.customer_id) {
+        // 2) cache to oilsales so offline works next time
+        upsertCustomerInvoicesFromServer(res.data, user.id);
+
+        // 3) KPIs: try API, fallback to local customers table
+        if (res.data.customer_id) {
           try {
-            const c = await api.get<CustomerDetails>(`/diiwaancustomers/${res.data.customer_id}`, {
-              headers: authHeader,
-            });
+            const c = await api.get<CustomerDetails>(
+              `/diiwaancustomers/${res.data.customer_id}`,
+              { headers: authHeader }
+            );
             setCustomer(c.data);
           } catch {
-            setCustomer(null);
+            const local = getCustomerDetailsLocalByName(
+              user.id,
+              res.data.customer_name
+            );
+            setCustomer(local);
           }
         } else {
-          setCustomer(null);
+          const local = getCustomerDetailsLocalByName(
+            user.id,
+            res.data.customer_name
+          );
+          setCustomer(local);
         }
-      } catch (e: any) {
-        setError(e?.response?.data?.detail || 'Failed to fetch customer oil sales.');
-      } finally {
-        setLoading(false);
-        setRefreshing(false);
+
+        return;
       }
-    },
-    [authHeader]
-  );
+
+      // OFFLINE (or no token) → local-only
+      if (user?.id) {
+        const localReport = getCustomerInvoiceReportLocal(user.id, trimmed);
+        setReport(localReport);
+
+        const localCustomer = getCustomerDetailsLocalByName(
+          user.id,
+          localReport.customer_name
+        );
+        setCustomer(localCustomer);
+      } else {
+        setReport(null);
+        setCustomer(null);
+      }
+    } catch (e: any) {
+      // If online call fails, fallback to local cache
+      if (user?.id) {
+        try {
+          const localReport = getCustomerInvoiceReportLocal(user.id, trimmed);
+          setReport(localReport);
+          const localCustomer = getCustomerDetailsLocalByName(
+            user.id,
+            localReport.customer_name
+          );
+          setCustomer(localCustomer);
+          setError(null);
+        } catch {
+          setError('Failed to load customer oil sales from local DB.');
+        }
+      } else {
+        setError(e?.response?.data?.detail || 'Failed to fetch customer oil sales.');
+      }
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  },
+  [authHeader, online, token, user]
+);
+
+
 
   const refetch = useCallback(() => {
     if (decodedName) fetchReport(decodedName);
@@ -227,8 +301,8 @@ export default function CustomerInvoicesPage() {
   }, [fetchProfile]);
 
   useEffect(() => {
-    if (token && decodedName) fetchReport(decodedName);
-  }, [token, decodedName, fetchReport]);
+    if (decodedName) fetchReport(decodedName);
+  }, [decodedName, fetchReport]);
 
   const onRefresh = useCallback(() => {
     setRefreshing(true);
@@ -290,22 +364,44 @@ export default function CustomerInvoicesPage() {
     </View>
   );
 
-  // open receipt
-  const openReceipt = useCallback(async (saleId: number) => {
-    setReceiptOpen(true);
-    setReceiptLoading(true);
-    setActiveSaleId(saleId);
-    setActiveSale(null);
-    try {
-      const res = await api.get<OilSaleRead>(`/oilsale/${saleId}`, { headers: authHeader });
-      setActiveSale(res.data);
-    } catch (e: any) {
-      Alert.alert('Failed to load receipt', e?.response?.data?.detail || 'Please try again.');
-      setReceiptOpen(false);
-    } finally {
-      setReceiptLoading(false);
-    }
-  }, [authHeader]);
+  // open receipt (online + offline)
+  const openReceipt = useCallback(
+    async (saleId: number) => {
+      if (!user?.id) return;
+
+      setReceiptOpen(true);
+      setReceiptLoading(true);
+      setActiveSaleId(saleId);
+      setActiveSale(null);
+
+      try {
+        if (online && token) {
+          const res = await api.get<OilSaleRead>(`/oilsale/${saleId}`, { headers: authHeader });
+          setActiveSale(res.data);
+        } else {
+          const localSale = getSaleLocal(user.id, saleId);
+          if (!localSale) throw new Error('Sale not found in local cache.');
+          setActiveSale(localSale);
+        }
+      } catch (e: any) {
+        // fallback to local if API fails
+        try {
+          const localSale = getSaleLocal(user.id, saleId);
+          if (!localSale) throw e;
+          setActiveSale(localSale);
+        } catch (err: any) {
+          Alert.alert(
+            'Failed to load receipt',
+            err?.response?.data?.detail || err?.message || 'Please try again.'
+          );
+          setReceiptOpen(false);
+        }
+      } finally {
+        setReceiptLoading(false);
+      }
+    },
+    [authHeader, online, token, user]
+  );
 
   // ======= row =======
   const renderItem = useCallback(
@@ -353,7 +449,6 @@ export default function CustomerInvoicesPage() {
 
   const headerTitleText = 'Invoices';
 
-
   /* --------------------------------- Share helpers --------------------------------- */
 
   const openWhatsAppTo = async (phoneRaw: string, text: string) => {
@@ -364,11 +459,15 @@ export default function CustomerInvoicesPage() {
 
     const canDeep = await Linking.canOpenURL('whatsapp://send');
     if (canDeep) {
-      try { return await Linking.openURL(deepLink); } catch {}
+      try {
+        return await Linking.openURL(deepLink);
+      } catch {}
     }
     const canWeb = await Linking.canOpenURL(webLink);
     if (canWeb) {
-      try { return await Linking.openURL(webLink); } catch {}
+      try {
+        return await Linking.openURL(webLink);
+      } catch {}
     }
     Alert.alert('WhatsApp unavailable', 'Could not open WhatsApp on this device.');
   };
@@ -386,7 +485,6 @@ export default function CustomerInvoicesPage() {
     const canShare = await Sharing.isAvailableAsync();
 
     const basePR = PixelRatio.get() || 2;
-    // Cap output height around ~9000px to avoid very tall bitmaps on Android
     const safeMaxOutPx = 9000;
     const measuredHeight = paperHeight || 0;
 
@@ -402,7 +500,6 @@ export default function CustomerInvoicesPage() {
       result: 'tmpfile',
       backgroundColor: '#FFFFFF',
       pixelRatio,
-      // 👇 key flag to capture the WHOLE ScrollView content
       snapshotContentContainer: true,
     });
 
@@ -416,7 +513,11 @@ export default function CustomerInvoicesPage() {
         Alert.alert('Sharing unavailable', 'System sharing is not available on this device.');
         return;
       }
-      await Sharing.shareAsync(uri, { mimeType: 'image/png', dialogTitle: 'Share invoice', UTI: 'public.png' });
+      await Sharing.shareAsync(uri, {
+        mimeType: 'image/png',
+        dialogTitle: 'Share invoice',
+        UTI: 'public.png',
+      });
     } catch (e: any) {
       Alert.alert('Share failed', e?.message || 'Unable to generate image.');
     }
@@ -428,13 +529,22 @@ export default function CustomerInvoicesPage() {
       if (!canShare) {
         const canOpen = await Linking.canOpenURL('whatsapp://send');
         if (canOpen) {
-          await Linking.openURL('whatsapp://send?text=' + encodeURIComponent('See attached invoice.'));
+          await Linking.openURL(
+            'whatsapp://send?text=' + encodeURIComponent('See attached invoice.')
+          );
         } else {
-          Alert.alert('Sharing unavailable', 'WhatsApp or system share sheet is not available.');
+          Alert.alert(
+            'Sharing unavailable',
+            'WhatsApp or system share sheet is not available.'
+          );
         }
         return;
       }
-      await Sharing.shareAsync(uri, { mimeType: 'image/png', UTI: 'public.png', dialogTitle: 'Send to WhatsApp' });
+      await Sharing.shareAsync(uri, {
+        mimeType: 'image/png',
+        UTI: 'public.png',
+        dialogTitle: 'Send to WhatsApp',
+      });
     } catch (e: any) {
       Alert.alert('WhatsApp share failed', e?.message || 'Unable to prepare image for WhatsApp.');
     }
@@ -450,15 +560,26 @@ export default function CustomerInvoicesPage() {
   return (
     <SafeAreaView style={styles.screen} edges={['top', 'bottom', 'left', 'right']}>
       {/* HEADER */}
-      <LinearGradient colors={[BRAND_BLUE, BRAND_BLUE_2]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.header}>
+      <LinearGradient
+        colors={[BRAND_BLUE, BRAND_BLUE_2]}
+        start={{ x: 0, y: 0 }}
+        end={{ x: 1, y: 1 }}
+        style={styles.header}
+      >
         <View style={styles.headerInner}>
           <TouchableOpacity onPress={handleBack} style={styles.backBtn} hitSlop={8}>
             <Feather name="arrow-left" size={20} color="#fff" />
           </TouchableOpacity>
 
-          <Text style={styles.headerTitle} numberOfLines={1}>{headerTitleText}</Text>
+          <Text style={styles.headerTitle} numberOfLines={1}>
+            {headerTitleText}
+          </Text>
 
-          <TouchableOpacity style={styles.headerShareBtn} onPress={() => setShareOpen(true)} activeOpacity={0.9}>
+          <TouchableOpacity
+            style={styles.headerShareBtn}
+            onPress={() => setShareOpen(true)}
+            activeOpacity={0.9}
+          >
             <Feather name="send" size={14} color={BRAND_BLUE} />
             <Text style={styles.headerShareTxt}>Udir macmiil</Text>
           </TouchableOpacity>
@@ -467,7 +588,11 @@ export default function CustomerInvoicesPage() {
 
       {/* Quick actions */}
       <View style={styles.headerBar}>
-        <TouchableOpacity style={[styles.pill, styles.pillPrimary]} activeOpacity={0.9} onPress={() => setIsPayOpen(true)}>
+        <TouchableOpacity
+          style={[styles.pill, styles.pillPrimary]}
+          activeOpacity={0.9}
+          onPress={() => setIsPayOpen(true)}
+        >
           <Feather name="dollar-sign" size={16} color={BRAND_BLUE} />
           <Text style={styles.pillPrimaryTxt}>Bixi deyn</Text>
         </TouchableOpacity>
@@ -481,8 +606,7 @@ export default function CustomerInvoicesPage() {
               params: {
                 customer_name:
                   report?.customer_name || customer?.name || decodedName || '',
-                customer_contact:
-                  customer?.phone || report?.customer_contact || '',
+                customer_contact: customer?.phone || report?.customer_contact || '',
               },
             })
           }
@@ -516,25 +640,36 @@ export default function CustomerInvoicesPage() {
         </View>
       ) : report ? (
         <>
-          {/* 👇 capture THIS ScrollView for a full-page stitched image */}
+          {/* capture THIS ScrollView for a full-page stitched image */}
           <ScrollView
             ref={scrollRef}
             collapsable={false}
             contentContainerStyle={{ paddingBottom: insets.bottom }}
-
-            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={ACCENT} />}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={onRefresh}
+                tintColor={ACCENT}
+              />
+            }
           >
             {/* PRINTABLE / SHAREABLE PAPER */}
             <View
               style={styles.paperWrap}
               ref={sheetRef}
               collapsable={false}
-              onLayout={e => setPaperHeight(e.nativeEvent.layout.height)}
+              onLayout={(e) => setPaperHeight(e.nativeEvent.layout.height)}
             >
               {/* Seller (centered) */}
               <View style={styles.receiptHeaderCenter}>
-                <Text style={styles.receiptTitle} numberOfLines={2}>{sellerTitle || 'Receipt'}</Text>
-                {!!sellerContact && <Text style={styles.receiptContact} numberOfLines={1}>{sellerContact}</Text>}
+                <Text style={styles.receiptTitle} numberOfLines={2}>
+                  {sellerTitle || 'Receipt'}
+                </Text>
+                {!!sellerContact && (
+                  <Text style={styles.receiptContact} numberOfLines={1}>
+                    {sellerContact}
+                  </Text>
+                )}
               </View>
 
               {/* perforation */}
@@ -581,7 +716,7 @@ export default function CustomerInvoicesPage() {
                       {search ? 'No matches.' : 'No oil sales for this customer.'}
                     </Text>
                   }
-                  scrollEnabled={false} // keep content inside outer ScrollView
+                  scrollEnabled={false}
                   contentContainerStyle={{ paddingVertical: 2 }}
                 />
               </View>
@@ -617,7 +752,9 @@ export default function CustomerInvoicesPage() {
         onOpenWhatsAppChat={() =>
           openWhatsAppTo(
             customer?.phone || report?.customer_contact || '',
-            `Salaan ${report?.customer_name || customer?.name || ''}, fadlan eeg rasiidka (sawirka/PNG) ee aan kuu diray.`
+            `Salaan ${
+              report?.customer_name || customer?.name || ''
+            }, fadlan eeg rasiidka (sawirka/PNG) ee aan kuu diray.`
           )
         }
       />
@@ -661,10 +798,15 @@ function ReceiptModal({
   customerPhone: string;
 }) {
   const isUSD = (sale?.currency || '').toUpperCase() === 'USD';
-  const fmtNum = (n?: number | null, d = 2) => (typeof n === 'number' && isFinite(n) ? n.toFixed(d) : '—');
+  const fmtNum = (n?: number | null, d = 2) =>
+    typeof n === 'number' && isFinite(n) ? n.toFixed(d) : '—';
   const fmtUSD = (n?: number | null) =>
     typeof n === 'number' && isFinite(n)
-      ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(n)
+      ? new Intl.NumberFormat('en-US', {
+          style: 'currency',
+          currency: 'USD',
+          maximumFractionDigits: 2,
+        }).format(n)
       : '—';
   const fmtCur = (cur?: string, n?: number | null) => {
     const c = (cur || 'USD').toUpperCase();
@@ -675,8 +817,8 @@ function ReceiptModal({
     ? sale.unit_type === 'liters'
       ? `${fmtNum(sale.liters_sold, 0)} L`
       : sale.unit_type === 'lot'
-        ? '1 lot'
-        : `${sale.unit_qty || 0} ${sale.unit_type}`
+      ? '1 lot'
+      : `${sale.unit_qty || 0} ${sale.unit_type}`
     : '—';
 
   // summary balances (based on single sale)
@@ -715,7 +857,13 @@ function ReceiptModal({
                 {!!customerPhone && <Text style={styles.customerPhoneTxt}>{customerPhone}</Text>}
               </View>
 
-              <View style={{ marginVertical: 8, borderBottomWidth: 1, borderBottomColor: '#F1F1F1' }} />
+              <View
+                style={{
+                  marginVertical: 8,
+                  borderBottomWidth: 1,
+                  borderBottomColor: '#F1F1F1',
+                }}
+              />
 
               {/* Body */}
               <View style={{ gap: 6 }}>
@@ -723,10 +871,17 @@ function ReceiptModal({
                 <KV label="Date" value={new Date(sale.created_at).toLocaleString()} />
                 <KV label="Oil type" value={sale.oil_type?.toUpperCase()} />
                 <KV label="Quantity" value={qtyLabel} />
-                <KV label="Currency" value={isUSD ? '$ (USD)' : (sale.currency || '').toUpperCase()} />
+                <KV
+                  label="Currency"
+                  value={isUSD ? '$ (USD)' : (sale.currency || '').toUpperCase()}
+                />
                 {typeof sale.price_per_l === 'number' ? (
                   <KV
-                    label={sale.unit_type === 'liters' ? 'Price per L' : 'Price per L (derived)'}
+                    label={
+                      sale.unit_type === 'liters'
+                        ? 'Price per L'
+                        : 'Price per L (derived)'
+                    }
                     value={fmtCur(sale.currency, sale.price_per_l)}
                   />
                 ) : null}
@@ -735,8 +890,16 @@ function ReceiptModal({
               {/* Summary */}
               <View style={styles.summaryCard}>
                 <Row label="Subtotal" value={fmtCur(sale.currency, subtotal)} bold={false} />
-                {discount ? <Row label="Discount" value={`- ${fmtCur(sale.currency, discount)}`} bold={false} /> : null}
-                {tax ? <Row label="Tax" value={fmtCur(sale.currency, tax)} bold={false} /> : null}
+                {discount ? (
+                  <Row
+                    label="Discount"
+                    value={`- ${fmtCur(sale.currency, discount)}`}
+                    bold={false}
+                  />
+                ) : null}
+                {tax ? (
+                  <Row label="Tax" value={fmtCur(sale.currency, tax)} bold={false} />
+                ) : null}
                 <Row label="Total" value={fmtCur(sale.currency, totalNative)} bold />
                 {!isUSD && typeof usdView === 'number' ? (
                   <Row label="USD View" value={fmtUSD(usdView)} />
@@ -778,11 +941,16 @@ function KV({ label, value }: { label: string; value: string }) {
     </View>
   );
 }
+
 function Row({ label, value, bold }: { label: string; value: string; bold?: boolean }) {
   return (
     <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 }}>
-      <Text style={{ color: TEXT, fontSize: 13, fontWeight: bold ? '800' : '600' }}>{label}</Text>
-      <Text style={{ color: TEXT, fontSize: 13, fontWeight: bold ? '900' : '700' }}>{value}</Text>
+      <Text style={{ color: TEXT, fontSize: 13, fontWeight: bold ? '800' : '600' }}>
+        {label}
+      </Text>
+      <Text style={{ color: TEXT, fontSize: 13, fontWeight: bold ? '900' : '700' }}>
+        {value}
+      </Text>
     </View>
   );
 }
@@ -804,15 +972,33 @@ function SharePopup({
   return (
     <CenterModal visible={visible} onClose={onClose}>
       <Text style={styles.popupTitle}>Udir macmiil</Text>
-      <TouchableOpacity style={styles.popupBtn} onPress={() => { onShareImg(); onClose(); }}>
+      <TouchableOpacity
+        style={styles.popupBtn}
+        onPress={() => {
+          onShareImg();
+          onClose();
+        }}
+      >
         <Feather name="image" size={16} color={TEXT} />
         <Text style={styles.popupBtnTxt}>Share Image (PNG)</Text>
       </TouchableOpacity>
-      <TouchableOpacity style={styles.popupBtn} onPress={() => { onShareWhatsApp(); onClose(); }}>
+      <TouchableOpacity
+        style={styles.popupBtn}
+        onPress={() => {
+          onShareWhatsApp();
+          onClose();
+        }}
+      >
         <FontAwesome name="whatsapp" size={16} color="#25D366" />
         <Text style={styles.popupBtnTxt}>WhatsApp</Text>
       </TouchableOpacity>
-      <TouchableOpacity style={styles.popupBtn} onPress={() => { onOpenWhatsAppChat(); onClose(); }}>
+      <TouchableOpacity
+        style={styles.popupBtn}
+        onPress={() => {
+          onOpenWhatsAppChat();
+          onClose();
+        }}
+      >
         <FontAwesome name="whatsapp" size={16} color="#25D366" />
         <Text style={styles.popupBtnTxt}>Open WhatsApp Chat</Text>
       </TouchableOpacity>
@@ -1096,7 +1282,13 @@ const styles = StyleSheet.create({
     borderColor: BORDER,
     elevation: 8,
   },
-  popupTitle: { fontWeight: '900', color: TEXT, fontSize: 16, marginBottom: 8, textAlign: 'center' },
+  popupTitle: {
+    fontWeight: '900',
+    color: TEXT,
+    fontSize: 16,
+    marginBottom: 8,
+    textAlign: 'center',
+  },
   popupBtn: {
     flexDirection: 'row',
     alignItems: 'center',

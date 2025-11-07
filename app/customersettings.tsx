@@ -1,5 +1,6 @@
 // app/(customer)/customer-setting.tsx
 import { Feather, Ionicons } from '@expo/vector-icons';
+import NetInfo from '@react-native-community/netinfo';
 import { useFocusEffect } from '@react-navigation/native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
@@ -25,6 +26,15 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import api from '@/services/api';
 import { useAuth } from '../src/context/AuthContext';
+
+// ⬇️ import the offline helpers (fix the path if needed)
+import {
+  createOrUpdateCustomerLocal,
+  getCustomersLocal,
+  hardDeleteCustomerLocal,
+  markCustomerDeletedLocal,
+  upsertCustomersFromServer,
+} from './db/customerRepo';
 
 type Customer = {
   id: number;
@@ -54,7 +64,9 @@ const SHEET_H = Math.min(SCREEN_H * 0.9, 720);
 export default function CustomerSetting() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { token } = useAuth();
+  const { token, user } = useAuth();
+
+  const [online, setOnline] = useState(true);
 
   // data
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -86,6 +98,19 @@ export default function CustomerSetting() {
   const [formAddress, setFormAddress] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
+  // delete popup (center card)
+  const [deleteTarget, setDeleteTarget] = useState<Customer | null>(null);
+  const deleteAnim = useRef(new Animated.Value(0)).current; // 0 hidden, 1 visible
+
+  // ---- network status (offline/online) ----
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
+
   const openEdit = useCallback(
     (c: Customer) => {
       setFormName(c.name || '');
@@ -116,10 +141,6 @@ export default function CustomerSetting() {
       }
     });
   }, [translateY]);
-
-  // delete popup (center card)
-  const [deleteTarget, setDeleteTarget] = useState<Customer | null>(null);
-  const deleteAnim = useRef(new Animated.Value(0)).current; // 0 hidden, 1 visible
 
   const openDelete = useCallback(
     (c: Customer) => {
@@ -167,8 +188,17 @@ export default function CustomerSetting() {
 
   const confirmDelete = useCallback(async () => {
     if (!deleteTarget) return;
+
     try {
-      await api.delete(`/diiwaancustomers/${deleteTarget.id}`);
+      if (online && token && deleteTarget.id > 0) {
+        // online: delete on server + remove from local sqlite cache
+        await api.delete(`/diiwaancustomers/${deleteTarget.id}`);
+        hardDeleteCustomerLocal(deleteTarget.id);
+      } else {
+        // offline: mark deleted locally, sync later
+        markCustomerDeletedLocal(deleteTarget.id);
+      }
+
       setCustomers((prev) => prev.filter((x) => x.id !== deleteTarget.id));
       if (selectedId === deleteTarget.id) setSelectedId(null);
       closeDelete();
@@ -176,17 +206,40 @@ export default function CustomerSetting() {
       console.warn(e?.response?.data?.detail || 'Delete failed.');
       closeDelete();
     }
-  }, [deleteTarget, selectedId, closeDelete]);
+  }, [deleteTarget, selectedId, closeDelete, online, token]);
 
-  // fetch
+  // ---- load (online + offline aware) ----
   const loadPage = useCallback(
     async (reset = false) => {
-      if (!token) return;
+      if (!user?.id) return;
+
       try {
         if (reset) {
           setLoading(true);
           setOffset(0);
         }
+
+        // OFFLINE (or no token) → read from SQLite only
+        if (!online || !token) {
+          const localOffset = reset ? 0 : offset;
+          const localData = getCustomersLocal(
+            search,
+            limit,
+            localOffset,
+            user.id
+          ) as unknown as Customer[];
+
+          setCustomers((prev) =>
+            reset ? localData : [...prev, ...localData.filter((n) => !prev.some((p) => p.id === n.id))]
+          );
+          setHasMore(localData.length === limit);
+          setError(null);
+          if (reset) setOffset(localData.length);
+          else setOffset((v) => v + localData.length);
+          return;
+        }
+
+        // ONLINE → fetch from server, then cache into SQLite
         const res = await api.get<Customer[]>('/diiwaancustomers', {
           params: {
             q: search || undefined,
@@ -194,13 +247,20 @@ export default function CustomerSetting() {
             limit,
           },
         });
+
         const data = res.data || [];
+
+        // keep sqlite cache in sync for offline use
+        if (data.length) {
+          upsertCustomersFromServer(data as any, user.id);
+        }
+
         setCustomers((prev) =>
           reset ? data : [...prev, ...data.filter((n) => !prev.some((p) => p.id === n.id))]
         );
         setHasMore(data.length === limit);
         setError(null);
-        if (reset) setOffset(0 + data.length);
+        if (reset) setOffset(data.length);
         else setOffset((v) => v + data.length);
       } catch (e: any) {
         setError(e?.response?.data?.detail || 'Failed to load customers.');
@@ -209,13 +269,13 @@ export default function CustomerSetting() {
         setRefreshing(false);
       }
     },
-    [token, search, offset, limit]
+    [token, online, search, offset, limit, user?.id]
   );
 
   useEffect(() => {
     loadPage(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token]);
+  }, [token, online, user?.id]);
 
   useEffect(() => {
     const t = setTimeout(() => loadPage(true), 300);
@@ -231,29 +291,49 @@ export default function CustomerSetting() {
     if (!loading && hasMore) loadPage(false);
   }, [loading, hasMore, loadPage]);
 
-  // submit edit
+  // submit edit (online + offline aware)
   const handleUpdate = useCallback(async () => {
     if (!selectedCustomer) return;
     if (!formName.trim()) return;
 
+    if (!user?.id) {
+      console.warn('No tenant/user id – cannot apply offline update.');
+      return;
+    }
+
+    const payload = {
+      name: formName.trim(),
+      phone: formPhone.trim() || null,
+      status: formStatus || 'active',
+      address: formAddress.trim() || null,
+    };
+
     setSubmitting(true);
     try {
-      await api.patch(`/diiwaancustomers/${selectedCustomer.id}`, {
-        name: formName.trim(),
-        phone: formPhone.trim() || null,
-        status: formStatus || 'active',
-        address: formAddress.trim() || null,
-      });
+      if (online && token) {
+        // online: patch server, then update sqlite cache
+        const res = await api.patch(`/diiwaancustomers/${selectedCustomer.id}`, payload);
+        upsertCustomersFromServer([res.data] as any, user.id);
+      } else {
+        // offline: update sqlite only; syncCustomersWithServer will push later
+        createOrUpdateCustomerLocal(
+          payload,
+          user.id,
+          { id: selectedCustomer.id } as any // only id is used in UPDATE
+        );
+      }
+
       closeEdit();
+      // update local UI list immediately
       setCustomers((prev) =>
         prev.map((c) =>
           c.id === selectedCustomer.id
             ? {
                 ...c,
-                name: formName.trim(),
-                phone: formPhone.trim() || null,
-                status: formStatus || 'active',
-                address: formAddress.trim() || null,
+                name: payload.name,
+                phone: payload.phone,
+                status: payload.status,
+                address: payload.address,
               }
             : c
         )
@@ -263,7 +343,17 @@ export default function CustomerSetting() {
     } finally {
       setSubmitting(false);
     }
-  }, [selectedCustomer, formName, formPhone, formStatus, formAddress, closeEdit]);
+  }, [
+    selectedCustomer,
+    formName,
+    formPhone,
+    formStatus,
+    formAddress,
+    closeEdit,
+    online,
+    token,
+    user?.id,
+  ]);
 
   // Android back closes sheet or delete popup
   useFocusEffect(
@@ -367,6 +457,12 @@ export default function CustomerSetting() {
 
           <View style={{ width: 42 }} />
         </View>
+
+        {!online && (
+          <Text style={{ color: '#FBBF24', marginTop: 6, textAlign: 'center', fontSize: 11 }}>
+            Offline – xogta waxa laga akhrinayaa kaydka gudaha
+          </Text>
+        )}
       </LinearGradient>
 
       {/* Search BELOW header */}
@@ -401,8 +497,12 @@ export default function CustomerSetting() {
             contentContainerStyle={{ paddingTop: 10, paddingBottom: 24 }}
             onEndReachedThreshold={0.4}
             onEndReached={loadMore}
-            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={ACCENT} />}
-            ListEmptyComponent={!loading ? <Text style={styles.emptyText}>No customers yet.</Text> : null}
+            refreshControl={
+              <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={ACCENT} />
+            }
+            ListEmptyComponent={
+              !loading ? <Text style={styles.emptyText}>No customers yet.</Text> : null
+            }
           />
         )}
       </View>
@@ -421,7 +521,10 @@ export default function CustomerSetting() {
         <View style={styles.sheetHandle} />
         <Text style={styles.sheetTitle}>Edit macaamiil</Text>
 
-        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          style={{ flex: 1 }}
+        >
           <ScrollView
             keyboardShouldPersistTaps="handled"
             contentContainerStyle={{ paddingBottom: insets.bottom + 20 }}
@@ -459,7 +562,9 @@ export default function CustomerSetting() {
                     style={[styles.pill, formStatus === s && styles.pillActive]}
                     onPress={() => setFormStatus(s)}
                   >
-                    <Text style={[styles.pillTxt, formStatus === s && styles.pillTxtActive]}>{s}</Text>
+                    <Text style={[styles.pillTxt, formStatus === s && styles.pillTxtActive]}>
+                      {s}
+                    </Text>
                   </TouchableOpacity>
                 ))}
               </View>
@@ -478,7 +583,11 @@ export default function CustomerSetting() {
             </View>
 
             <View style={[styles.formActions, { marginBottom: 8 }]}>
-              <TouchableOpacity style={[styles.btn, styles.btnGhost]} onPress={closeEdit} disabled={submitting}>
+              <TouchableOpacity
+                style={[styles.btn, styles.btnGhost]}
+                onPress={closeEdit}
+                disabled={submitting}
+              >
                 <Text style={[styles.btnTxt, { color: TEXT }]}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity
@@ -527,7 +636,10 @@ export default function CustomerSetting() {
               <TouchableOpacity style={[styles.btn, styles.btnGhost]} onPress={closeDelete}>
                 <Text style={[styles.btnTxt, { color: TEXT }]}>Cancel</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={[styles.btn, { backgroundColor: DANGER }]} onPress={confirmDelete}>
+              <TouchableOpacity
+                style={[styles.btn, { backgroundColor: DANGER }]}
+                onPress={confirmDelete}
+              >
                 <Text style={styles.btnTxt}>Delete</Text>
               </TouchableOpacity>
             </View>
@@ -564,7 +676,13 @@ const styles = StyleSheet.create({
 
   // Two-line title
   headerTitleTop: { color: '#fff', fontSize: 16, fontWeight: '900', letterSpacing: 0.2 },
-  headerTitleSub: { color: 'rgba(255,255,255,0.9)', fontSize: 12, fontWeight: '700', letterSpacing: 0.2, marginTop: 2 },
+  headerTitleSub: {
+    color: 'rgba(255,255,255,0.9)',
+    fontSize: 12,
+    fontWeight: '700',
+    letterSpacing: 0.2,
+    marginTop: 2,
+  },
 
   searchWrapLight: {
     flexDirection: 'row',
@@ -665,7 +783,13 @@ const styles = StyleSheet.create({
     backgroundColor: '#E5E7EB',
     marginBottom: 10,
   },
-  sheetTitle: { fontSize: 16, fontWeight: '800', color: TEXT, textAlign: 'center', marginBottom: 8 },
+  sheetTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: TEXT,
+    textAlign: 'center',
+    marginBottom: 8,
+  },
 
   formRow: { marginBottom: 12 },
   label: { fontWeight: '700', color: TEXT, marginBottom: 6 },
@@ -740,7 +864,13 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: DANGER,
   },
-  deleteTitle: { textAlign: 'center', fontSize: 18, fontWeight: '800', color: TEXT, marginTop: 12 },
+  deleteTitle: {
+    textAlign: 'center',
+    fontSize: 18,
+    fontWeight: '800',
+    color: TEXT,
+    marginTop: 12,
+  },
   deleteText: { textAlign: 'center', color: MUTED, marginTop: 6, lineHeight: 20 },
   deleteActions: { flexDirection: 'row', gap: 10, marginTop: 16 },
   iconBtn: {

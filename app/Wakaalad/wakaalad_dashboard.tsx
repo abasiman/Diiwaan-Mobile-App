@@ -1,6 +1,7 @@
 // app/Wakaalad/wakaalad_dashboard.tsx
-import { Feather } from '@expo/vector-icons';
+import { Feather, Ionicons } from '@expo/vector-icons';
 import DateTimePicker from '@react-native-community/datetimepicker';
+import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 import dayjs from 'dayjs';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
@@ -71,7 +72,7 @@ const COLOR_TEXT = '#0B1221';
 const COLOR_MUTED = '#64748B';
 const COLOR_DIV = '#E5E7EB';
 const COLOR_CARD = '#F8FAFC';
-const COLOR_ACCENT = '#0B2447'; // dark blue for progress
+const COLOR_ACCENT = '#0B2447'; // dark blue for accents
 const COLOR_SUCCESS = '#16A34A';
 
 const CAPACITY = { fuusto: 240, caag: 20 } as const;
@@ -123,6 +124,9 @@ const ConfirmBadge = ({ size = 16 }: { size?: number }) => (
 export default function WakaaladDashboard() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const tabBarHeight = useBottomTabBarHeight?.() ?? 0;
+  const fabBottom = Math.max(16, tabBarHeight + insets.bottom + 12);
+
   const { token } = useAuth();
 
   const [loading, setLoading] = useState(false);
@@ -263,13 +267,14 @@ export default function WakaaladDashboard() {
   return (
     <View style={styles.page}>
       {/* Header */}
-      <SafeAreaView edges={['top']} style={{ backgroundColor: COLOR_ACCENT }}>
+      <SafeAreaView edges={['top']} style={{ backgroundColor: COLOR_BG }}>
         <StatusBar style="light" translucent />
         <LinearGradient
           colors={[COLOR_ACCENT, COLOR_ACCENT]}
           start={{ x: 0, y: 0 }}
           end={{ x: 1, y: 0 }}
-          style={[styles.header, { paddingTop: insets.top }]}
+          style={[styles.header, { paddingTop: 6, overflow: 'hidden' }]}
+
         >
           <View style={styles.headerRowTop}>
             {/* Back */}
@@ -290,17 +295,6 @@ export default function WakaaladDashboard() {
               </Text>
             </View>
 
-            {/* + Abuur Wakaalad */}
-            <TouchableOpacity
-              onPress={() => setCreateOpen(true)}
-              activeOpacity={0.9}
-              style={styles.createBtn}
-              accessibilityRole="button"
-              accessibilityLabel="Abuur Wakaalad"
-            >
-              <Feather name="plus" size={12} color={COLOR_ACCENT} />
-              <Text style={styles.createBtnTxt}>Abuur Wakaalad</Text>
-            </TouchableOpacity>
           </View>
         </LinearGradient>
       </SafeAreaView>
@@ -327,12 +321,12 @@ export default function WakaaladDashboard() {
 
           <TouchableOpacity onPress={() => setShowFilters(true)} style={styles.headerFilterBtnSmall}>
             <Feather name="filter" size={12} color={COLOR_ACCENT} />
-            <Text style={styles.headerFilterTxtSmall}>Filter</Text>
+            <Text style={styles.headerFilterTxtSmall}>DATE</Text>
           </TouchableOpacity>
         </View>
       </View>
 
-      {/* BIG Unit Selector (below search) */}
+      {/* BIG Unit Selector */}
       <View style={styles.unitBar}>
         <Text style={styles.unitBarLabel}>Display in</Text>
         <View style={styles.unitChipsRow}>
@@ -356,7 +350,10 @@ export default function WakaaladDashboard() {
 
       {/* List */}
       <ScrollView
-        contentContainerStyle={styles.scrollContent}
+        contentContainerStyle={[
+          styles.scrollContent,
+          { paddingBottom: 24 + tabBarHeight + insets.bottom + 80 }, // keep content above tabs & FAB
+        ]}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator
@@ -381,9 +378,6 @@ export default function WakaaladDashboard() {
             const suffix = unitSuffix();
 
             const pctForLabel = Math.max(4, Math.min(96, Math.round(pctStock)));
-
-            // explicit fuusto sold (for green tick)
-            const soldFuustoCount = Math.floor((wk.wakaal_sold || 0) / fuustoCap(wk.oil_type));
 
             return (
               <View key={wk.id} style={styles.card}>
@@ -460,13 +454,7 @@ export default function WakaaladDashboard() {
                           {formatNumber(sold)} {suffix}
                         </Text>
                       </View>
-
-                    
                     </View>
-
-                  {/*   <View style={styles.statBoxSmall}>
-                      <Text style={styles.statMini}>Sold {Math.round(pctSold)}%</Text>
-                    </View> */}
                   </View>
                 </View>
               </View>
@@ -475,14 +463,36 @@ export default function WakaaladDashboard() {
         )}
       </ScrollView>
 
-      {/* Filters Modal */}
+      {/* ===== FAB (above bottom tabs) ===== */}
+      {/* ===== FAB (above bottom tabs) ===== */}
+      <TouchableOpacity
+        style={[styles.fab, { bottom: fabBottom }]}
+        onPress={() => setCreateOpen(true)}
+        activeOpacity={0.9}
+        accessibilityRole="button"
+        accessibilityLabel="Create wakaalad"
+        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+      >
+        <LinearGradient
+          colors={['#1E40AF', '#1E40AF']}
+          style={styles.fabGradient}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 1 }}
+        >
+          <Ionicons name="add" size={20} color="white" />
+          <Text style={styles.fabText}>create</Text>
+        </LinearGradient>
+      </TouchableOpacity>
+
+
+      {/* Filters (DATE) Modal */}
       <Modal visible={showFilters} transparent animationType="fade" onRequestClose={() => setShowFilters(false)}>
         <TouchableWithoutFeedback onPress={() => setShowFilters(false)}>
           <View style={styles.modalBackdrop}>
             <TouchableWithoutFeedback onPress={() => {}}>
               <View style={[styles.modalCard, { width: '94%', maxHeight: '80%' }]}>
                 <View style={styles.modalHeader}>
-                  <Text style={styles.modalTitle}>Filters</Text>
+                  <Text style={styles.modalTitle}>Date Range</Text>
                   <TouchableOpacity onPress={() => setShowFilters(false)}>
                     <Feather name="x" size={16} color="#1F2937" />
                   </TouchableOpacity>
@@ -579,16 +589,17 @@ const styles = StyleSheet.create({
   page: { flex: 1, backgroundColor: COLOR_BG },
 
   header: {
-    paddingBottom: 4,
-    paddingHorizontal: 16,
-    borderBottomLeftRadius: 18,
-    borderBottomRightRadius: 18,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.08,
-    shadowRadius: 10,
-    elevation: 3,
-  },
+  paddingBottom: 18,
+  paddingHorizontal: 16,
+  borderBottomLeftRadius: 22,
+  borderBottomRightRadius: 22,
+  shadowColor: '#000',
+  shadowOffset: { width: 0, height: 4 },
+  shadowOpacity: 0.1,
+  shadowRadius: 12,
+  elevation: 4,
+},
+
   headerRowTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   backBtn: {
     width: 28,
@@ -616,13 +627,14 @@ const styles = StyleSheet.create({
   },
   createBtnTxt: { color: COLOR_ACCENT, fontWeight: '800', fontSize: 11 },
 
+  // Search row
   searchRow: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 6 },
   searchBox: {
     paddingHorizontal: 8,
     paddingVertical: 6,
     borderRadius: 10,
-    borderWidth: 1,
-    borderColor: COLOR_DIV,
+    borderWidth: 1.5,              // thicker border
+    borderColor: COLOR_ACCENT,     // <- dark blue border
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
@@ -643,7 +655,7 @@ const styles = StyleSheet.create({
   },
   headerFilterTxtSmall: { color: COLOR_ACCENT, fontSize: 10, fontWeight: '800' },
 
-  // BIG Unit Selector (prominent)
+  // BIG Unit Selector
   unitBar: {
     paddingHorizontal: 16,
     paddingBottom: 8,
@@ -685,7 +697,7 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
   },
 
-  scrollContent: { padding: 12, paddingBottom: 24 },
+  scrollContent: { padding: 12 }, // dynamic bottom padding added inline in component
   loading: { padding: 20, alignItems: 'center', justifyContent: 'center' },
   empty: { paddingVertical: 36, alignItems: 'center', justifyContent: 'center', gap: 6 },
   emptyText: { color: COLOR_MUTED, fontSize: 12 },
@@ -755,7 +767,7 @@ const styles = StyleSheet.create({
   },
   progressTag: {
     position: 'absolute',
-    bottom: 12, // sits just above the bar
+    bottom: 12,
     paddingHorizontal: 6,
     paddingVertical: 2,
     backgroundColor: COLOR_ACCENT,
@@ -788,6 +800,36 @@ const styles = StyleSheet.create({
 
   breakdownText: { color: '#6B7280', fontSize: 10, marginTop: 0 },
 
+  // Floating Action Button
+  fab: {
+    position: 'absolute',
+    right: 20,
+    // bottom set dynamically
+    zIndex: 999,          // iOS stacking
+    elevation: 12,        // Android stacking
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.25,
+    shadowRadius: 7,
+  },
+ fabGradient: {
+  // was: width: 52,
+  minWidth: 52,
+  height: 52,
+  paddingHorizontal: 14,      // room for label
+  borderRadius: 26,
+  justifyContent: 'center',
+  alignItems: 'center',
+  flexDirection: 'row',       // icon + text inline
+  gap: 8,                     // space between icon and text
+},
+
+fabText: {
+  color: '#FFFFFF',
+  fontSize: 12,
+  fontWeight: '800',
+  letterSpacing: 0.2,
+},
   // Modal
   modalBackdrop: {
     flex: 1,

@@ -1,775 +1,879 @@
-// VendorPaymentCreateSheet.tsx
+// app/(tabs)/customerslist.tsx
+import { Feather } from '@expo/vector-icons';
+import NetInfo from '@react-native-community/netinfo';
+import { useFocusEffect } from '@react-navigation/native';
+import { LinearGradient } from 'expo-linear-gradient';
+import { useRouter } from 'expo-router';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+
 import api from '@/services/api';
-import { Feather, FontAwesome } from '@expo/vector-icons';
-import * as Sharing from 'expo-sharing';
-import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   Animated,
+  BackHandler,
   Dimensions,
   Easing,
+  FlatList,
   KeyboardAvoidingView,
-  Linking,
-  Modal,
   Platform,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
-  TouchableWithoutFeedback,
   View,
 } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { captureRef } from 'react-native-view-shot';
-import { events, EVT_VENDOR_PAYMENT_CREATED } from './eventBus';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { useAuth } from '../../src/context/AuthContext';
+import {
+  createOrUpdateCustomerLocal,
+  getCustomersLocal,
+  hardDeleteCustomerLocal,
+  markCustomerDeletedLocal,
+  syncCustomersWithServer,
+  upsertCustomersFromServer,
+  type CustomerRow as Customer,
+} from '../db/customerRepo';
 
-type Method = 'cash' | 'custom'; // UI-only; we will ALWAYS send 'equity' to backend
-type ExtraCosts = { truckRent: number; depotCost: number; tax: number; currency: string };
-type Props = {
-  visible: boolean;
-  onClose: () => void;
-  token: string | null;
-
-  /** Identify the item; if this oil belongs to a lot, we’ll auto-upgrade to lot scope */
-  oilId: number;
-  /** If provided, we’ll use lot scope explicitly */
-  lotId?: number;
-
-  /** Optional: pay a specific extra-cost row */
-  extraCostId?: number;
-
-  vendorNameOverride?: string | null;
-  currentPayable?: number;
-  onCreated?: () => void;
-  companyName?: string | null;
-  companyContact?: string | null;
-  extraCosts?: ExtraCosts;
-};
-
-// ───────────────────────── DEBUG ─────────────────────────
-const DEBUG = true;
-const mkTraceId = () => `vp-${Date.now().toString(36)}-${Math.round(Math.random() * 1e6).toString(36)}`;
-const dlog = (t: string, ...a: any[]) => DEBUG && console.log(`[VendorPayment][${t}]`, ...a);
-const derror = (t: string, ...a: any[]) => DEBUG && console.error(`[VendorPayment][${t}]`, ...a);
-// ────────────────────────────────────────────────────────
-
+const BRAND_BLUE = '#0B2447';
+const BRAND_BLUE_2 = '#0B2447';
 const ACCENT = '#576CBC';
-const BORDER = '#E5E7EB';
-const BG = '#FFFFFF';
+const BG = '#F7F9FC';
 const TEXT = '#0B1220';
 const MUTED = '#6B7280';
-const PAPER_W = 330;
+const DANGER = '#EF4444';
+const SUCCESS = '#10B981';
+const BORDER = '#E5E7EB';
 
-export default function VendorPaymentCreateSheet({
-  visible,
-  onClose,
-  token,
-  oilId,
-  lotId,
-  extraCostId,
-  vendorNameOverride,
-  currentPayable = 0,
-  onCreated,
-  companyName,
-  companyContact,
-  extraCosts,
-}: Props) {
-  const traceIdRef = useRef<string>(mkTraceId());
-  useEffect(() => {
-    if (visible) {
-      traceIdRef.current = mkTraceId();
-      dlog(traceIdRef.current, 'Sheet opened', { oilId, lotId, extraCostId, vendorNameOverride, currentPayable });
-    }
-  }, [visible, oilId, lotId, extraCostId, vendorNameOverride, currentPayable]);
+const { height: SCREEN_H } = Dimensions.get('window');
+const TOP_GAP = 80;
+const SHEET_H = Math.min(SCREEN_H - TOP_GAP, SCREEN_H * 0.9);
+const MINI_SHEET_H = 180;
 
-  const insets = useSafeAreaInsets();
-  const bottomSafe = insets.bottom || 0;
-  const SCREEN_H = Dimensions.get('window').height;
-  const SHEET_H = Math.round(SCREEN_H * 0.92);
+export default function CustomersList() {
+  const { token, user } = useAuth();
+  const router = useRouter();
 
-  const [amount, setAmount] = useState<string>('');
-  const [method, setMethod] = useState<Method>('cash'); // UI only
-  const [customMethod, setCustomMethod] = useState<string>('');
+  const [online, setOnline] = useState(true);
+
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const [search, setSearch] = useState('');
+  const [offset, setOffset] = useState(0);
+  const [limit] = useState(20);
+  const [hasMore, setHasMore] = useState(true);
+
+  const offsetRef = useRef(0);
+  const loadingRef = useRef(false);
+
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const selectedCustomer = useMemo(
+    () => customers.find((c) => c.id === selectedId) || null,
+    [selectedId, customers]
+  );
+
+  const settingsY = useRef(new Animated.Value(SCREEN_H)).current;
+  const addY = useRef(new Animated.Value(SCREEN_H)).current;
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isAddOpen, setIsAddOpen] = useState(false);
+
+  const [formMode, setFormMode] = useState<'add' | 'edit'>('add');
+  const [formName, setFormName] = useState('');
+  const [formPhone, setFormPhone] = useState('');
+  const [formAmountDue, setFormAmountDue] = useState<string>('0'); // still unused, kept for compatibility
+  const [formStatus, setFormStatus] = useState<'active' | 'inactive' | ''>('active');
+  const [formAddress, setFormAddress] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
-  // vendor/oil context
-  const [vendorName, setVendorName] = useState<string>('-');
-  const [oilType, setOilType] = useState<string | null>(null);
-  const [oilLotId, setOilLotId] = useState<number | null>(null); // ← NEW: detect lot from oil
+  const formScrollRef = useRef<ScrollView>(null);
 
-  // receipt states
-  const [showReceipt, setShowReceipt] = useState(false);
-  const [receiptUri, setReceiptUri] = useState<string | null>(null);
-  const [savedAt, setSavedAt] = useState<Date | null>(null);
-  const [paidAmt, setPaidAmt] = useState<number>(0);
-  const [prevDue, setPrevDue] = useState<number>(currentPayable);
-  const [newDue, setNewDue] = useState<number>(currentPayable);
+  // ---- network status (offline/online) ----
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
 
-  const [shareOpen, setShareOpen] = useState(false);
-  const [shareMsg, setShareMsg] = useState('');
+  const resetForm = useCallback(() => {
+    setFormMode('add');
+    setFormName('');
+    setFormPhone('');
+    setFormAmountDue('0');
+    setFormStatus('active');
+    setFormAddress('');
+    setSubmitting(false);
+  }, []);
 
-  const paperRef = useRef<View>(null);
+  const goToInvoices = useCallback(
+    (name?: string | null) => {
+      const safe = (name ?? '').trim();
+      if (!safe) return Alert.alert('Xulasho khaldan', 'Magaca macaamiilka waa madhan.');
+      const encoded = encodeURIComponent(safe);
+      router.push({ pathname: '/(Transactions)/[customer]', params: { customer: encoded } });
+    },
+    [router]
+  );
 
-  const authHeader = useMemo(() => (token ? { Authorization: `Bearer ${token}` } : {}), [token]);
+  const closeSettings = useCallback(() => {
+    Animated.timing(settingsY, {
+      toValue: SCREEN_H,
+      duration: 220,
+      easing: Easing.in(Easing.cubic),
+      useNativeDriver: false,
+    }).start(({ finished }) => finished && setIsSettingsOpen(false));
+  }, [settingsY]);
+
+  const openAdd = useCallback(() => {
+    setFormMode('add');
+    resetForm();
+    setIsAddOpen(true);
+    Animated.timing(addY, {
+      toValue: SCREEN_H - SHEET_H,
+      duration: 300,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: false,
+    }).start(() => {
+      requestAnimationFrame(() => formScrollRef.current?.scrollTo({ y: 0, animated: false }));
+    });
+  }, [addY, resetForm]);
+
+  const openEdit = useCallback(
+    (c: Customer) => {
+      setFormMode('edit');
+      setFormName(c.name || '');
+      setFormPhone(c.phone || '');
+      setFormAmountDue(String(c.amount_due ?? 0));
+      setFormStatus((c.status as any) || 'active');
+      setFormAddress(c.address || '');
+
+      Animated.parallel([
+        Animated.timing(settingsY, {
+          toValue: SCREEN_H,
+          duration: 180,
+          easing: Easing.in(Easing.cubic),
+          useNativeDriver: false,
+        }),
+        Animated.timing(addY, {
+          toValue: SCREEN_H - SHEET_H,
+          delay: 100,
+          duration: 280,
+          easing: Easing.out(Easing.cubic),
+          useNativeDriver: false,
+        }),
+      ]).start(() => {
+        setIsAddOpen(true);
+        requestAnimationFrame(() => formScrollRef.current?.scrollTo({ y: 0, animated: false }));
+      });
+    },
+    [addY, settingsY]
+  );
+
+  const closeAdd = useCallback(() => {
+    Animated.timing(addY, {
+      toValue: SCREEN_H,
+      duration: 240,
+      easing: Easing.in(Easing.cubic),
+      useNativeDriver: false,
+    }).start(({ finished }) => finished && setIsAddOpen(false));
+  }, [addY]);
+
+  // ---- Local page loader (SQLite only) ----
+  const loadPage = useCallback(
+    (reset = false) => {
+      if (!user?.id) return; // no tenant yet
+      if (loadingRef.current) return;
+      loadingRef.current = true;
+
+      try {
+        if (reset) {
+          setLoading(true);
+          setHasMore(true);
+          offsetRef.current = 0;
+          setOffset(0);
+        }
+
+        const localOffset = reset ? 0 : offsetRef.current;
+        const data = getCustomersLocal(search, limit, localOffset, user.id);
+
+        setCustomers((prev) => {
+          if (reset) return data;
+          return [...prev, ...data];
+        });
+
+        setHasMore(data.length === limit);
+        offsetRef.current = localOffset + data.length;
+        setOffset(offsetRef.current);
+        setError(null);
+      } catch (e: any) {
+        setError(e?.message || 'Failed to load customers from local db.');
+      } finally {
+        setLoading(false);
+        loadingRef.current = false;
+      }
+    },
+    [search, limit, user?.id]
+  );
+
+  // ---- Pull fresh data from server → SQLite (when online) ----
+  // ---- Pull fresh data from server → SQLite (when online) ----
+const pullLatestFromServer = useCallback(async () => {
+  if (!online || !token || !user?.id) return;
+
+  try {
+    const res = await api.get('/diiwaancustomers', {
+      // IMPORTANT: do NOT send q: undefined, just offset/limit
+      params: {
+        offset: 0,
+        limit: 5000, // big enough to cover all existing customers
+      },
+    });
+
+    // Some backends return array, some wrap in .items – keep it safe
+    const raw = (res as any).data;
+    const data = Array.isArray(raw?.items) ? raw.items : (Array.isArray(raw) ? raw : []);
+
+    upsertCustomersFromServer(data, user.id);
+  } catch (e) {
+    // ignore; offline still works
+    console.log('pullLatestFromServer error', e?.response?.data || e?.message || e);
+  }
+}, [online, token, user?.id]);
+
+
+  // Initial load
+  useEffect(() => {
+    if (!user?.id) return;
+
+    // 1) always load from local db
+    loadPage(true);
+
+    // 2) if online, sync dirty → server and pull fresh list
+    if (online && token) {
+      (async () => {
+        try {
+          await syncCustomersWithServer(api);
+          await pullLatestFromServer();
+          loadPage(true);
+        } catch {
+          // ignore
+        }
+      })();
+    }
+  }, [online, token, user?.id, loadPage, pullLatestFromServer]);
+
+  // Re-run local query on search change (no network)
+  useEffect(() => {
+    if (!user?.id) return;
+    const t = setTimeout(() => {
+      loadPage(true);
+    }, 200);
+    return () => clearTimeout(t);
+  }, [search, loadPage, user?.id]);
+
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      if (online && token && user?.id) {
+        await syncCustomersWithServer(api);
+        await pullLatestFromServer();
+      }
+      loadPage(true);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [online, token, user?.id, loadPage, pullLatestFromServer]);
+
+  const loadMore = useCallback(() => {
+    if (!loading && hasMore && !loadingRef.current) {
+      loadPage(false);
+    }
+  }, [hasMore, loading, loadPage]);
 
   const fmtMoney = (n: number) =>
-    new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(n || 0);
-
-  const fmtMoneyExtra = (n: number) =>
     new Intl.NumberFormat('en-US', {
       style: 'currency',
-      currency: extraCosts?.currency || 'USD',
+      currency: 'USD',
       maximumFractionDigits: 2,
     }).format(n || 0);
 
-  // slide animation
-  const slideY = useRef(new Animated.Value(SHEET_H)).current;
-  useEffect(() => {
-    if (visible) {
-      Animated.timing(slideY, { toValue: 0, duration: 260, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
-    } else {
-      slideY.setValue(SHEET_H);
+  const handleCreateOrUpdate = useCallback(async () => {
+    if (!formName.trim()) {
+      Alert.alert('Fadlan geli magaca macaamiilka');
+      return;
     }
-  }, [visible, SHEET_H, slideY]);
+    if (!user?.id) {
+      Alert.alert('Error', 'No tenant selected.');
+      return;
+    }
 
-  const close = () => {
-    if (submitting) return;
-    dlog(traceIdRef.current, 'Sheet closed by user');
-    onClose();
-  };
-
-  /** Resolve vendor + detect lot_id from oil if present */
-  useEffect(() => {
-    let isMounted = true;
-    (async () => {
-      if (!visible) return;
-
-      try {
-        if (oilId) {
-          dlog(traceIdRef.current, 'Fetching oil', { oilId });
-          const r = await api.get(`/diiwaanoil/${oilId}`, { headers: authHeader });
-          const data = r?.data || {};
-          if (!isMounted) return;
-
-          const prefer =
-            (vendorNameOverride && vendorNameOverride.trim()) ||
-            (data?.oil_well && String(data.oil_well).trim()) ||
-            (data?.supplier_name && String(data.supplier_name).trim()) ||
-            '-';
-
-          setVendorName(prefer);
-          setOilType(data?.oil_type ?? null);
-          setOilLotId(Number.isFinite(data?.lot_id) ? Number(data.lot_id) : null); // ← store lot
-          dlog(traceIdRef.current, 'Resolved vendor/oil', {
-            vendorName: prefer,
-            oilType: data?.oil_type ?? null,
-            oilLotId: Number.isFinite(data?.lot_id) ? Number(data.lot_id) : null,
-          });
-          return;
-        }
-
-        if (lotId) {
-          dlog(traceIdRef.current, 'Fetching lot (for vendor)', { lotId });
-          const r = await api.get(`/diiwaanoil/lot/${lotId}`, { headers: authHeader });
-          const data = r?.data || {};
-          const prefer =
-            (vendorNameOverride && vendorNameOverride.trim()) ||
-            (data?.oil_well && String(data.oil_well).trim()) ||
-            (data?.supplier_name && String(data.supplier_name).trim()) ||
-            '-';
-          if (!isMounted) return;
-          setVendorName(prefer);
-          setOilType(data?.oil_type ?? null);
-          setOilLotId(lotId); // explicit lot
-          dlog(traceIdRef.current, 'Resolved vendor from lot', { vendorName: prefer, oilType: data?.oil_type ?? null, oilLotId: lotId });
-          return;
-        }
-
-        // no oil/lot provided
-        const prefer = (vendorNameOverride && vendorNameOverride.trim()) || '-';
-        if (isMounted) {
-          setVendorName(prefer);
-          setOilType(null);
-          setOilLotId(null);
-        }
-        dlog(traceIdRef.current, 'No oil/lot; using override vendor', { vendorName: prefer });
-      } catch (e: any) {
-        const prefer = (vendorNameOverride && vendorNameOverride.trim()) || '-';
-        if (!isMounted) return;
-        setVendorName(prefer);
-        setOilType(null);
-        setOilLotId(lotId ?? null); // keep whatever hint we had
-        derror(traceIdRef.current, 'Vendor detection failed', {
-          error: e?.message,
-          server: e?.response?.data,
-          status: e?.response?.status,
-        });
-      }
-    })();
-    return () => {
-      isMounted = false;
+    const payload = {
+      name: formName.trim(),
+      phone: formPhone.trim() || null,
+      address: formAddress.trim() || null,
+      status: formStatus || 'active',
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, oilId, lotId, vendorNameOverride, token]);
-
-  /** Prefill amount */
-  useEffect(() => {
-    if (visible) {
-      const due = Number.isFinite(currentPayable) ? currentPayable : 0;
-      setPrevDue(due);
-      setNewDue(due);
-      setAmount(due > 0 ? (Math.round(due * 100) / 100).toFixed(2) : '');
-      setMethod('cash');
-      dlog(traceIdRef.current, 'Prefill amount', { currentPayable: due });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, currentPayable]);
-
-  // helpers
-  const sanitizeAmount = (raw: string) => {
-    let cleaned = raw.replace(/[^0-9.]/g, '');
-    const firstDot = cleaned.indexOf('.');
-    if (firstDot !== -1) {
-      const before = cleaned.slice(0, firstDot + 1);
-      const after = cleaned.slice(firstDot + 1).replace(/\./g, '');
-      cleaned = before + after;
-    }
-    cleaned = cleaned.replace(/^0+(?=\d)/, '0');
-    return cleaned;
-  };
-  const sanitizeAmountToNumber = (raw: string) => {
-    const num = parseFloat(sanitizeAmount(raw));
-    return Number.isFinite(num) ? num : 0;
-  };
-
-  const typedAmt = sanitizeAmountToNumber(amount);
-  const remainingPreview = Math.max(0, (currentPayable || 0) - typedAmt);
-  const isOverpay = typedAmt > (currentPayable || 0);
-
-  // extras (display)
-  const extraItems = useMemo(() => {
-    if (!extraCosts) return [] as Array<{ label: string; amt: number }>;
-    return [
-      { label: 'Truck rent', amt: Number(extraCosts.truckRent || 0) },
-      { label: 'Depot cost', amt: Number(extraCosts.depotCost || 0) },
-      { label: 'Tax', amt: Number(extraCosts.tax || 0) },
-    ].filter(x => x.amt > 0.0001);
-  }, [extraCosts]);
-  const extraTotal = useMemo(() => extraItems.reduce((s, x) => s + x.amt, 0), [extraItems]);
-
-  const buildShareMessage = (paid: number, remain: number) => {
-    const paidStr = fmtMoney(paid);
-    const remainStr = fmtMoney(Math.max(0, remain));
-    const core = remain > 0
-      ? `Waxaad siisay ${vendorName} ${paidStr}. Haraaga waa ${remainStr}.`
-      : `Waxaad siisay ${vendorName} ${paidStr}. Dayntii waa la bixiyay. Mahadsanid.`;
-    if (extraItems.length) {
-      const extras =
-        `\n\nExtra costs recorded (${extraCosts?.currency || 'USD'}):\n` +
-        extraItems.map(it => `• ${it.label}: ${fmtMoneyExtra(it.amt)}`).join('\n') +
-        `\nTotal extras: ${fmtMoneyExtra(extraTotal)}`;
-      return core + extras;
-    }
-    return core;
-  };
-
-  async function sendWhatsAppText(phoneRaw: string | undefined, text: string) {
-    const digits = (phoneRaw || '').replace(/[^\d]/g, '');
-    theMsg: {
-      const msg = encodeURIComponent(text || '');
-      const deepLink = `whatsapp://send?phone=${digits}&text=${msg}`;
-      const webLink = `https://wa.me/${digits}?text=${msg}`;
-      const canDeep = await Linking.canOpenURL('whatsapp://send');
-      if (canDeep) {
-        try { await Linking.openURL(deepLink); break theMsg; } catch {}
-      }
-      const canWeb = await Linking.canOpenURL(webLink);
-      if (canWeb) { try { await Linking.openURL(webLink); } catch {} }
-      else { Alert.alert('WhatsApp unavailable', 'Could not open WhatsApp on this device.'); }
-    }
-  }
-  async function sendSmsText(text: string) {
-    const msg = encodeURIComponent(text || '');
-    const url = Platform.select({ ios: `sms:&body=${msg}`, android: `sms:?body=${msg}`, default: `sms:?body=${msg}` });
-    try { const can = await Linking.canOpenURL(url!); if (can) await Linking.openURL(url!); } catch {}
-  }
-
-  const capturePaper = async () => {
-    if (!paperRef.current) return null;
-    const pixelRatio = Platform.OS === 'android' ? 3 : 2;
-    const uri = await captureRef(paperRef.current, {
-      format: 'png', quality: 1, fileName: 'vendor_payment_receipt', result: 'tmpfile', pixelRatio, backgroundColor: '#FFFFFF',
-    });
-    return uri;
-  };
-
-  useEffect(() => {
-    let t: NodeJS.Timeout | null = null;
-    if (showReceipt) {
-      t = setTimeout(async () => {
-        try {
-          const uri = await capturePaper();
-          setReceiptUri(uri);
-          if (uri) {
-            setShareMsg(buildShareMessage(paidAmt, newDue));
-            setShareOpen(true);
-          }
-        } catch (e: any) {
-          derror(traceIdRef.current, 'Receipt capture failed', e?.message || e);
-        }
-      }, 180);
-    }
-    return () => { if (t) clearTimeout(t); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showReceipt, newDue, paidAmt, extraItems, extraTotal, extraCosts?.currency]);
-
-  const onSave = async () => {
-    const T0 = Date.now();
-    const trace = traceIdRef.current;
-
-    // must have at least one target: oil, lot, or a specific extra
-    const hasTarget =
-      !!oilId ||
-      !!lotId ||
-      (typeof extraCostId === 'number');
-
-    if (!hasTarget) {
-      derror(trace, 'No target (oil/lot/extra) provided; cannot proceed');
-      return Alert.alert('Fadlan', 'Wax aan bixinno lama helin (oil, lot, ama extra).');
-    }
-
-
-    const amtNum = sanitizeAmountToNumber(amount);
-    dlog(trace, 'User clicked Save', { rawAmount: amount, parsedAmount: amtNum, currentPayable, oilId, lotId, extraCostId, oilLotId });
-
-    if (!(amtNum > 0)) {
-      derror(trace, 'Invalid amount (<= 0)');
-      return Alert.alert('Fadlan', 'Geli lacag sax ah (ka weyn 0).');
-    }
-
-    const dueNow = Math.max(0, currentPayable || 0);
-    const payAmount = dueNow > 0 ? Math.min(amtNum, dueNow) : amtNum;
-
-    if (amtNum > dueNow && dueNow > 0) {
-      dlog(trace, 'Overpayment clamped', { amtNum, dueNow, payAmount });
-      Alert.alert('Overpayment adjusted', `Waxaad gelisay ${fmtMoney(amtNum)}, balse haraaga waa ${fmtMoney(dueNow)}. Waxaanu diiwaan gelinay ${fmtMoney(payAmount)}.`);
-    }
-
-    // ── SCOPE DECISION ─────────────────────────────────────────────
-    // priority: pay specific extra → explicit lotId → auto-upgrade to lot if oil has lot → else oil
-    let scope: 'extra' | 'lot' | 'oil' = 'oil';
-    let usedLotId: number | null = null;
-
-    if (typeof extraCostId === 'number') {
-      scope = 'extra';
-    } else if (typeof lotId === 'number') {
-      scope = 'lot';
-      usedLotId = lotId;
-    } else if (typeof oilLotId === 'number' && Number.isFinite(oilLotId)) {
-      scope = 'lot';
-      usedLotId = oilLotId; // ← AUTO-UPGRADE
-    } else {
-      scope = 'oil';
-    }
-
-    dlog(trace, 'scopeDecision', { scope, usedLotId, oilId, extraCostId });
 
     setSubmitting(true);
     try {
-      const body: any = {
-        amount: payAmount,
-        supplier_name: vendorName,
-        payment_method: 'equity' as const,
-        note: oilType ? `Payment for ${oilType} lot (funded by owner equity)` : 'Funded by owner equity',
-      };
-
-
-      // Tell backend how to apply this payment
-      if (scope === 'extra') {
-        // Paying a specific extra: only that extra should be touched
-        body.apply_to = 'extras_only';
-      } else if (scope === 'lot') {
-        // Pay ONLY the base part of the lot; do NOT spill into extras
-        body.apply_to = 'base_only';
+      if (online && token) {
+        // Online: hit API, then cache into SQLite
+        if (formMode === 'add') {
+          const res = await api.post('/diiwaancustomers', payload);
+          upsertCustomersFromServer([res.data], user.id);
+        } else if (formMode === 'edit' && selectedCustomer) {
+          const res = await api.patch(
+            `/diiwaancustomers/${selectedCustomer.id}`,
+            payload
+          );
+          upsertCustomersFromServer([res.data], user.id);
+        }
       } else {
-        // Single-oil fallback: leave default behavior (or force base-only if you prefer)
-        body.apply_to = 'base_only';
+        // Offline: write to SQLite only; server will get it on next sync
+        if (formMode === 'add') {
+          createOrUpdateCustomerLocal(payload, user.id);
+        } else if (formMode === 'edit' && selectedCustomer) {
+          createOrUpdateCustomerLocal(payload, user.id, selectedCustomer);
+        }
       }
 
-
-      if (scope === 'extra') {
-        body.extra_cost_id = extraCostId;
-        if (typeof lotId === 'number') body.lot_id = lotId; // optional hint; backend will resolve from extra
-      } else if (scope === 'lot') {
-        body.lot_id = usedLotId;     // ← send lot_id ONLY
-      } else {
-        body.oil_id = oilId;         // ← single-oil scope
-      }
-
-      dlog(trace, 'POST /diiwaanvendorpayments request', { url: '/diiwaanvendorpayments', headersSet: !!authHeader.Authorization, body });
-
-      const resp = await api.post('/diiwaanvendorpayments', body, { headers: authHeader });
-      dlog(trace, 'POST /diiwaanvendorpayments response', { status: resp?.status, data: resp?.data, durationMs: Date.now() - T0 });
-
-      const remain = Math.max(0, dueNow - payAmount);
-      setPaidAmt(payAmount);
-      setPrevDue(dueNow);
-      setNewDue(remain);
-      setSavedAt(new Date());
-
-      events.emit(EVT_VENDOR_PAYMENT_CREATED, undefined);
-      dlog(trace, 'Emitted EVT_VENDOR_PAYMENT_CREATED');
-
-      onCreated?.();
-
-      setAmount('');
-      setMethod('cash');
-
-      onClose();
-      setShowReceipt(true);
+      closeAdd();
+      loadPage(true);
     } catch (e: any) {
-      const serverDetail = e?.response?.data?.detail;
-      const status = e?.response?.status;
-      const data = e?.response?.data;
-
-      derror(trace, 'Payment creation failed', {
-        status,
-        serverDetail,
-        serverData: data,
-        requestBodySnapshot: {
-          amount: sanitizeAmountToNumber(amount),
-          oil_id: scope === 'oil' ? oilId : null,
-          lot_id: scope === 'lot' ? usedLotId : null,
-          extra_cost_id: scope === 'extra' ? extraCostId : null,
-          payment_method: 'equity',
-          supplier_name: vendorName,
-        },
-        hint: 'Lot scope should omit oil_id; extra scope must include extra_cost_id.',
-        durationMs: Date.now() - T0,
-      });
-
-      Alert.alert('Error', String(serverDetail || e?.message || 'Save failed.'));
+      Alert.alert('Error', e?.response?.data?.detail || 'Operation failed.');
     } finally {
       setSubmitting(false);
     }
-  };
+  }, [
+    formName,
+    formPhone,
+    formAddress,
+    formStatus,
+    formMode,
+    selectedCustomer,
+    closeAdd,
+    online,
+    token,
+    loadPage,
+    user?.id,
+  ]);
 
-  const shareImage = async () => {
-    if (!receiptUri) return;
-    try {
-      await Sharing.shareAsync(receiptUri, { mimeType: 'image/png', dialogTitle: 'Send Receipt', UTI: 'public.png' });
-      dlog(traceIdRef.current, 'Shared receipt image');
-    } catch (e: any) {
-      derror(traceIdRef.current, 'Share image failed', e?.message || e);
-    }
-  };
+  const handleDelete = useCallback(() => {
+    if (!selectedCustomer) return;
+    Alert.alert('Delete', `Delete ${selectedCustomer.name || 'this customer'}?`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            if (online && token && selectedCustomer.id > 0) {
+              // online delete: tell server, then hard delete from local
+              await api.delete(`/diiwaancustomers/${selectedCustomer.id}`);
+              hardDeleteCustomerLocal(selectedCustomer.id);
+            } else {
+              // offline: mark deleted + dirty, so sync can send DELETE later
+              markCustomerDeletedLocal(selectedCustomer.id);
+            }
+            closeSettings();
+            loadPage(true);
+            setSelectedId(null);
+          } catch (e: any) {
+            Alert.alert('Error', e?.response?.data?.detail || 'Delete failed.');
+          }
+        },
+      },
+    ]);
+  }, [selectedCustomer, closeSettings, online, token, loadPage]);
 
-  const closeShareAndReceipt = () => {
-    setShareOpen(false);
-    setShowReceipt(false);
-    dlog(traceIdRef.current, 'Closed share & receipt');
+  useFocusEffect(
+    useCallback(() => {
+      const onBack = () => {
+        let handled = false;
+        if (isAddOpen) {
+          closeAdd();
+          handled = true;
+        }
+        if (isSettingsOpen) {
+          closeSettings();
+          handled = true;
+        }
+        return handled;
+      };
+      const sub = BackHandler.addEventListener('hardwareBackPress', onBack);
+      return () => sub.remove();
+    }, [isAddOpen, isSettingsOpen, closeAdd, closeSettings])
+  );
+
+  const renderItem = ({ item }: { item: Customer }) => {
+    const selected = item.id === selectedId;
+    return (
+      <TouchableOpacity
+        onPress={() => goToInvoices(item.name)}
+        onLongPress={() => {
+          setSelectedId(item.id);
+          setIsSettingsOpen(true);
+          Animated.timing(settingsY, {
+            toValue: SCREEN_H - MINI_SHEET_H,
+            duration: 260,
+            easing: Easing.out(Easing.cubic),
+            useNativeDriver: false,
+          }).start();
+        }}
+        style={[styles.itemRow, selected && styles.itemRowSelected]}
+        activeOpacity={0.7}
+      >
+        <View style={styles.itemLeft}>
+          <Text style={styles.itemName} numberOfLines={1}>
+            {item.name || '—'}
+          </Text>
+          <Text style={styles.itemSub} numberOfLines={1}>
+            {item.phone || 'No phone'}
+          </Text>
+        </View>
+
+        <View style={styles.itemRight}>
+          <Text
+            style={[
+              styles.amountDue,
+              (item.amount_due || 0) > 0 ? styles.amountDanger : styles.amountOkay,
+            ]}
+          >
+            {fmtMoney(item.amount_due || 0)}
+          </Text>
+          <Text style={styles.amountHint}>Balance</Text>
+        </View>
+      </TouchableOpacity>
+    );
   };
 
   return (
-    <>
-      {/* Bottom Sheet */}
-      <Modal visible={visible} transparent animationType="slide" presentationStyle="overFullScreen" onRequestClose={close}>
-        <TouchableWithoutFeedback onPress={close}>
-          <View style={styles.backdrop} />
-        </TouchableWithoutFeedback>
-
-        <Animated.View style={[styles.sheetWrap, { height: SHEET_H, transform: [{ translateY: slideY }] }]}>
-          <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={Platform.OS === 'ios' ? 18 : 0} style={{ flex: 1 }}>
-            <View style={[styles.sheetCard, { paddingBottom: Math.max(16, bottomSafe) }]}>
-              <View style={styles.sheetHandle} />
-              <Text style={styles.title}>Record Payment</Text>
-
-              {/* Vendor & AP banner */}
-              <View style={[dueStyles.banner, { marginBottom: 8 }]}>
-                <Text style={dueStyles.left}>Vendor</Text>
-                <Text style={dueStyles.right} numberOfLines={1}>{vendorName || '-'}</Text>
-              </View>
-              <View style={dueStyles.banner}>
-                <Text style={dueStyles.left}>Amount payable</Text>
-                <Text style={dueStyles.right}>{fmtMoney(Math.max(0, currentPayable || 0))}</Text>
-              </View>
-
-              {/* Extra costs (display) */}
-              {extraItems.length > 0 && (
-                <View style={[dueStyles.banner, { backgroundColor: '#F8FAFF' }]}>
-                  <View style={{ flex: 1 }}>
-                    <Text style={[dueStyles.left, { marginBottom: 6 }]}>Extra costs recorded</Text>
-                    {extraItems.map((it, idx) => (
-                      <View key={idx} style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-                        <Text style={[dueStyles.left, { color: '#475569' }]}>{it.label}</Text>
-                        <Text style={[dueStyles.right]}>{fmtMoneyExtra(it.amt)}</Text>
-                      </View>
-                    ))}
-                    <View style={{ borderBottomWidth: StyleSheet.hairlineWidth, borderColor: BORDER, marginVertical: 6 }} />
-                    <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-                      <Text style={[dueStyles.left, { fontWeight: '900' }]}>Total extras</Text>
-                      <Text style={[dueStyles.right]}>{fmtMoneyExtra(extraTotal)}</Text>
-                    </View>
-                    <Text style={{ color: '#6B7280', fontSize: 11, marginTop: 6 }}>
-                      * To pay a specific extra, use the “Extra Cost” flow.
-                    </Text>
-                  </View>
-                </View>
-              )}
-
-              <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: 18 }}>
-                {/* Amount */}
-                <View style={styles.row}>
-                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <Text style={styles.label}>Amount to pay</Text>
-                    <TouchableOpacity
-                      onPress={() => {
-                        const v = (Math.round(Math.max(0, currentPayable || 0) * 100) / 100).toFixed(2);
-                        setAmount(v);
-                        dlog(traceIdRef.current, 'Quick fill full amount', { value: v });
-                      }}
-                      style={dueStyles.quickFill}
-                      activeOpacity={0.8}
-                    >
-                      <Feather name="zap" size={14} color="#0B2447" />
-                      <Text style={dueStyles.quickFillTxt}>Full amount</Text>
-                    </TouchableOpacity>
-                  </View>
-
-                  <TextInput
-                    key={visible ? 'amount-open' : 'amount-closed'}
-                    value={amount}
-                    onChangeText={(t) => { const s = sanitizeAmount(t); setAmount(s); dlog(traceIdRef.current, 'Typing amount', { raw: t, sanitized: s }); }}
-                    placeholder="0.00"
-                    placeholderTextColor="#9CA3AF"
-                    style={[styles.input, isOverpay && currentPayable > 0 ? { borderColor: '#FCA5A5', backgroundColor: '#FFF7F7' } : null]}
-                    maxLength={18}
-                  />
-                  <Text style={{ marginTop: 6, fontSize: 12, fontWeight: '700', color: isOverpay && currentPayable > 0 ? '#DC2626' : '#059669' }}>
-                    {isOverpay && currentPayable > 0
-                      ? `Over by ${fmtMoney(typedAmt - Math.max(0, currentPayable || 0))} (will be adjusted)`
-                      : `Remaining after payment: ${fmtMoney(Math.max(0, remainingPreview))}`}
-                  </Text>
-                </View>
-
-                {/* Method (UI note only) */}
-                <View style={styles.row}>
-                  <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center', marginBottom: 8 }}>
-                    <TouchableOpacity
-                      activeOpacity={0.8}
-                      onPress={() => { setMethod('cash'); dlog(traceIdRef.current, 'Method selected', { method: 'cash' }); }}
-                      style={[methodPillStyles.pill, method === 'cash' ? methodPillStyles.pillActive : null]}
-                    >
-                      <Feather name="dollar-sign" size={16} color={method === 'cash' ? '#fff' : TEXT} />
-                      <Text style={[methodPillStyles.pillTxt, method === 'cash' ? { color: '#fff' } : null]}>Cash</Text>
-                    </TouchableOpacity>
-
-                    <View style={{ flex: 1 }}>
-                      <TextInput
-                        value={customMethod}
-                        onChangeText={(t) => { setCustomMethod(t); setMethod(t.trim().length > 0 ? 'custom' : 'cash'); }}
-                        placeholder="Note: Equity (owner capital)"
-                        placeholderTextColor="#9CA3AF"
-                        style={styles.input}
-                      />
-                    </View>
-                  </View>
-                </View>
-
-                {/* Actions */}
-                <View style={[styles.actions, { marginTop: 0 }]}>
-                  <TouchableOpacity style={[styles.btn, styles.btnGhost]} onPress={close} disabled={submitting}>
-                    <Text style={styles.btnGhostText}>Cancel</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={[styles.btn, submitting ? { opacity: 0.6 } : null]}
-                   onPress={onSave} 
-                   disabled={
-                    submitting ||
-                    (!oilId && !lotId && typeof extraCostId !== 'number')
-                  }>
-
-                   
-                    {submitting ? <ActivityIndicator size="small" color="#fff" /> : (<><Feather name="save" size={16} color="#fff" /><Text style={styles.btnTxt}>Save</Text></>)}
-                  </TouchableOpacity>
-                </View>
-              </ScrollView>
-            </View>
-          </KeyboardAvoidingView>
-        </Animated.View>
-      </Modal>
-
-      {/* IMAGE-ONLY Receipt */}
-      <Modal visible={showReceipt} transparent animationType="fade" onRequestClose={() => setShowReceipt(false)}>
-        <TouchableWithoutFeedback onPress={() => setShowReceipt(false)}>
-          <View style={styles.backdrop} />
-        </TouchableWithoutFeedback>
-
-        <View style={styles.paperCenter}>
-          <View style={styles.paperNotchLeft} />
-          <View style={styles.paperNotchRight} />
-
-          <View ref={paperRef} collapsable={false} style={styles.paper}>
-            <Text style={styles.paperCompany} numberOfLines={1}>{(companyName || 'Rasiid Bixin-sameeye').toUpperCase()}</Text>
-            {!!companyContact && <Text style={styles.paperCompanySub} numberOfLines={1}>{companyContact}</Text>}
-
-            <View style={styles.dots} />
-
-            <Text style={styles.paperTitle}>Vendor Payment Receipt</Text>
-            <Text style={styles.paperMeta}>{savedAt ? savedAt.toLocaleString() : new Date().toLocaleString()}</Text>
-
-            <View style={styles.dots} />
-
-            <View style={styles.rowKV}><Text style={styles.k}>Vendor</Text><Text style={styles.v} numberOfLines={1}>{vendorName || '-'}</Text></View>
-            {oilType ? (<View style={styles.rowKV}><Text style={styles.k}>Oil Type</Text><Text style={styles.v}>{oilType}</Text></View>) : null}
-            <View style={styles.rowKV}><Text style={styles.k}>Method</Text><Text style={styles.v}>{'Equity (Owner capital)'}</Text></View>
-
-            <View style={styles.dots} />
-
-            <View style={styles.amountBlock}><Text style={styles.amountLabel}>PAID</Text><Text style={styles.amountValue}>{fmtMoney(paidAmt)}</Text></View>
-
-            <View style={styles.rowKV}><Text style={styles.k}>Previous Payable</Text><Text style={styles.v}>{fmtMoney(prevDue)}</Text></View>
-            <View style={styles.rowKV}><Text style={[styles.k]}>New Payable</Text><Text style={[styles.v, newDue > 0 ? styles.vDanger : styles.vOk]}>{fmtMoney(newDue)}</Text></View>
-
-            {extraItems.length > 0 && (
-              <>
-                <View style={styles.dots} />
-                <Text style={[styles.k, { marginBottom: 4 }]}>Extra costs recorded</Text>
-                {extraItems.map((it, idx) => (<View key={`x-${idx}`} style={styles.rowKV}><Text style={styles.k}>{it.label}</Text><Text style={styles.v}>{fmtMoneyExtra(it.amt)}</Text></View>))}
-                <View style={styles.rowKV}><Text style={[styles.k, { fontWeight: '900' }]}>Total extras</Text><Text style={[styles.v, { fontWeight: '900' }]}>{fmtMoneyExtra(extraTotal)}</Text></View>
-              </>
-            )}
-
-            <View style={styles.dots} />
-            <Text style={styles.footerThanks}>Mahadsanid!</Text>
-            <Text style={styles.footerFine}>Rasiidkan waa caddeyn bixinta lacagta alaab-qeybiyaha (funded by owner equity).</Text>
-          </View>
+    <SafeAreaView style={styles.screen} edges={['top', 'left', 'right']}>
+      {/* Header */}
+      <LinearGradient
+        colors={[BRAND_BLUE, BRAND_BLUE_2]}
+        start={{ x: 0, y: 0 }}
+        end={{ x: 1, y: 1 }}
+        style={styles.header}
+      >
+        <View style={styles.headerInner}>
+          <View style={{ width: 32 }} />
+          <Text style={styles.headerTitle} numberOfLines={1}>
+            Macaamiisha
+          </Text>
+          <View style={{ width: 32 }} />
         </View>
-      </Modal>
+        {!online && (
+          <Text style={{ color: '#FBBF24', marginTop: 6, textAlign: 'center', fontSize: 11 }}>
+            Offline – xogta waxa laga soo qaaday kaydka gudaha
+          </Text>
+        )}
+      </LinearGradient>
 
-      {/* Share chooser */}
-      <Modal visible={shareOpen} transparent animationType="slide" onRequestClose={closeShareAndReceipt}>
-        <TouchableWithoutFeedback onPress={closeShareAndReceipt}><View style={styles.sheetBackdrop} /></TouchableWithoutFeedback>
-        <View style={[styles.shareSheetContainer, { paddingBottom: Math.max(20, bottomSafe + 6) }]}>
-          <View style={styles.sheetHandle} />
-          <Text style={styles.sheetTitle}>Udir rasiidka</Text>
-          <Text style={styles.sheetDesc}>Dooro meesha aad ku wadaagi doonto rasiidka sawirka (PNG) iyo fariinta.</Text>
+      {/* Actions */}
+      <View style={styles.actionsRow}>
+        <TouchableOpacity
+          style={[styles.pill, styles.pillPrimary]}
+          onPress={() => router.push('/customersettings')}
+          activeOpacity={0.9}
+        >
+          <Feather name="settings" size={16} color={BRAND_BLUE} />
+          <Text style={styles.pillPrimaryTxt}>bedel xogta</Text>
+          <View style={{ width: 8 }} />
+        </TouchableOpacity>
 
-          <View style={styles.sheetList}>
-            <TouchableOpacity style={styles.sheetItem} onPress={async () => { await shareImage(); closeShareAndReceipt(); }} activeOpacity={0.9}>
-              <View style={[styles.sheetIcon, { backgroundColor: '#F5F7FB' }]}><Feather name="share-2" size={18} color="#0B2447" /></View>
-              <View style={{ flex: 1 }}><Text style={styles.sheetItemTitle}>System Share</Text><Text style={styles.sheetItemSub}>Let the device choose an app</Text></View>
-              <Feather name="chevron-right" size={18} color="#6B7280" />
-            </TouchableOpacity>
+        <TouchableOpacity style={[styles.pill, styles.pillAlt]} onPress={openAdd} activeOpacity={0.9}>
+          <Feather name="user-plus" size={16} color="#243B6B" />
+          <Text style={styles.pillAltTxt}>ku dar macmiil</Text>
+        </TouchableOpacity>
+      </View>
 
-            <TouchableOpacity style={styles.sheetItem} onPress={async () => { await shareImage(); await sendWhatsAppText(undefined, shareMsg); closeShareAndReceipt(); }} activeOpacity={0.9}>
-              <View style={[styles.sheetIcon, { backgroundColor: '#E7F9EF' }]}><FontAwesome name="whatsapp" size={18} color="#25D366" /></View>
-              <View style={{ flex: 1 }}><Text style={styles.sheetItemTitle}>WhatsApp</Text><Text style={styles.sheetItemSub}>Share image then open chat with text</Text></View>
-              <Feather name="chevron-right" size={18} color="#6B7280" />
-            </TouchableOpacity>
+      {/* Search */}
+      <View style={styles.searchWrapOuter}>
+        <Feather name="search" size={18} color={MUTED} />
+        <TextInput
+          value={search}
+          onChangeText={setSearch}
+          placeholder="raadi macaamiil (offline/online)"
+          placeholderTextColor="#9CA3AF"
+          style={styles.searchInputOuter}
+          autoCorrect={false}
+          returnKeyType="search"
+        />
+      </View>
 
-            <TouchableOpacity style={styles.sheetItem} onPress={async () => { await shareImage(); await sendSmsText(shareMsg); closeShareAndReceipt(); }} activeOpacity={0.9}>
-              <View style={[styles.sheetIcon, { backgroundColor: '#EEF2FF' }]}><Feather name="message-circle" size={18} color="#4F46E5" /></View>
-              <View style={{ flex: 1 }}><Text style={styles.sheetItemTitle}>SMS</Text><Text style={styles.sheetItemSub}>Share image via sheet, then prefill SMS</Text></View>
-              <Feather name="chevron-right" size={18} color="#6B7280" />
-            </TouchableOpacity>
+      {/* Content */}
+      <View style={styles.content}>
+        {loading && customers.length === 0 ? (
+          <View style={styles.center}>
+            <ActivityIndicator size="large" color={ACCENT} />
+            {error ? <Text style={styles.errorText}>{error}</Text> : null}
           </View>
+        ) : (
+          <FlatList
+            data={customers}
+            keyExtractor={(it) => String(it.id)}
+            renderItem={renderItem}
+            ItemSeparatorComponent={() => <View style={styles.separator} />}
+            style={{ flex: 1 }}
+            contentContainerStyle={{ paddingBottom: 24, paddingTop: 8 }}
+            onEndReachedThreshold={0.4}
+            onEndReached={loadMore}
+            keyboardShouldPersistTaps="handled"
+            keyboardDismissMode="on-drag"
+            showsVerticalScrollIndicator
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                onRefresh={onRefresh}
+                tintColor={ACCENT}
+              />
+            }
+            ListEmptyComponent={
+              !loading ? <Text style={styles.emptyText}>No customers yet.</Text> : null
+            }
+            ListFooterComponent={
+              hasMore ? (
+                <View style={{ paddingVertical: 16, alignItems: 'center' }}>
+                  <ActivityIndicator color={ACCENT} />
+                </View>
+              ) : null
+            }
+          />
+        )}
+      </View>
 
-          <TouchableOpacity style={styles.sheetCancel} onPress={closeShareAndReceipt}>
-            <Text style={styles.sheetCancelTxt}>Close</Text>
+      {/* Backdrop */}
+      <Backdrop
+        visible={isSettingsOpen || isAddOpen}
+        onPress={() => {
+          if (isAddOpen) closeAdd();
+          if (isSettingsOpen) closeSettings();
+        }}
+      />
+
+      {/* Settings Bottom Sheet */}
+      <Animated.View
+        style={[styles.sheet, { height: MINI_SHEET_H, top: settingsY }]}
+        pointerEvents={isSettingsOpen ? 'auto' : 'none'}
+      >
+        <View style={styles.sheetHandle} />
+        <Text style={styles.sheetTitle}>{selectedCustomer?.name || 'Actions'}</Text>
+        <View style={styles.sheetRow}>
+          <TouchableOpacity
+            style={[styles.sheetAction, { backgroundColor: selectedCustomer ? ACCENT : '#B9C3FF' }]}
+            onPress={() => selectedCustomer && openEdit(selectedCustomer)}
+            disabled={!selectedCustomer}
+          >
+            <Feather name="edit-2" size={16} color="#fff" />
+            <Text style={styles.sheetActionText}>Edit</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.sheetAction, { backgroundColor: selectedCustomer ? DANGER : '#F5B4B4' }]}
+            onPress={handleDelete}
+            disabled={!selectedCustomer}
+          >
+            <Feather name="trash-2" size={16} color="#fff" />
+            <Text style={styles.sheetActionText}>Delete</Text>
           </TouchableOpacity>
         </View>
-      </Modal>
-    </>
+        <TouchableOpacity style={styles.sheetClose} onPress={closeSettings}>
+          <Text style={styles.sheetCloseTxt}>Close</Text>
+        </TouchableOpacity>
+      </Animated.View>
+
+      {/* Add/Edit Bottom Sheet */}
+      <Animated.View
+        style={[styles.sheet, { height: SHEET_H, top: addY }]}
+        pointerEvents={isAddOpen ? 'auto' : 'none'}
+      >
+        <View style={styles.sheetHandle} />
+        <Text style={styles.sheetTitle}>
+          {formMode === 'add' ? 'Add macaamiil' : 'Edit macaamiil'}
+        </Text>
+
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          keyboardVerticalOffset={Platform.select({ ios: 12, android: 0 })}
+          style={{ flex: 1 }}
+        >
+          <ScrollView
+            ref={formScrollRef}
+            style={{ flex: 1 }}
+            contentContainerStyle={{ paddingBottom: 24, paddingTop: 4, flexGrow: 1 }}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator
+          >
+            <View style={styles.formRow}>
+              <Text style={styles.label}>Magaca</Text>
+              <TextInput
+                value={formName}
+                onChangeText={setFormName}
+                placeholder="Magaca macaamiilka"
+                placeholderTextColor="#9CA3AF"
+                style={styles.input}
+                returnKeyType="next"
+              />
+            </View>
+
+            <View style={styles.formRow}>
+              <Text style={styles.label}>Phone</Text>
+              <TextInput
+                value={formPhone}
+                onChangeText={setFormPhone}
+                placeholder="(+252) 61 234 5678"
+                placeholderTextColor="#9CA3AF"
+                keyboardType="phone-pad"
+                style={styles.input}
+                returnKeyType="next"
+              />
+            </View>
+
+            <View style={styles.formRow}>
+              <Text style={styles.label}>Address</Text>
+              <TextInput
+                value={formAddress}
+                onChangeText={setFormAddress}
+                placeholder="Degmada, xaafadda…"
+                placeholderTextColor="#9CA3AF"
+                style={[styles.input, { height: 100, textAlignVertical: 'top', paddingTop: 12 }]}
+                multiline
+                returnKeyType="done"
+              />
+            </View>
+
+            <View style={styles.formActions}>
+              <TouchableOpacity
+                style={[styles.btn, styles.btnGhost]}
+                onPress={closeAdd}
+                disabled={submitting}
+              >
+                <Text style={[styles.btnTxt, { color: TEXT }]}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.btn, submitting ? { opacity: 0.6 } : null]}
+                onPress={handleCreateOrUpdate}
+                disabled={submitting}
+              >
+                <Text style={styles.btnTxt}>
+                  {formMode === 'add' ? 'Save' : 'Update'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </ScrollView>
+        </KeyboardAvoidingView>
+      </Animated.View>
+    </SafeAreaView>
   );
 }
 
-const dueStyles = StyleSheet.create({
-  banner: {
-    flexDirection: 'row', justifyContent: 'space-between', backgroundColor: '#FAFBFF',
-    borderWidth: 1, borderColor: BORDER, borderRadius: 12, paddingVertical: 10, paddingHorizontal: 12, marginBottom: 12,
-  },
-  left: { color: MUTED, fontWeight: '700' },
-  right: { color: TEXT, fontWeight: '900', maxWidth: 190 },
-  quickFill: {
-    flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 10, paddingVertical: 6,
-    borderRadius: 20, backgroundColor: '#EEF2FF', borderWidth: 1, borderColor: '#DDE3F0',
-  },
-  quickFillTxt: { color: '#0B2447', fontWeight: '800', fontSize: 12 },
-});
+function Backdrop({ visible, onPress }: { visible: boolean; onPress: () => void }) {
+  const opacity = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(opacity, {
+      toValue: visible ? 1 : 0,
+      duration: 180,
+      useNativeDriver: true,
+    }).start();
+  }, [visible, opacity]);
 
-const methodPillStyles = StyleSheet.create({
-  pill: {
-    flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 12, height: 40,
-    borderRadius: 12, borderWidth: 1.5, borderColor: BORDER, backgroundColor: '#fff',
-  },
-  pillActive: { backgroundColor: '#0B2447', borderColor: '#0B2447' },
-  pillTxt: { color: TEXT, fontWeight: '800' },
-});
+  if (!visible) return null;
+  return (
+    <Animated.View style={[styles.backdrop, { opacity }]}>
+      <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={onPress} />
+    </Animated.View>
+  );
+}
 
 const styles = StyleSheet.create({
-  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.45)' },
-  sheetWrap: { position: 'absolute', left: 0, right: 0, bottom: 0 },
-  sheetCard: {
-    flex: 1, backgroundColor: BG, borderTopLeftRadius: 22, borderTopRightRadius: 22,
-    paddingHorizontal: 16, paddingTop: 10, borderTopWidth: 1, borderLeftWidth: 1, borderRightWidth: 1,
-    borderColor: BORDER, shadowColor: '#000', shadowOpacity: 0.18, shadowOffset: { width: 0, height: -8 },
-    shadowRadius: 16, elevation: 20,
+  screen: { flex: 1, backgroundColor: BG },
+
+  header: {
+    paddingHorizontal: 14,
+    paddingTop: 14,
+    paddingBottom: 16,
+    borderBottomLeftRadius: 18,
+    borderBottomRightRadius: 18,
   },
-  sheetHandle: { alignSelf: 'center', width: 46, height: 5, borderRadius: 3, backgroundColor: '#E5E7EB', marginBottom: 8 },
-  title: { fontSize: 18, fontWeight: '800', marginBottom: 10, color: TEXT, textAlign: 'center' },
+  headerInner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  headerTitle: {
+    flex: 1,
+    textAlign: 'center',
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '900',
+  },
 
-  row: { marginBottom: 14 },
+  actionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    marginTop: 10,
+    marginBottom: 10,
+    paddingHorizontal: 14,
+  },
+  pill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    height: 40,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+  },
+  pillPrimary: { backgroundColor: '#fff', borderColor: 'rgba(0,0,0,0.05)' },
+  pillPrimaryTxt: { color: BRAND_BLUE, fontWeight: '800' },
+  pillAlt: { backgroundColor: '#EEF2FF', borderColor: '#E0E7FF' },
+  pillAltTxt: { color: '#243B6B', fontWeight: '800' },
+
+  searchWrapOuter: {
+    marginTop: 6,
+    marginBottom: 6,
+    alignSelf: 'center',
+    width: '88%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: '#fff',
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    height: 40,
+    borderWidth: 1,
+    borderColor: '#DDE3F0',
+  },
+  searchInputOuter: {
+    flex: 1,
+    color: TEXT,
+    fontSize: 14,
+    paddingVertical: 2,
+  },
+
+  content: { flex: 1, paddingHorizontal: 14, paddingTop: 8 },
+  center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 10 },
+  errorText: { color: DANGER, marginTop: 8 },
+  emptyText: { textAlign: 'center', color: MUTED, marginTop: 24 },
+
+  separator: { height: 10 },
+
+  itemRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#fff',
+    borderRadius: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderWidth: 1,
+    borderColor: BORDER,
+  },
+  itemRowSelected: {
+    borderColor: ACCENT,
+    shadowColor: ACCENT,
+    shadowOpacity: 0.15,
+    shadowOffset: { width: 0, height: 6 },
+    shadowRadius: 12,
+    elevation: 3,
+  },
+  itemLeft: { flex: 1, paddingRight: 10 },
+  itemName: { fontSize: 16, color: TEXT, fontWeight: '700' },
+  itemSub: { fontSize: 13, color: MUTED, marginTop: 3 },
+  itemRight: { alignItems: 'flex-end' },
+  amountDue: { fontSize: 15, fontWeight: '800' },
+  amountDanger: { color: DANGER },
+  amountOkay: { color: SUCCESS },
+  amountHint: { fontSize: 11, color: MUTED, marginTop: 2 },
+
+  sheet: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    backgroundColor: '#fff',
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 12,
+    borderTopWidth: 1,
+    borderColor: BORDER,
+    zIndex: 20,
+    elevation: 20,
+  },
+  sheetHandle: {
+    alignSelf: 'center',
+    width: 44,
+    height: 4,
+    borderRadius: 999,
+    backgroundColor: '#E5E7EB',
+    marginBottom: 10,
+  },
+  sheetTitle: { fontSize: 16, fontWeight: '800', color: TEXT, textAlign: 'center', marginBottom: 8 },
+  sheetRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+    marginTop: 8,
+  },
+  sheetAction: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 16,
+    height: 44,
+    borderRadius: 12,
+  },
+  sheetActionText: { color: '#fff', fontWeight: '700' },
+  sheetClose: { marginTop: 12, alignSelf: 'center', paddingVertical: 6, paddingHorizontal: 12 },
+  sheetCloseTxt: { color: MUTED, fontWeight: '600' },
+
+  formRow: { marginBottom: 12 },
   label: { fontWeight: '700', color: TEXT, marginBottom: 6 },
-  input: { backgroundColor: '#fff', borderWidth: 1, borderColor: BORDER, borderRadius: 12, paddingHorizontal: 12, height: 48, color: TEXT },
+  input: {
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    height: 44,
+    color: TEXT,
+  },
 
-  actions: { flexDirection: 'row', gap: 10 },
+  formActions: { flexDirection: 'row', gap: 10, marginTop: 8 },
   btn: {
-    flex: 1, height: 48, borderRadius: 12, backgroundColor: ACCENT,
-    alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 8,
+    flex: 1,
+    height: 48,
+    borderRadius: 12,
+    backgroundColor: ACCENT,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  btnGhost: {
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: BORDER,
   },
   btnTxt: { color: '#fff', fontWeight: '800' },
-  btnGhost: { backgroundColor: '#fff', borderWidth: 1, borderColor: BORDER },
-  btnGhostText: { color: TEXT, fontWeight: '800' },
 
-  paperCenter: { ...StyleSheet.absoluteFillObject, padding: 18, justifyContent: 'center', alignItems: 'center' },
-  paperNotchLeft: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: 'rgba(0,0,0,0.05)', left: '50%', marginLeft: -(PAPER_W / 2) - 7, top: '20%' },
-  paperNotchRight: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: 'rgba(0,0,0,0.05)', right: '50%', marginRight: -(PAPER_W / 2) - 7, bottom: '22%' },
-  paper: {
-    width: PAPER_W, backgroundColor: '#FFFEFC', borderRadius: 12, borderWidth: 1, borderColor: '#E9EDF5',
-    paddingVertical: 14, paddingHorizontal: 14, shadowColor: '#000', shadowOpacity: 0.06,
-    shadowOffset: { width: 0, height: 8 }, shadowRadius: 12, elevation: 4,
+  backdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    zIndex: 10,
+    elevation: 10,
   },
-  paperCompany: { textAlign: 'center', fontSize: 14, fontWeight: '900', color: TEXT },
-  paperCompanySub: { textAlign: 'center', fontSize: 11, color: MUTED, marginTop: 2 },
-  paperTitle: { textAlign: 'center', fontSize: 13, color: '#475569', fontWeight: '800', marginTop: 2 },
-  paperMeta: { textAlign: 'center', fontSize: 11, color: MUTED, marginTop: 2 },
-  dots: { borderBottomWidth: 1, borderStyle: 'dotted', borderColor: '#C7D2FE', marginVertical: 10 },
-  rowKV: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
-  k: { color: '#475569', fontSize: 12, fontWeight: '700' },
-  v: { color: TEXT, fontSize: 12, fontWeight: '800' },
-  vDanger: { color: '#DC2626' },
-  vOk: { color: '#059669' },
-  amountBlock: { alignItems: 'center', marginVertical: 4 },
-  amountLabel: { fontSize: 11, color: '#64748B', fontWeight: '700', marginBottom: 2 },
-  amountValue: { fontSize: 20, fontWeight: '900', color: '#059669' },
-
-  sheetBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.35)' },
-  shareSheetContainer: {
-    position: 'absolute', left: 0, right: 0, bottom: 0, backgroundColor: '#fff', borderTopLeftRadius: 22,
-    borderTopRightRadius: 22, paddingHorizontal: 16, paddingTop: 10, borderWidth: 1, borderColor: '#EEF1F6',
-  },
-  sheetTitle: { fontSize: 16, fontWeight: '900', color: '#111827', textAlign: 'center' },
-  sheetDesc: { fontSize: 12, color: '#6B7280', textAlign: 'center', marginTop: 4, marginBottom: 10 },
-  sheetList: { gap: 10 },
-  sheetItem: {
-    flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 12, paddingHorizontal: 10,
-    borderRadius: 14, backgroundColor: '#FAFBFF', borderWidth: 1, borderColor: '#EEF1F6',
-  },
-  sheetIcon: { width: 36, height: 36, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
-  sheetItemTitle: { fontSize: 14, fontWeight: '800', color: '#0B1220' },
-  sheetItemSub: { fontSize: 11, color: '#6B7280' },
-  sheetCancel: { marginTop: 12, alignSelf: 'center', paddingVertical: 10, paddingHorizontal: 16 },
-  sheetCancelTxt: { fontWeight: '800', color: '#6B7280' },
 });

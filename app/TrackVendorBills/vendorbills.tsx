@@ -1,15 +1,12 @@
-// app/(tabs)/TrackVendorBills/vendorbills.tsx
 import { AntDesign, Feather } from '@expo/vector-icons';
 import DateTimePicker from '@react-native-community/datetimepicker';
-import { useFocusEffect } from '@react-navigation/native';
+import { useFocusEffect, useIsFocused } from '@react-navigation/native';
 import dayjs from 'dayjs';
 import { LinearGradient } from 'expo-linear-gradient';
-import { BackHandler } from 'react-native';
-
-import { useIsFocused } from '@react-navigation/native';
 import { useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { BackHandler } from 'react-native';
 
 import { events, EVT_EXTRA_COST_CREATED, EVT_VENDOR_PAYMENT_CREATED } from '../Shidaal/eventBus';
 
@@ -36,6 +33,8 @@ import OilExtraCostModal from '../Shidaal/oilExtraCostModal';
 import VendorPaymentCreateSheet from '../Shidaal/vendorpayment';
 
 const { width } = Dimensions.get('window');
+
+const ALL_TRUCKS = '__ALL__';
 
 /** -------- Oil Summary types (from oildashboard) -------- */
 type OilType = 'diesel' | 'petrol' | 'kerosene' | 'jet' | 'hfo' | 'crude' | 'lube';
@@ -69,6 +68,33 @@ type SummaryResponse = {
   totals: Record<string, OilTypeTotals>;
   depot_lots: number;
   items: DiiwaanOilRead[];
+};
+
+/** ---------- Wakaalad stats types (from /wakaalad_diiwaan/stats/summary) ---------- */
+type WakaaladSoldByTruck = {
+  truck_plate: string | null;
+  total_sold_l: number;
+  total_sold_fuusto: number;
+  total_sold_caag: number;
+};
+
+type WakaaladMovedByTruck = {
+  truck_plate: string | null;
+  moved_l: number;
+  moved_fuusto: number;
+  moved_caag: number;
+};
+
+type WakaaladStatsResponse = {
+  total_sold_l: number;
+  total_sold_fuusto: number;
+  total_sold_caag: number;
+  sold_by_truck_plate: WakaaladSoldByTruck[];
+  sold_by_wakaalad: any[];
+  moved_total_l: number;
+  moved_total_fuusto: number;
+  moved_total_caag: number;
+  moved_by_truck_plate: WakaaladMovedByTruck[];
 };
 
 /** ---------- Supplier dues / children ---------- */
@@ -158,27 +184,43 @@ function billKey(it: SupplierDueItem, idx: number) {
   return `${base}__${idx}`;
 }
 
+/** Unit conversion helper */
+function convertLitersForDisplay(liters: number, unit: 'liters' | 'fuusto' | 'caag') {
+  const L = Number(liters || 0);
+  if (!L) return 0;
+  if (unit === 'liters') return L;
+  if (unit === 'fuusto') return L / 240;
+  return L / 20;
+}
+
 /** Compact child badge (card right side) */
 function ChildOilBadge({
   label,
-  sold,
   instock,
+  displayUnit,
 }: {
   label: string;
-  sold: number;
   instock: number;
+  displayUnit: 'liters' | 'fuusto' | 'caag';
 }) {
+  const unitLabel = displayUnit === 'liters' ? 'L' : displayUnit === 'fuusto' ? 'Fuusto' : 'Caag';
+  const displayed = convertLitersForDisplay(instock, displayUnit);
+  const decimals = displayUnit === 'liters' ? 0 : 2;
+
   return (
     <View style={styles.childBadge}>
-      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-        <Feather name="droplet" size={11} color={COLOR_TEXT} />
-        <Text style={styles.badgeType}>{label}</Text>
-      </View>
-      <View style={{ flexDirection: 'row', gap: 10 }}>
-    
-        <Text style={styles.badgeStat}>
-          Stock: <Text style={styles.badgeStatStrong}>{formatNumber(instock)} liters</Text>
-        </Text>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, justifyContent: 'space-between' }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          <Feather name="droplet" size={11} color={COLOR_TEXT} />
+          <Text style={styles.badgeType}>{label}</Text>
+        </View>
+
+        {/* Green stock button */}
+        <TouchableOpacity style={styles.stockPill}>
+          <Text style={styles.stockPillTxt}>
+            {formatNumber(displayed, decimals)} {unitLabel}
+          </Text>
+        </TouchableOpacity>
       </View>
     </View>
   );
@@ -197,6 +239,17 @@ export default function VendorBillsScreen() {
   const [summary, setSummary] = useState<SummaryResponse | null>(null);
   const overall = summary?.totals?.__overall__;
 
+  // Wakaalad stats
+  const [wakaaladStats, setWakaaladStats] = useState<WakaaladStatsResponse | null>(null);
+
+  // View filters for stats
+  const [selectedTruck, setSelectedTruck] = useState<string>(ALL_TRUCKS);
+  const [displayUnit, setDisplayUnit] = useState<'liters' | 'fuusto' | 'caag'>('liters');
+
+  // real popups for truck + display in
+  const [truckPickerOpen, setTruckPickerOpen] = useState(false);
+  const [unitPickerOpen, setUnitPickerOpen] = useState(false);
+
   // Details popup
   const [selected, setSelected] = useState<SupplierDueItem | null>(null);
   const detailsOpen = !!selected;
@@ -209,7 +262,7 @@ export default function VendorBillsScreen() {
   const [extraOilId, setExtraOilId] = useState<number | null>(null);
 
   // Single Extra Costs sheet (bottom-up)
-  const [extrasPopupOpen, setExtrasPopupOpen] = useState(false);
+  const [extrasPopupOpen, setExtrasPopupOpen] = useState(false); // kept if used elsewhere
 
   // Vendor payment sheet
   const [payOpen, setPayOpen] = useState(false);
@@ -229,6 +282,62 @@ export default function VendorBillsScreen() {
     startDate: dayjs().startOf('month').toDate(),
     endDate: dayjs().endOf('day').toDate(),
   });
+
+  const closeFilters = () => {
+    setShowFilters(false);
+    setTruckPickerOpen(false);
+    setUnitPickerOpen(false);
+  };
+
+  // Derived effective range with fallback to previous month when "this month" has no data
+  const effectiveRange = useMemo(() => {
+    const isCurrentMonth =
+      dayjs(dateRange.startDate).isSame(dayjs().startOf('month'), 'day') &&
+      dayjs(dateRange.endDate).isSame(dayjs().endOf('day'), 'day');
+
+    const filterWithRange = (range: { startDate: Date; endDate: Date }) => {
+      const from = dayjs(range.startDate).startOf('day').valueOf();
+      const to = dayjs(range.endDate).endOf('day').valueOf();
+      const q = search.trim().toLowerCase();
+
+      const base = items.filter((it) => {
+        const t = it.date ? new Date(it.date).getTime() : 0;
+        const dateOK = t >= from && t <= to;
+        const plate = (it.truck_plate || '').trim();
+        const truckOK = selectedTruck === ALL_TRUCKS || plate === selectedTruck;
+
+        if (!dateOK || !truckOK) return false;
+        if (!q) return true;
+
+        const childTypes = (it.child_oils || []).map((c) => c.oil_type ?? '').join(' ');
+        const hay = `${it.supplier_name ?? ''} ${it.truck_plate ?? ''} ${it.truck_type ?? ''} ${
+          it.oil_type ?? ''
+        } ${childTypes}`.toLowerCase();
+        return hay.includes(q);
+      });
+
+      return base.sort((a, b) => {
+        const ta = a.date ? new Date(a.date).getTime() : 0;
+        const tb = b.date ? new Date(b.date).getTime() : 0;
+        return tb - ta;
+      });
+    };
+
+    const firstPass = filterWithRange(dateRange);
+
+    if (isCurrentMonth && firstPass.length === 0) {
+      const prevStart = dayjs(dateRange.startDate).subtract(1, 'month').startOf('month').toDate();
+      const prevEnd = dayjs(prevStart).endOf('month').toDate();
+      return {
+        range: { startDate: prevStart, endDate: prevEnd },
+        data: filterWithRange({ startDate: prevStart, endDate: prevEnd }),
+      };
+    }
+
+    return { range: dateRange, data: firstPass };
+  }, [dateRange, items, search, selectedTruck]);
+
+  const filteredItems = effectiveRange.data;
 
   const headers = useMemo(
     () => (token ? { Authorization: `Bearer ${token}` } : undefined),
@@ -255,8 +364,8 @@ export default function VendorBillsScreen() {
           ...(headers || {}),
           'Cache-Control': 'no-cache',
           Pragma: 'no-cache',
-        },
-        params: { _ts: Date.now() },
+          params: { _ts: Date.now() },
+        } as any,
       });
       setItems(res?.data?.items ?? []);
     } catch {
@@ -274,17 +383,29 @@ export default function VendorBillsScreen() {
     } catch {}
   }, [headers]);
 
+  /** Fetch wakaalad stats summary */
+  const fetchWakaaladStats = useCallback(async () => {
+    try {
+      const res = await api.get<WakaaladStatsResponse>('/wakaalad_diiwaan/stats/summary', {
+        headers: { ...(headers || {}) },
+      });
+      setWakaaladStats(res.data);
+    } catch {
+      // ignore for now
+    }
+  }, [headers]);
+
   const fetchAll = useCallback(async () => {
-    if (fetchingRef.current) return; // single-flight guard
+    if (fetchingRef.current) return;
     fetchingRef.current = true;
     try {
       setLoading(true);
-      await Promise.all([fetchVendorDues(), fetchOilSummary()]);
+      await Promise.all([fetchVendorDues(), fetchOilSummary(), fetchWakaaladStats()]);
     } finally {
       setLoading(false);
       fetchingRef.current = false;
     }
-  }, [fetchVendorDues, fetchOilSummary]);
+  }, [fetchVendorDues, fetchOilSummary, fetchWakaaladStats]);
 
   useFocusEffect(
     useCallback(() => {
@@ -293,8 +414,8 @@ export default function VendorBillsScreen() {
   );
 
   useEffect(() => {
-    const offPay   = events.on(EVT_VENDOR_PAYMENT_CREATED, () => fetchAll());
-    const offExtra = events.on(EVT_EXTRA_COST_CREATED,   () => fetchAll());
+    const offPay = events.on(EVT_VENDOR_PAYMENT_CREATED, () => fetchAll());
+    const offExtra = events.on(EVT_EXTRA_COST_CREATED, () => fetchAll());
     return () => {
       offPay();
       offExtra();
@@ -360,34 +481,10 @@ export default function VendorBillsScreen() {
     setPayCurrentDue(0);
   };
 
-  // also refresh when the payment sheet closes without creating (to be safe)
   const onPaymentClosed = async () => {
     setPayOpen(false);
     await fetchAll();
   };
-
-  // search + date + SORT NEWEST FIRST
-  const filteredItems = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    const from = dayjs(dateRange.startDate).startOf('day').valueOf();
-    const to = dayjs(dateRange.endDate).endOf('day').valueOf();
-
-    const base = items.filter((it) => {
-      const t = it.date ? new Date(it.date).getTime() : 0;
-      const dateOK = t >= from && t <= to;
-      if (!q) return dateOK;
-
-      const childTypes = (it.child_oils || []).map((c) => c.oil_type ?? '').join(' ');
-      const hay = `${it.supplier_name ?? ''} ${it.truck_plate ?? ''} ${it.truck_type ?? ''} ${it.oil_type ?? ''} ${childTypes}`.toLowerCase();
-      return dateOK && hay.includes(q);
-    });
-
-    return base.sort((a, b) => {
-      const ta = a.date ? new Date(a.date).getTime() : 0;
-      const tb = b.date ? new Date(b.date).getTime() : 0;
-      return tb - ta;
-    });
-  }, [items, search, dateRange]);
 
   // hardware back → /menu
   useFocusEffect(
@@ -405,109 +502,192 @@ export default function VendorBillsScreen() {
     setSelected(null);
   };
 
-  /** CHILD SECTION (popup): only Oil Type + lines: Oil cost / Stock / Sold */
-  const renderChildSection = (c: OilDueLine, ix: number) => (
-    <View key={`child_${c.oil_id}_${ix}`} style={styles.childSection}>
-      <View style={styles.childHeader}>
-        <Text style={styles.childHeaderTitle}>
-          {(c.oil_type || 'OIL').toString().toUpperCase()}
-        </Text>
-      </View>
+  /** Truck options from stats + summary */
+  const truckOptions = useMemo(() => {
+    const set = new Set<string>();
+    wakaaladStats?.sold_by_truck_plate.forEach((r) => {
+      if (r.truck_plate && r.truck_plate.trim()) set.add(r.truck_plate.trim());
+    });
+    wakaaladStats?.moved_by_truck_plate.forEach((r) => {
+      if (r.truck_plate && r.truck_plate.trim()) set.add(r.truck_plate.trim());
+    });
+    summary?.items.forEach((it) => {
+      if (it.truck_plate && it.truck_plate.trim()) set.add(it.truck_plate.trim());
+    });
+    const arr = Array.from(set).sort((a, b) => a.localeCompare(b));
+    return [ALL_TRUCKS, ...arr];
+  }, [summary, wakaaladStats]);
 
-      <View style={styles.inlineGrid}>
-        <Field label="Oil cost" value={formatCurrency(c.oil_total_landed_cost)} />
-        <Field label="Stock" value={formatNumber(c.in_stock_l)} />
-        <Field label="Sold" value={formatNumber(c.sold_l)} />
-      </View>
-    </View>
-  );
-
-  /** computed helpers for selected */
-  const selectedOverallCost = useMemo(() => {
-    if (!selected) return 0;
-    const base = Number(selected.over_all_cost ?? 0);
-    if (base) return base;
-    return Number((selected.oil_total_landed_cost || 0) + (selected.total_extra_cost || 0));
-  }, [selected]);
-
-  const totalExtraCosts = useMemo(() => {
-    if (!selected) return 0;
-    // prefer provided aggregate
-    if (typeof selected.total_extra_cost === 'number') return Number(selected.total_extra_cost || 0);
-    // fallback: sum child extra costs if present
-    const children = selected.child_oils || [];
-    if (children.length > 0) {
-      return children.reduce((acc, c) => acc + Number(c.total_extra_cost || 0), 0);
+  useEffect(() => {
+    if (!truckOptions.includes(selectedTruck)) {
+      setSelectedTruck(ALL_TRUCKS);
     }
-    return 0;
-  }, [selected]);
+  }, [truckOptions, selectedTruck]);
+
+  const unitLabel = displayUnit === 'liters' ? 'L' : displayUnit === 'fuusto' ? 'Fuusto' : 'Caag';
+
+  /** Metrics: remaining, sold, moved (in liters) depending on selected truck */
+  const remainingLiters = useMemo(() => {
+    if (!summary) return 0;
+    if (selectedTruck === ALL_TRUCKS) {
+      return Number(overall?.total_instock_l ?? 0);
+    }
+    const plate = selectedTruck;
+    return summary.items
+      .filter((it) => (it.truck_plate || '').trim() === plate)
+      .reduce((acc, it) => acc + Number(it.in_stock_l || 0), 0);
+  }, [summary, overall, selectedTruck]);
+
+  const soldLiters = useMemo(() => {
+    if (!wakaaladStats) return 0;
+    if (selectedTruck === ALL_TRUCKS) return Number(wakaaladStats.total_sold_l || 0);
+    const row = wakaaladStats.sold_by_truck_plate.find(
+      (r) => (r.truck_plate || '').trim() === selectedTruck
+    );
+    return Number(row?.total_sold_l || 0);
+  }, [wakaaladStats, selectedTruck]);
+
+  const movedLiters = useMemo(() => {
+    if (!wakaaladStats) return 0;
+    if (selectedTruck === ALL_TRUCKS) return Number(wakaaladStats.moved_total_l || 0);
+    const row = wakaaladStats.moved_by_truck_plate.find(
+      (r) => (r.truck_plate || '').trim() === selectedTruck
+    );
+    return Number(row?.moved_l || 0);
+  }, [wakaaladStats, selectedTruck]);
+
+  const remainingDisplay = convertLitersForDisplay(remainingLiters, displayUnit);
+  const soldDisplay = convertLitersForDisplay(soldLiters, displayUnit);
+  const movedDisplay = convertLitersForDisplay(movedLiters, displayUnit);
+  const kpiDecimals = displayUnit === 'liters' ? 0 : 2;
+
+  /** CHILD SECTION (popup): Oil type header + plate/date inline; lines: Oil cost / Stock */
+  const renderChildSection = (c: OilDueLine, ix: number, plate?: string | null, dateIso?: string | null) => {
+    const stockL = Number(c.in_stock_l || 0);
+    const stockDisplay = convertLitersForDisplay(stockL, displayUnit);
+    const stockLabel = `Stock (${unitLabel})`;
+    const stockValue = `${formatNumber(stockDisplay, kpiDecimals)} ${unitLabel}  ·  ${formatNumber(
+      stockL,
+      0
+    )} L`;
+
+    return (
+      <View key={`child_${c.oil_id}_${ix}`} style={styles.childSection}>
+        <View style={styles.childHeader}>
+          <Text style={styles.childHeaderTitle}>
+            {(c.oil_type || 'OIL').toString().toUpperCase()}
+          </Text>
+
+          {/* plate + date inline with oiltype header */}
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+            {!!plate && (
+              <View style={styles.inlinePill}>
+                <Feather name="truck" size={10} color={COLOR_TEXT} />
+                <Text style={styles.inlinePillTxt}>{plate}</Text>
+              </View>
+            )}
+            {!!dateIso && (
+              <View style={styles.inlinePill}>
+                <Feather name="calendar" size={10} color={COLOR_TEXT} />
+                <Text style={styles.inlinePillTxt}>{formatDateLocal(dateIso)}</Text>
+              </View>
+            )}
+          </View>
+        </View>
+
+        <View style={styles.inlineGrid}>
+          <Field label="Oil cost" value={formatCurrency(c.oil_total_landed_cost)} />
+          <Field label={stockLabel} value={stockValue} />
+        </View>
+      </View>
+    );
+  };
 
   return (
     <View style={styles.page}>
-      {/* Header */}
-      <SafeAreaView edges={['top']} style={{ backgroundColor: '#0B2447' }}>
+      <SafeAreaView edges={['top']} style={{ backgroundColor: COLOR_BG }}>
         <StatusBar style="light" translucent />
         <LinearGradient
           colors={['#0B2447', '#0B2447']}
           start={{ x: 0, y: 0 }}
           end={{ x: 1, y: 0 }}
-          style={[styles.header, { paddingTop: insets.top }]}
+          style={[styles.header, { paddingTop: 6, overflow: 'hidden' }]}
         >
-          <View style={styles.headerRowTop}>
+          <View style={styles.headerBar}>
             {/* Back */}
             <TouchableOpacity
-              style={styles.backBtn}
               onPress={() => router.replace('/menu')}
-              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-              activeOpacity={0.9}
+              style={styles.backBtn}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
             >
-              <Feather name="arrow-left" size={16} color="#0B2447" />
+              <Feather name="arrow-left" size={16} color="#E0E7FF" />
             </TouchableOpacity>
 
-            {/* Centered title + date range */}
-            <View style={{ flex: 1, alignItems: 'center' }}>
+            <View style={{ flex: 1 }} />
+
+            {/* Title + Date (right aligned) */}
+            <View style={{ alignItems: 'flex-end' }}>
               <Text style={styles.headerTitle}>Purchase Oil</Text>
               <Text style={styles.headerDate}>
-                {dayjs(dateRange.startDate).format('MMM D, YYYY')} – {dayjs(dateRange.endDate).format('MMM D, YYYY')}
+                {dayjs(effectiveRange.range.startDate).format('MMM D, YYYY')} –{' '}
+                {dayjs(effectiveRange.range.endDate).format('MMM D, YYYY')}
               </Text>
             </View>
-
-            {/* Create button */}
-            <TouchableOpacity
-              style={styles.addBtn}
-              onPress={() => router.push('/Shidaal/oilmodal')}
-              activeOpacity={0.9}
-            >
-              <Feather name="plus" size={12} color="#0B2447" />
-              <Text style={styles.addBtnText}>Dalab Cusub</Text>
-            </TouchableOpacity>
           </View>
         </LinearGradient>
       </SafeAreaView>
 
-      {/* KPI cards */}
-      <View style={styles.cardsRow}>
-        <KpiCard
-          title="In-Stock (L)"
-          value={formatNumber(overall?.total_instock_l ?? 0)}
-          icon="database"
-          iconBg="#DBEAFE"
-          iconColor="#1D4ED8"
-        />
-        <KpiCard
-          title="Sold (L)"
-          value={formatNumber(overall?.total_sold_l ?? 0)}
-          icon="trending-up"
-          iconBg="#DCFCE7"
-          iconColor="#047857"
-        />
-        <KpiCard
-          title="Depot Lots"
-          value={formatNumber(summary?.depot_lots ?? 0)}
-          icon="home"
-          iconBg="#EDE9FE"
-          iconColor="#6D28D9"
-        />
+      {/* KPI row: Big overview card with small stat cards (Remaining / Sold / Moved) */}
+      <View style={styles.cardsRowSingle}>
+        <View style={styles.cardKPIFlex}>
+          <View style={styles.cardHeaderRow}>
+            <Text style={styles.cardTitleMain}>Oil Overview</Text>
+
+            <TouchableOpacity onPress={() => setShowFilters(true)} style={styles.dateChipBtnSmall}>
+              <Feather name="calendar" size={11} color="#0B2447" />
+              <Text style={styles.dateChipTxtSmall}>Display</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Inner stat cards (smaller + dark blue) */}
+          <View style={styles.kpiInnerRow}>
+            {/* Remaining */}
+            <View style={styles.kpiStatCard}>
+              <View style={styles.kpiStatHeader}>
+                <Text style={styles.kpiStatLabel}>Remaining</Text>
+                <Feather name="droplet" size={12} color="#E5E7EB" />
+              </View>
+              <Text style={styles.kpiStatValue}>
+                {formatNumber(remainingDisplay, kpiDecimals)} {unitLabel}
+              </Text>
+              <Text style={styles.kpiStatSub}>{formatNumber(remainingLiters, 0)} L</Text>
+            </View>
+
+            {/* Total Sold */}
+            <View style={styles.kpiStatCard}>
+              <View style={styles.kpiStatHeader}>
+                <Text style={styles.kpiStatLabel}>Total Sold</Text>
+                <Feather name="trending-up" size={12} color="#E5E7EB" />
+              </View>
+              <Text style={styles.kpiStatValue}>
+                {formatNumber(soldDisplay, kpiDecimals)} {unitLabel}
+              </Text>
+              <Text style={styles.kpiStatSub}>{formatNumber(soldLiters, 0)} L</Text>
+            </View>
+
+            {/* Total Moved */}
+            <View style={styles.kpiStatCard}>
+              <View style={styles.kpiStatHeader}>
+                <Text style={styles.kpiStatLabel}>Total Moved</Text>
+                <Feather name="truck" size={12} color="#E5E7EB" />
+              </View>
+              <Text style={styles.kpiStatValue}>
+                {formatNumber(movedDisplay, kpiDecimals)} {unitLabel}
+              </Text>
+              <Text style={styles.kpiStatSub}>{formatNumber(movedLiters, 0)} L</Text>
+            </View>
+          </View>
+        </View>
       </View>
 
       {/* Search */}
@@ -529,10 +709,6 @@ export default function VendorBillsScreen() {
               <Feather name="x-circle" size={12} color={COLOR_MUTED} />
             </TouchableOpacity>
           )}
-          <TouchableOpacity onPress={() => setShowFilters(true)} style={styles.headerFilterBtnSmall}>
-            <Feather name="filter" size={12} color="#0B2447" />
-            <Text style={styles.headerFilterTxtSmall}>Filter</Text>
-          </TouchableOpacity>
         </View>
       </View>
 
@@ -544,7 +720,9 @@ export default function VendorBillsScreen() {
         showsVerticalScrollIndicator
       >
         {loading ? (
-          <View style={styles.loading}><ActivityIndicator /></View>
+          <View style={styles.loading}>
+            <ActivityIndicator />
+          </View>
         ) : filteredItems.length === 0 ? (
           <View style={styles.empty}>
             <Feather name="inbox" size={18} color={COLOR_MUTED} />
@@ -562,19 +740,22 @@ export default function VendorBillsScreen() {
             if (children.length > 0) {
               right = children.slice(0, 2);
             } else if (it.oil_id) {
-              right = [{
-                oil_id: it.oil_id,
-                oil_type: it.oil_type,
-                liters: it.liters,
-                sold_l: 0,
-                in_stock_l: 0,
-                oil_total_landed_cost: it.oil_total_landed_cost,
-                total_extra_cost: it.total_extra_cost,
-                over_all_cost: (it.over_all_cost ?? it.oil_total_landed_cost + it.total_extra_cost),
-                total_paid: it.total_paid,
-                amount_due: it.amount_due,
-                extra_costs: [],
-              }];
+              right = [
+                {
+                  oil_id: it.oil_id,
+                  oil_type: it.oil_type,
+                  liters: it.liters,
+                  sold_l: 0,
+                  in_stock_l: 0,
+                  oil_total_landed_cost: it.oil_total_landed_cost,
+                  total_extra_cost: it.total_extra_cost,
+                  over_all_cost:
+                    it.over_all_cost ?? it.oil_total_landed_cost + it.total_extra_cost,
+                  total_paid: it.total_paid,
+                  amount_due: it.amount_due,
+                  extra_costs: [],
+                },
+              ];
             }
 
             return (
@@ -586,9 +767,10 @@ export default function VendorBillsScreen() {
               >
                 {/* LEFT */}
                 <View style={{ flex: 1, minWidth: 0 }}>
-                  <Text style={styles.supplier} numberOfLines={1}>{title}</Text>
+                  <Text style={styles.supplier} numberOfLines={1}>
+                    {title}
+                  </Text>
                   <View style={styles.childRow}>
-                    {/* Date directly under title */}
                     <View style={styles.childPill}>
                       <Feather name="calendar" size={10} color={COLOR_TEXT} />
                       <Text style={styles.childText}>{formatDateLocal(it.date)}</Text>
@@ -602,8 +784,8 @@ export default function VendorBillsScreen() {
                     <ChildOilBadge
                       key={`${c.oil_id}_${ix}`}
                       label={(c.oil_type || '—').toUpperCase()}
-                      sold={Number(c.sold_l || 0)}
                       instock={Number(c.in_stock_l || 0)}
+                      displayUnit={displayUnit}
                     />
                   ))}
                 </View>
@@ -613,28 +795,33 @@ export default function VendorBillsScreen() {
         )}
       </ScrollView>
 
+      {/* Floating "+ Dalab Cusub" button */}
+      <TouchableOpacity
+        activeOpacity={0.92}
+        style={[styles.fab, { bottom: (insets.bottom || 0) + 85 }]}
+        onPress={() => router.push('/Shidaal/oilmodal')}
+      >
+        <Feather name="plus" size={16} color="#FFFFFF" />
+        <Text style={styles.fabTxt}>Dalab Cusub</Text>
+      </TouchableOpacity>
+
       {/* DETAILS POPUP */}
       <Modal visible={detailsOpen} onRequestClose={closeDetails} transparent animationType="fade">
         <TouchableWithoutFeedback onPress={closeDetails}>
           <View style={styles.modalBackdrop}>
             <TouchableWithoutFeedback onPress={() => {}}>
               <View style={[styles.modalCard, { maxHeight: '85%' }]}>
-                {/* Header: Title (plate/supplier) and DATE below it, plus action buttons on the right */}
+                {/* Header: title on left, Actions on right */}
                 <View style={[styles.modalHeader, { marginBottom: 8 }]}>
-                  <View style={{ flex: 1 }}>
+                  <View style={{ flex: 1, paddingRight: 8 }}>
                     <Text style={styles.modalTitle}>
-                      {(selected?.truck_plate && selected.truck_plate.trim()) || selected?.supplier_name || 'Details'}
+                      {(selected?.truck_plate && selected.truck_plate.trim()) ||
+                        selected?.supplier_name ||
+                        'Details'}
                     </Text>
-                    <View style={{ marginTop: 4, flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                      <Feather name="calendar" size={12} color={COLOR_MUTED} />
-                      <Text style={{ color: COLOR_MUTED, fontSize: 11, fontWeight: '700' }}>
-                        {formatDateLocal(selected?.date)}
-                      </Text>
-                    </View>
                   </View>
 
-                  <View style={{ flexDirection: 'row', gap: 6 }}>
-                    {/* Actions */}
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
                     {(() => {
                       const hasOil = !!(selected?.oil_id || selected?.child_oils?.[0]?.oil_id);
                       return (
@@ -648,48 +835,93 @@ export default function VendorBillsScreen() {
                         </TouchableOpacity>
                       );
                     })()}
+                  </View>
+                </View>
 
-                    {/* Extras popup (single list in its own tab) */}
-                    <TouchableOpacity
+                {/* Date line under header */}
+                <View
+                  style={{
+                    marginTop: -2,
+                    marginBottom: 8,
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    gap: 6,
+                  }}
+                >
+                  <Feather name="calendar" size={12} color={COLOR_MUTED} />
+                  <Text style={{ color: COLOR_MUTED, fontSize: 11, fontWeight: '700' }}>
+                    {formatDateLocal(selected?.date)}
+                  </Text>
+                </View>
+
+                {/* List header inside popup — Truck plate | Qarashaad */}
+                <View style={styles.listHeaderRow}>
+                  <View
+                    style={{
+                      flexDirection: 'row',
+                      alignItems: 'center',
+                      gap: 8,
+                      flexShrink: 1,
+                    }}
+                  >
+                    {!!(selected?.truck_plate && selected.truck_plate.trim()) && (
+                      <View style={styles.inlinePill}>
+                        <Feather name="truck" size={11} color={COLOR_TEXT} />
+                        <Text style={styles.inlinePillTxt} numberOfLines={1}>
+                          {selected.truck_plate.trim()}
+                        </Text>
+                      </View>
+                    )}
+                  </View>
+
+                  <TouchableOpacity
                     style={styles.headerTabBtn}
                     onPress={() => {
                       const lotId =
-                        (selected?.child_oils?.length ?? 0) > 0 && selected?.lot_id ? selected.lot_id : null;
+                        (selected?.child_oils?.length ?? 0) > 0 && selected?.lot_id
+                          ? selected.lot_id
+                          : null;
                       const oilId = selected?.oil_id ?? selected?.child_oils?.[0]?.oil_id ?? null;
+                      const plate = (selected?.truck_plate || '').trim();
 
                       if (lotId) {
-                        // use replace(...) if you prefer replacing the current screen in history
-                        // router.replace({ pathname: '/TrackVendorBills/Shidaal/extracostspage', params: { lot_id: String(lotId) } });
                         router.push({
                           pathname: '/Shidaal/extracostspage',
-                          params: { lot_id: String(lotId) },
+                          params: { lot_id: String(lotId), plate },
                         });
                       } else if (oilId) {
-                        // router.replace({ pathname: '/TrackVendorBills/Shidaal/extracostspage', params: { oil_id: String(oilId) } });
                         router.push({
                           pathname: '/Shidaal/extracostspage',
-                          params: { oil_id: String(oilId) },
+                          params: { oil_id: String(oilId), plate },
                         });
                       }
                     }}
+                    activeOpacity={0.9}
                   >
                     <Feather name="layers" size={12} color="#0B2447" />
-                    <Text style={styles.headerTabTxt}>Extra Costs</Text>
+                    <Text style={styles.headerTabTxt}>Qarashaad Dheerad Ah</Text>
                   </TouchableOpacity>
-
-                  </View>
                 </View>
+                <View style={styles.listHeaderDivider} />
 
                 <ScrollView
                   contentContainerStyle={{ paddingBottom: 10 }}
                   showsVerticalScrollIndicator
                   keyboardShouldPersistTaps="handled"
                 >
-                  {/* MAIN first: Child oil sections (only Oil cost / Stock / Sold) */}
-                  {(selected?.child_oils && selected.child_oils.length > 0)
-                    ? selected.child_oils.map((c, ix) => renderChildSection(c, ix))
+                  {/* MAIN first: Child oil sections */}
+                  {selected?.child_oils && selected.child_oils.length > 0
+                    ? selected.child_oils.map((c, ix) =>
+                        renderChildSection(
+                          c,
+                          ix,
+                          selected?.truck_plate || undefined,
+                          selected?.date || undefined
+                        )
+                      )
                     : selected?.oil_id
-                      ? renderChildSection({
+                    ? renderChildSection(
+                        {
                           oil_id: selected.oil_id!,
                           oil_type: selected.oil_type,
                           liters: selected.liters,
@@ -697,26 +929,55 @@ export default function VendorBillsScreen() {
                           in_stock_l: 0,
                           oil_total_landed_cost: selected.oil_total_landed_cost,
                           total_extra_cost: selected.total_extra_cost,
-                          over_all_cost: (selected.over_all_cost ?? selected.oil_total_landed_cost + selected.total_extra_cost),
+                          over_all_cost:
+                            selected.over_all_cost ??
+                            selected.oil_total_landed_cost + selected.total_extra_cost,
                           total_paid: selected.total_paid,
                           amount_due: selected.amount_due,
                           extra_costs: [],
-                        }, 0)
-                      : null
-                  }
+                        },
+                        0,
+                        selected?.truck_plate || undefined,
+                        selected?.date || undefined
+                      )
+                    : null}
 
-                  {/* Total Extra Costs (single line, not itemized) */}
+                  {/* Total Extra Costs */}
                   <Divider />
                   <View style={styles.inlineGrid}>
-                    <Field label="Total Extra Costs" value={formatCurrency(totalExtraCosts)} />
+                    <Field
+                      label="Total Extra Costs"
+                      value={formatCurrency(
+                        (() => {
+                          const children = selected?.child_oils || [];
+                          if (typeof selected?.total_extra_cost === 'number')
+                            return Number(selected?.total_extra_cost || 0);
+                          if (children.length > 0)
+                            return children.reduce(
+                              (acc, c) => acc + Number(c.total_extra_cost || 0),
+                              0
+                            );
+                          return 0;
+                        })()
+                      )}
+                    />
                   </View>
 
-                  {/* Bottom summary: Overall / Paid / Due */}
+                  {/* Overall / Paid / Due */}
                   <Divider />
                   <View style={[styles.inlineGrid, { marginBottom: 4 }]}>
                     <Field
                       label="Overall cost"
-                      value={formatCurrency(selectedOverallCost)}
+                      value={formatCurrency(
+                        (() => {
+                          const base = Number(selected?.over_all_cost ?? 0);
+                          if (base) return base;
+                          return Number(
+                            (selected?.oil_total_landed_cost || 0) +
+                              (selected?.total_extra_cost || 0)
+                          );
+                        })()
+                      )}
                       valueStyle={{ fontWeight: '900' }}
                     />
                     <Field
@@ -757,8 +1018,6 @@ export default function VendorBillsScreen() {
         </TouchableWithoutFeedback>
       </Modal>
 
-     
-
       {/* OilActionsModal */}
       <OilActionsModal
         visible={actionsOpen}
@@ -779,7 +1038,7 @@ export default function VendorBillsScreen() {
         onCreated={onExtraCreated}
       />
 
-      {/* Vendor Payment Sheet (refresh on close and on created) */}
+      {/* Vendor Payment Sheet */}
       <VendorPaymentCreateSheet
         visible={payOpen}
         onClose={onPaymentClosed}
@@ -794,15 +1053,15 @@ export default function VendorBillsScreen() {
         companyContact={undefined}
       />
 
-      {/* Filters Modal */}
-      <Modal visible={showFilters} transparent animationType="fade" onRequestClose={() => setShowFilters(false)}>
-        <TouchableWithoutFeedback onPress={() => setShowFilters(false)}>
+      {/* Filters Modal (now "Display") */}
+      <Modal visible={showFilters} transparent animationType="fade" onRequestClose={closeFilters}>
+        <TouchableWithoutFeedback onPress={closeFilters}>
           <View style={styles.modalBackdrop}>
             <TouchableWithoutFeedback onPress={() => {}}>
               <View style={[styles.modalCard, { width: '94%', maxHeight: '80%' }]}>
                 <View style={styles.modalHeader}>
-                  <Text style={styles.modalTitle}>Filters</Text>
-                  <TouchableOpacity onPress={() => setShowFilters(false)}>
+                  <Text style={styles.modalTitle}>Display</Text>
+                  <TouchableOpacity onPress={closeFilters}>
                     <AntDesign name="close" size={16} color="#1F2937" />
                   </TouchableOpacity>
                 </View>
@@ -818,22 +1077,31 @@ export default function VendorBillsScreen() {
                       <QuickRangeChip
                         label={`Today (${dayjs().format('ddd')})`}
                         onPress={() => {
-                          setDateRange({ startDate: dayjs().startOf('day').toDate(), endDate: dayjs().endOf('day').toDate() });
-                          setShowFilters(false);
+                          setDateRange({
+                            startDate: dayjs().startOf('day').toDate(),
+                            endDate: dayjs().endOf('day').toDate(),
+                          });
+                          closeFilters();
                         }}
                       />
                       <QuickRangeChip
                         label={`This Month (${dayjs().format('MMM')})`}
                         onPress={() => {
-                          setDateRange({ startDate: dayjs().startOf('month').toDate(), endDate: dayjs().endOf('month').toDate() });
-                          setShowFilters(false);
+                          setDateRange({
+                            startDate: dayjs().startOf('month').toDate(),
+                            endDate: dayjs().endOf('month').toDate(),
+                          });
+                          closeFilters();
                         }}
                       />
                       <QuickRangeChip
                         label={`This Year (${dayjs().format('YYYY')})`}
                         onPress={() => {
-                          setDateRange({ startDate: dayjs().startOf('year').toDate(), endDate: dayjs().endOf('day').toDate() });
-                          setShowFilters(false);
+                          setDateRange({
+                            startDate: dayjs().startOf('year').toDate(),
+                            endDate: dayjs().endOf('day').toDate(),
+                          });
+                          closeFilters();
                         }}
                       />
                     </View>
@@ -842,13 +1110,23 @@ export default function VendorBillsScreen() {
                   <View style={styles.filterSection}>
                     <Text style={styles.filterLabel}>Date Range</Text>
                     <View style={styles.dateRangeContainer}>
-                      <TouchableOpacity style={styles.dateBtn} onPress={() => setShowDatePicker('start')}>
-                        <Text style={styles.dateBtnText}>{dayjs(dateRange.startDate).format('MMM D, YYYY')}</Text>
+                      <TouchableOpacity
+                        style={styles.dateBtn}
+                        onPress={() => setShowDatePicker('start')}
+                      >
+                        <Text style={styles.dateBtnText}>
+                          {dayjs(dateRange.startDate).format('MMM D, YYYY')}
+                        </Text>
                         <Feather name="calendar" size={12} color="#0B2447" />
                       </TouchableOpacity>
                       <Text style={styles.rangeSep}>to</Text>
-                      <TouchableOpacity style={styles.dateBtn} onPress={() => setShowDatePicker('end')}>
-                        <Text style={styles.dateBtnText}>{dayjs(dateRange.endDate).format('MMM D, YYYY')}</Text>
+                      <TouchableOpacity
+                        style={styles.dateBtn}
+                        onPress={() => setShowDatePicker('end')}
+                      >
+                        <Text style={styles.dateBtnText}>
+                          {dayjs(dateRange.endDate).format('MMM D, YYYY')}
+                        </Text>
                         <Feather name="calendar" size={12} color="#0B2447" />
                       </TouchableOpacity>
                     </View>
@@ -859,10 +1137,11 @@ export default function VendorBillsScreen() {
                         mode="date"
                         display={Platform.OS === 'ios' ? 'spinner' : 'default'}
                         onChange={(_, sel) => {
+                          const picker = showDatePicker;
                           setShowDatePicker(null);
                           if (!sel) return;
                           setDateRange((prev) =>
-                            showDatePicker === 'start'
+                            picker === 'start'
                               ? { ...prev, startDate: dayjs(sel).startOf('day').toDate() }
                               : { ...prev, endDate: dayjs(sel).endOf('day').toDate() }
                           );
@@ -870,23 +1149,154 @@ export default function VendorBillsScreen() {
                       />
                     )}
                   </View>
+
+                  {/* Truck + Display unit (button opens real popup) */}
+                  <View style={styles.filterSection}>
+                    <Text style={styles.filterLabel}>Truck & Display In</Text>
+                    <View style={{ flexDirection: 'row', gap: 8 }}>
+                      {/* Truck picker */}
+                      <View style={styles.pickerContainer}>
+                        <Text style={styles.pickerLabel}>Truck</Text>
+                        <TouchableOpacity
+                          style={styles.pickerBtn}
+                          activeOpacity={0.9}
+                          onPress={() => setTruckPickerOpen(true)}
+                        >
+                          <Text style={styles.pickerValue} numberOfLines={1}>
+                            {selectedTruck === ALL_TRUCKS ? 'All trucks' : selectedTruck}
+                          </Text>
+                          <Feather name="chevron-down" size={14} color="#0B2447" />
+                        </TouchableOpacity>
+                      </View>
+
+                      {/* Unit picker */}
+                      <View style={styles.pickerContainer}>
+                        <Text style={styles.pickerLabel}>Display in</Text>
+                        <TouchableOpacity
+                          style={styles.pickerBtn}
+                          activeOpacity={0.9}
+                          onPress={() => setUnitPickerOpen(true)}
+                        >
+                          <Text style={styles.pickerValue}>
+                            {displayUnit === 'liters'
+                              ? 'Liters'
+                              : displayUnit === 'fuusto'
+                              ? 'Fuusto'
+                              : 'Caag'}
+                          </Text>
+                          <Feather name="chevron-down" size={14} color="#0B2447" />
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                  </View>
                 </ScrollView>
 
                 <View style={styles.filterActions}>
                   <TouchableOpacity
                     style={styles.resetBtn}
-                    onPress={() =>
+                    onPress={() => {
                       setDateRange({
                         startDate: dayjs().startOf('month').toDate(),
                         endDate: dayjs().endOf('day').toDate(),
-                      })
-                    }
+                      });
+                      setSelectedTruck(ALL_TRUCKS);
+                      setDisplayUnit('liters');
+                    }}
                   >
                     <Text style={styles.resetTxt}>Reset</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity style={styles.applyBtn} onPress={() => setShowFilters(false)}>
+                  <TouchableOpacity
+                    style={styles.applyBtn}
+                    onPress={closeFilters}
+                  >
                     <Text style={styles.applyTxt}>Apply</Text>
                   </TouchableOpacity>
+                </View>
+              </View>
+            </TouchableWithoutFeedback>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
+
+      {/* REAL POPUP: Truck picker */}
+      <Modal
+        visible={truckPickerOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setTruckPickerOpen(false)}
+      >
+        <TouchableWithoutFeedback onPress={() => setTruckPickerOpen(false)}>
+          <View style={styles.modalBackdrop}>
+            <TouchableWithoutFeedback onPress={() => {}}>
+              <View style={styles.pickerCard}>
+                <View style={styles.pickerModalHeader}>
+                  <Text style={styles.pickerModalTitle}>Select Truck</Text>
+                  <TouchableOpacity onPress={() => setTruckPickerOpen(false)}>
+                    <AntDesign name="close" size={16} color="#1F2937" />
+                  </TouchableOpacity>
+                </View>
+
+                <ScrollView style={{ maxHeight: 260 }}>
+                  {truckOptions.map((opt) => (
+                    <TouchableOpacity
+                      key={opt}
+                      style={styles.pickerOption}
+                      activeOpacity={0.9}
+                      onPress={() => {
+                        setSelectedTruck(opt);
+                        setTruckPickerOpen(false);
+                      }}
+                    >
+                      <Text style={styles.pickerOptionText}>
+                        {opt === ALL_TRUCKS ? 'All trucks' : opt}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
+              </View>
+            </TouchableWithoutFeedback>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
+
+      {/* REAL POPUP: Display in picker */}
+      <Modal
+        visible={unitPickerOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setUnitPickerOpen(false)}
+      >
+        <TouchableWithoutFeedback onPress={() => setUnitPickerOpen(false)}>
+          <View style={styles.modalBackdrop}>
+            <TouchableWithoutFeedback onPress={() => {}}>
+              <View style={styles.pickerCard}>
+                <View style={styles.pickerModalHeader}>
+                  <Text style={styles.pickerModalTitle}>Display In</Text>
+                  <TouchableOpacity onPress={() => setUnitPickerOpen(false)}>
+                    <AntDesign name="close" size={16} color="#1F2937" />
+                  </TouchableOpacity>
+                </View>
+
+                <View>
+                  {(['liters', 'fuusto', 'caag'] as const).map((u) => (
+                    <TouchableOpacity
+                      key={u}
+                      style={styles.pickerOption}
+                      activeOpacity={0.9}
+                      onPress={() => {
+                        setDisplayUnit(u);
+                        setUnitPickerOpen(false);
+                      }}
+                    >
+                      <Text style={styles.pickerOptionText}>
+                        {u === 'liters'
+                          ? 'Liters'
+                          : u === 'fuusto'
+                          ? 'Fuusto (240L)'
+                          : 'Caag (20L)'}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
                 </View>
               </View>
             </TouchableWithoutFeedback>
@@ -910,7 +1320,10 @@ function Field({
   return (
     <View style={{ flexBasis: '48%', marginBottom: 6 }}>
       <Text style={{ color: COLOR_MUTED, fontSize: 10, marginBottom: 2 }}>{label}</Text>
-      <Text style={[{ color: COLOR_TEXT, fontSize: 12, fontWeight: '800' }, valueStyle]} numberOfLines={2}>
+      <Text
+        style={[{ color: COLOR_TEXT, fontSize: 12, fontWeight: '800' }, valueStyle]}
+        numberOfLines={2}
+      >
         {value}
       </Text>
     </View>
@@ -918,29 +1331,6 @@ function Field({
 }
 function Divider() {
   return <View style={{ height: 1, backgroundColor: COLOR_DIV, marginVertical: 10 }} />;
-}
-function KpiCard({
-  title,
-  value,
-  icon,
-  iconBg = '#F3F4F6',
-  iconColor = '#111827',
-}: {
-  title: string;
-  value: string;
-  icon: any;
-  iconBg?: string;
-  iconColor?: string;
-}) {
-  return (
-    <View style={styles.cardKPI}>
-      <View style={[styles.cardIconWrap, { backgroundColor: iconBg }]}>
-        <Feather name={icon} size={14} color={iconColor} />
-      </View>
-      <Text style={styles.cardTitle}>{title}</Text>
-      <Text style={styles.cardValue}>{value}</Text>
-    </View>
-  );
 }
 function QuickRangeChip({ label, onPress }: { label: string; onPress: () => void }) {
   return (
@@ -957,95 +1347,115 @@ const styles = StyleSheet.create({
 
   /* Header */
   header: {
-    paddingBottom: 4,
+    paddingBottom: 14,
     paddingHorizontal: 16,
-    borderBottomLeftRadius: 18,
-    borderBottomRightRadius: 18,
+    borderBottomLeftRadius: 22,
+    borderBottomRightRadius: 22,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.08,
-    shadowRadius: 10,
-    elevation: 3,
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.1,
+    shadowRadius: 12,
+    elevation: 4,
+    position: 'relative',
   },
-  headerRowTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-
+  headerBar: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
   backBtn: {
     width: 28,
     height: 28,
     borderRadius: 8,
-    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.25)',
     alignItems: 'center',
     justifyContent: 'center',
-    borderWidth: 1,
-    borderColor: '#D8E0F5',
   },
-  addBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    backgroundColor: '#FFFFFF',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#D8E0F5',
-  },
-  addBtnText: { color: '#0B2447', fontWeight: '800', fontSize: 11, letterSpacing: 0.2 },
-  headerTitle: { fontSize: 15, fontWeight: '800', color: '#E0E7FF', textAlign: 'center' },
-  headerDate: { color: '#CBD5E1', fontSize: 10, marginTop: 2, textAlign: 'center' },
+  headerTitle: { fontSize: 14, fontWeight: '800', color: '#E0E7FF' },
+  headerDate: { fontSize: 10, color: '#CBD5E1', marginTop: 2 },
 
-  /* KPI cards row */
-  cardsRow: { flexDirection: 'row', gap: 10, marginTop: 10, paddingHorizontal: 16 },
-  cardKPI: {
-    width: CARD_WIDTH,
+  /* KPI row (single big card) */
+  cardsRowSingle: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 6,
+    paddingHorizontal: 16,
+    alignItems: 'stretch',
+    zIndex: 40,
+  },
+  cardKPIFlex: {
+    flex: 1,
     backgroundColor: '#fff',
     borderRadius: 12,
     padding: 10,
     borderWidth: 1,
     borderColor: '#E8EDF4',
     shadowColor: '#000',
-    shadowOpacity: 0.04,
+    shadowOpacity: 0.05,
     shadowRadius: 4,
     shadowOffset: { width: 0, height: 2 },
     elevation: 1,
+    position: 'relative',
   },
-  cardIconWrap: {
-    width: 22,
-    height: 22,
-    borderRadius: 7,
+  cardHeaderRow: {
+    flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
+    justifyContent: 'space-between',
     marginBottom: 4,
   },
-  cardTitle: { color: '#6B7280', fontSize: 10, marginBottom: 0 },
-  cardValue: { fontSize: 14, fontWeight: '700', color: '#111827' },
+  cardTitleMain: { color: '#0B2447', fontSize: 12, fontWeight: '900' },
+  dateChipBtnSmall: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#D8E0F5',
+    backgroundColor: '#FFFFFF',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  dateChipTxtSmall: { color: '#0B2447', fontSize: 9, fontWeight: '900' },
+
+  kpiInnerRow: {
+    flexDirection: 'row',
+    marginTop: 2,
+    gap: 6,
+  },
+  kpiStatCard: {
+    flex: 1,
+    borderRadius: 9,
+    backgroundColor: '#0B2447',
+    borderWidth: 1,
+    borderColor: '#0B2447',
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+  },
+  kpiStatHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 2,
+  },
+  kpiStatLabel: { fontSize: 9, fontWeight: '800', color: '#E5E7EB' },
+  kpiStatValue: { fontSize: 11, fontWeight: '900', color: '#FFFFFF' },
+  kpiStatSub: { fontSize: 9, color: '#CBD5F5', marginTop: 1 },
 
   /* Search row */
   searchRow: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 8 },
   searchBox: {
-    paddingHorizontal: 8,
-    paddingVertical: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
     borderRadius: 10,
     borderWidth: 1,
-    borderColor: COLOR_DIV,
+    borderColor: '#94A3B8',
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
     backgroundColor: '#FFFFFF',
   },
-  searchInput: { flex: 1, fontSize: 11, paddingVertical: 2, color: COLOR_TEXT },
-  headerFilterBtnSmall: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    backgroundColor: '#EEF2FF',
-    paddingVertical: 5,
-    paddingHorizontal: 8,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#DDE3F0',
-  },
-  headerFilterTxtSmall: { color: '#0B2447', fontSize: 10, fontWeight: '800' },
+  searchInput: { flex: 1, fontSize: 12, paddingVertical: 4, color: COLOR_TEXT },
 
   /* List */
   scrollContent: { padding: 12, paddingBottom: 24 },
@@ -1059,9 +1469,9 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     borderWidth: 1,
     borderColor: '#E9EEF6',
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    marginBottom: 10,
+    paddingVertical: 9,
+    paddingHorizontal: 10,
+    marginBottom: 8,
     flexDirection: 'row',
     gap: 10,
     shadowColor: COLOR_SHADOW,
@@ -1084,22 +1494,29 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 4,
   },
-  childText: { color: COLOR_TEXT, fontSize: 10, fontWeight: '700' },
+  childText: { color: COLOR_TEXT, fontSize: 9, fontWeight: '700' },
 
-  rightCol: { alignItems: 'flex-end', justifyContent: 'center', minWidth: 150, gap: 6 },
+  rightCol: { alignItems: 'flex-end', justifyContent: 'center', minWidth: 150, gap: 4 },
   childBadge: {
     backgroundColor: '#FFFFFF',
     borderWidth: 1,
     borderColor: '#E7ECF3',
     borderRadius: 10,
-    paddingVertical: 6,
-    paddingHorizontal: 8,
-    gap: 6,
-    minWidth: 145,
+    paddingVertical: 5,
+    paddingHorizontal: 7,
+    gap: 4,
+    minWidth: 140,
   },
-  badgeType: { fontSize: 11, fontWeight: '900', color: COLOR_TEXT },
-  badgeStat: { fontSize: 10, color: COLOR_MUTED, fontWeight: '700' },
-  badgeStatStrong: { color: COLOR_TEXT },
+  badgeType: { fontSize: 9, fontWeight: '900', color: COLOR_TEXT },
+
+  // Green stock pill
+  stockPill: {
+    backgroundColor: '#10B981',
+    borderRadius: 999,
+    paddingVertical: 3,
+    paddingHorizontal: 7,
+  },
+  stockPillTxt: { color: 'white', fontWeight: '900', fontSize: 8 },
 
   /** Modal (centered) */
   modalBackdrop: {
@@ -1137,6 +1554,20 @@ const styles = StyleSheet.create({
   },
   headerTabTxt: { color: '#0B2447', fontSize: 10, fontWeight: '900' },
 
+  // list header (inside popup)
+  listHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 6,
+  },
+  listHeaderDivider: {
+    height: 1,
+    backgroundColor: COLOR_DIV,
+    marginTop: 8,
+    marginBottom: 10,
+  },
+
   inlineGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -1152,8 +1583,27 @@ const styles = StyleSheet.create({
     backgroundColor: '#FAFCFF',
     marginBottom: 10,
   },
-  childHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 },
+  childHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
   childHeaderTitle: { fontSize: 12, fontWeight: '900', color: COLOR_TEXT },
+
+  // inline pills in child header
+  inlinePill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    borderRadius: 999,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#E7ECF3',
+  },
+  inlinePillTxt: { fontSize: 9, fontWeight: '800', color: COLOR_TEXT },
 
   modalFooter: { marginTop: 10, flexDirection: 'row', alignItems: 'center' },
 
@@ -1244,6 +1694,95 @@ const styles = StyleSheet.create({
     backgroundColor: 'white',
   },
   resetTxt: { fontSize: 11, fontWeight: '800', color: '#1F2937' },
-  applyBtn: { flex: 1, padding: 9, borderRadius: 8, backgroundColor: '#0B2447', alignItems: 'center' },
+  applyBtn: {
+    flex: 1,
+    padding: 9,
+    borderRadius: 8,
+    backgroundColor: '#0B2447',
+    alignItems: 'center',
+  },
   applyTxt: { fontSize: 11, fontWeight: '800', color: 'white' },
+
+  /* Picker popups */
+  pickerContainer: {
+    flex: 1,
+  },
+  pickerLabel: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: '#64748B',
+    marginBottom: 3,
+  },
+  pickerBtn: {
+    height: 34,
+    borderRadius: 9,
+    borderWidth: 1,
+    borderColor: '#D4DFEE',
+    backgroundColor: '#F9FAFB',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 10,
+  },
+  pickerValue: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: '#0B2447',
+    flex: 1,
+    marginRight: 6,
+  },
+  pickerCard: {
+    width: '86%',
+    maxHeight: '70%',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+  },
+  pickerModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  pickerModalTitle: {
+    fontSize: 13,
+    fontWeight: '900',
+    color: '#111827',
+  },
+  pickerOption: {
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
+  },
+  pickerOptionText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#0B2447',
+  },
+
+  /* FAB */
+  fab: {
+    position: 'absolute',
+    right: 16,
+    borderRadius: 999,
+    backgroundColor: '#0B2447',
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOpacity: 0.18,
+        shadowRadius: 12,
+        shadowOffset: { width: 0, height: 6 },
+      },
+      android: { elevation: 6 },
+    }),
+  },
+  fabTxt: { color: '#FFFFFF', fontWeight: '900', fontSize: 12 },
 });

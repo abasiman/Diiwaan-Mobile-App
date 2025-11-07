@@ -3,14 +3,23 @@ import * as NavigationBar from 'expo-navigation-bar';
 import { Redirect, Slot, usePathname } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import * as Updates from 'expo-updates';
-import React, { useCallback, useEffect, useLayoutEffect, useRef } from 'react';
-import { Alert, AppState, Platform, Text, View } from 'react-native';
+import React, { useCallback, useEffect, useLayoutEffect } from 'react';
+import { AppState, Platform, Text, View } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { AuthProvider, useAuth } from '../src/context/AuthContext';
+import { initCustomerInvoiceDb } from './db/customerinvoicedb';
+import { initCustomerLedgerDb } from './db/customerledgerdb';
+import { initDb } from './db/db';
 
 const BRAND_BLUE = '#0B2447';
 
 export default function RootLayout() {
+
+   React.useEffect(() => {
+    initDb();
+    initCustomerInvoiceDb();
+     initCustomerLedgerDb();
+  }, []);
   return (
     <SafeAreaProvider>
       <StatusBar backgroundColor={BRAND_BLUE} style="light" translucent={false} />
@@ -64,36 +73,34 @@ function BottomInsetTint({ color }: { color: string }) {
 }
 
 /* ----------------------------- OTA updates ----------------------------- */
+/**
+ * Silent background-ish updates:
+ *  - Checks once when the app loads (production only).
+ *  - If an update is available, downloads it quietly.
+ *  - Does NOT reload the app; update applies on next cold start.
+ *  - No AppState listener → less chance of "battery draining in background".
+ */
 function OTAUpdates() {
-  const promptedRef = useRef(false);
-  const checkingRef = useRef(false);
-
-  const checkAndPrompt = useCallback(async () => {
-    if (__DEV__ || checkingRef.current) return;
-    checkingRef.current = true;
-    try {
-      const res = await Updates.checkForUpdateAsync();
-      if (res.isAvailable) {
-        await Updates.fetchUpdateAsync();
-        if (!promptedRef.current) {
-          promptedRef.current = true;
-          Alert.alert('Update available', 'Restart to apply the latest updates?', [
-            { text: 'Later', onPress: () => { promptedRef.current = false; } },
-            { text: 'Restart', onPress: () => Updates.reloadAsync() },
-          ]);
-        }
-      }
-    } catch {
-      // ignore
-    }
-    checkingRef.current = false;
-  }, []);
-
-  useEffect(() => { checkAndPrompt(); }, [checkAndPrompt]);
   useEffect(() => {
-    const sub = AppState.addEventListener('change', s => { if (s === 'active') checkAndPrompt(); });
-    return () => sub.remove();
-  }, [checkAndPrompt]);
+    if (__DEV__) return; // skip OTA checks in dev
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const res = await Updates.checkForUpdateAsync();
+        if (!cancelled && res.isAvailable) {
+          await Updates.fetchUpdateAsync(); // no reload here; apply next launch
+        }
+      } catch {
+        // ignore network/update errors
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   return null;
 }
@@ -112,9 +119,14 @@ function AndroidNavBarStyler({ color }: { color: string }) {
     }
   }, [color]);
 
-  useLayoutEffect(() => { applyNavBar(); }, [applyNavBar]);
+  useLayoutEffect(() => {
+    applyNavBar();
+  }, [applyNavBar]);
+
   useEffect(() => {
-    const sub = AppState.addEventListener('change', state => { if (state === 'active') applyNavBar(); });
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') applyNavBar();
+    });
     return () => sub.remove();
   }, [applyNavBar]);
 
@@ -153,7 +165,7 @@ function GuardedNavigator() {
 
   if (!token && (inTabs || inContent)) return <Redirect href="/(auth)/login" />;
   if (token && pathname === '/') return <Redirect href="/(tabs)/customerslist" />;
-  if (token && inAuth)          return <Redirect href="/(tabs)/customerslist" />;
+  if (token && inAuth) return <Redirect href="/(tabs)/customerslist" />;
 
   return (
     <Boundary>

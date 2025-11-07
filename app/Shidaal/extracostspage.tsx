@@ -97,11 +97,26 @@ export default function ExtraCostsPage() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const { token } = useAuth();
-  const { oil_id, lot_id } = useLocalSearchParams<{ oil_id?: string; lot_id?: string }>();
+  const { oil_id, lot_id, plate } = useLocalSearchParams<{ oil_id?: string; lot_id?: string; plate?: string }>();
+
 
   const isLot = !!lot_id;
   const anchorId = useMemo(() => (isLot ? toNum(lot_id) : toNum(oil_id)), [isLot, lot_id, oil_id]);
-  const headerTitle = isLot ? `Lot #${anchorId ?? '—'} • Extra Costs` : `Oil #${anchorId ?? '—'} • Extra Costs`;
+  // normalize plate (handles undefined/array + decodes if encoded)
+  const plateLabel = useMemo(() => {
+    const raw = Array.isArray(plate) ? plate[0] : plate;
+    if (!raw) return null;
+    try {
+      return decodeURIComponent(raw).trim() || null;
+    } catch {
+      return raw.trim() || null;
+    }
+  }, [plate]);
+
+  const headerTitle = plateLabel
+  ? `${plateLabel} • Extra Costs`
+  : (isLot ? `Lot #${anchorId ?? '—'} • Extra Costs` : `Oil #${anchorId ?? '—'} • Extra Costs`);
+
 
 
   const [loading, setLoading] = useState(false);
@@ -383,7 +398,7 @@ const onAddExtraTop = () => {
       >
 
           <Feather name="plus" size={12} color="#0B2447" />
-          <Text style={styles.addTopBtnTxt}>Add Extra Cost</Text>
+          <Text style={styles.addTopBtnTxt}>Ku Dar Qarash</Text>
         </TouchableOpacity>
 
       </View>

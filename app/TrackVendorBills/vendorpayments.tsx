@@ -1,5 +1,4 @@
-// Vendor Payments Screen (with ViewMode + infinite scroll)
-
+// Vendor Payments Screen (scrollable + smooth + robust infinite scroll)
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 import { AntDesign, Feather } from '@expo/vector-icons';
@@ -13,13 +12,14 @@ import {
   ActivityIndicator,
   Alert,
   FlatList,
-  LayoutChangeEvent,
-  Modal, Platform, StyleSheet,
+  Modal,
+  Platform,
+  StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
   TouchableWithoutFeedback,
-  View
+  View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -122,11 +122,11 @@ export default function VendorPaymentsScreen() {
   const { token } = useAuth();
 
   const [loading, setLoading] = useState(false);
-  const [refreshing, setRefreshing] = useState(false); // pull-to-refresh
+  const [refreshing, setRefreshing] = useState(false);
   const [items, setItems] = useState<VendorPaymentWithContext[]>([]);
   const [totals, setTotals] = useState<VendorPaymentTotals | null>(null);
 
-  // Filters (search + date)
+  // Filters
   const [search, setSearch] = useState('');
   const [showFilters, setShowFilters] = useState(false);
   const [showDatePicker, setShowDatePicker] = useState<'start' | 'end' | null>(null);
@@ -135,10 +135,10 @@ export default function VendorPaymentsScreen() {
     endDate: dayjs().endOf('day').toDate(),
   });
 
-  // View mode: All / Base (oil) / Extras
+  // View mode
   const [viewMode, setViewMode] = useState<ViewMode>('all');
 
-  // Truck plate filter
+  // Plate filter
   const [platePickerOpen, setPlatePickerOpen] = useState(false);
   const [plateQuery, setPlateQuery] = useState('');
   const [selectedPlate, setSelectedPlate] = useState<string | null>(null);
@@ -150,14 +150,17 @@ export default function VendorPaymentsScreen() {
   const [loadingMore, setLoadingMore] = useState(false);
   const fetchingRef = useRef(false);
 
+  // Momentum guard so onEndReached isn’t throttled into “stuck” state
+  const onEndMomentum = useRef(false);
+
   const headers = useMemo(() => (token ? { Authorization: `Bearer ${token}` } : undefined), [token]);
 
-  // Build common params for API
+  // Build common params
   const dateParams = useMemo(() => {
     const start = dayjs(dateRange.startDate).startOf('day').format(API_DATE_FMT);
     const end = dayjs(dateRange.endDate).endOf('day').format(API_DATE_FMT);
     return {
-      order: 'created_desc' as const, // newest first
+      order: 'created_desc' as const,
       from_date: `${start}T00:00:00Z`,
       to_date: `${end}T23:59:59Z`,
     };
@@ -190,7 +193,7 @@ export default function VendorPaymentsScreen() {
         }
         setTotals(res?.data?.totals ?? null);
 
-        // If fewer than page size, no more pages
+        // More?
         setHasMore(pageItems.length === PAGE_SIZE);
         setOffset(pageOffset + pageItems.length);
       } catch (e: any) {
@@ -199,6 +202,7 @@ export default function VendorPaymentsScreen() {
         setLoading(false);
         setLoadingMore(false);
         fetchingRef.current = false;
+        onEndMomentum.current = false; // allow next end reach
       }
     },
     [headers, dateParams]
@@ -206,14 +210,13 @@ export default function VendorPaymentsScreen() {
 
   // Initial load + when dateRange changes
   useEffect(() => {
-    // reset & refetch from start
     setOffset(0);
     setHasMore(true);
     fetchPage(0, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetchPage, dateParams.from_date, dateParams.to_date]);
 
-  // Always refresh on focus (silent)
+  // Refresh on focus (silent)
   useFocusEffect(
     useCallback(() => {
       setOffset(0);
@@ -233,11 +236,17 @@ export default function VendorPaymentsScreen() {
 
   // Infinite scroll trigger
   const onEndReached = useCallback(() => {
+    if (onEndMomentum.current) return; // wait for next momentum
     if (loadingMore || loading || !hasMore) return;
     fetchPage(offset);
+    onEndMomentum.current = true;
   }, [loadingMore, loading, hasMore, fetchPage, offset]);
 
-  /* ===== Plates list (unique from items) ===== */
+  const onMomentumScrollBegin = useCallback(() => {
+    onEndMomentum.current = false;
+  }, []);
+
+  /* ===== Plates list ===== */
   const allPlates = useMemo(() => {
     const s = new Set<string>();
     for (const p of items) {
@@ -253,16 +262,11 @@ export default function VendorPaymentsScreen() {
     return allPlates.filter((x) => x.toLowerCase().includes(q));
   }, [allPlates, plateQuery]);
 
-  /* ===== Row shaping (classify base vs extra vs lot) ===== */
+  /* ===== Row shaping ===== */
   type RowKind = 'base' | 'extra' | 'lot';
   const rowsShaped = useMemo(() => {
     return items.map((p) => {
-      const kind: RowKind = p.extra_cost_id
-        ? 'extra'
-        : p.oil_id
-          ? 'base'
-          : 'lot';
-
+      const kind: RowKind = p.extra_cost_id ? 'extra' : p.oil_id ? 'base' : 'lot';
       let tx = p.transaction_type || '';
       if (!tx && kind === 'base') {
         const oilType = p.supplier_due_context?.oil_type?.toLowerCase().trim();
@@ -278,27 +282,22 @@ export default function VendorPaymentsScreen() {
         datePretty: fmtDateLocal(p.payment_date),
         transactionForUI: breakTxAtPlusForUI(tx),
         amount: Number(p.amount || 0),
-        // Server already scopes amount_due correctly (base due for base rows; extra due for extra rows; lot for lot)
         balanceSnapshot: Number(p.amount_due || 0),
         rawDate: p.payment_date,
       };
     });
   }, [items]);
 
-  /* Filter (plate + search + view mode) */
+  // Filter (plate + search + view mode)
   const filteredRows = useMemo(() => {
     const q = search.trim().toLowerCase();
 
     return rowsShaped
       .filter((r) => {
-        // View mode
         if (viewMode === 'base' && r.kind !== 'base') return false;
         if (viewMode === 'extras' && r.kind !== 'extra') return false;
-
-        // Plate filter
         if (selectedPlate && r.truckPlate.trim() !== selectedPlate) return false;
 
-        // Search
         if (!q) return true;
         const hay = `${r.truckType} ${r.truckPlate} ${r.transactionForUI}`.toLowerCase();
         return hay.includes(q);
@@ -340,7 +339,6 @@ export default function VendorPaymentsScreen() {
     else if (key === 'month') setDateRange({ startDate: monthStart.toDate(), endDate: monthEnd.toDate() });
     else setDateRange({ startDate: yearStart.toDate(), endDate: yearEnd.toDate() });
     setShowFilters(false);
-    // reset paging and refetch silently
     setOffset(0);
     setHasMore(true);
     fetchPage(0, { replace: true, silent: true });
@@ -357,15 +355,11 @@ export default function VendorPaymentsScreen() {
     setDateRange(nextRange);
   };
 
-  /* ========= Layout measurements ========= */
-  const [headerH, setHeaderH] = useState(0);
-  const onHeaderLayout = (e: LayoutChangeEvent) => setHeaderH(Math.ceil(e.nativeEvent.layout.height));
-
-  // Loading footer (infinite scroll)
+  // Loading footer
   const ListFooter = useMemo(() => {
-    if (!loadingMore) return <View style={{ height: 10 }} />;
+    if (!loadingMore) return <View style={{ height: 18 }} />;
     return (
-      <View style={{ paddingVertical: 12, alignItems: 'center', justifyContent: 'center' }}>
+      <View style={{ paddingVertical: 14, alignItems: 'center', justifyContent: 'center' }}>
         <ActivityIndicator />
         <Text style={{ color: COLOR_MUTED, fontSize: 11, marginTop: 6 }}>Loading more…</Text>
       </View>
@@ -444,7 +438,6 @@ export default function VendorPaymentsScreen() {
       {/* Totals + Plate Picker */}
       <View style={styles.kpiRow}>
         <View style={styles.kpiCard}>
-          {/* Left: totals stack */}
           <View style={{ flex: 1 }}>
             <Text style={styles.kpiTitle}>
               {viewMode === 'base' ? 'Total Paid (Oil)' : viewMode === 'extras' ? 'Total Paid (Extras)' : 'Total Paid'}
@@ -459,7 +452,6 @@ export default function VendorPaymentsScreen() {
             </View>
           </View>
 
-          {/* Right: plate dropdown trigger */}
           <View style={styles.plateCol}>
             <Text style={styles.plateLabel}>Truck Plate</Text>
             <TouchableOpacity
@@ -471,32 +463,49 @@ export default function VendorPaymentsScreen() {
               activeOpacity={0.9}
             >
               <Feather name="truck" size={14} color="#0B2447" />
-              <Text style={styles.plateBtnTxt}>
-                {selectedPlate ? selectedPlate : 'All plates'}
-              </Text>
+              <Text style={styles.plateBtnTxt}>{selectedPlate ? selectedPlate : 'All plates'}</Text>
               <Feather name="chevron-down" size={16} color="#0B2447" />
             </TouchableOpacity>
           </View>
         </View>
       </View>
 
-      {/* ===== Table Card ===== */}
+      {/* ===== Table Card (FlatList is the ONLY scroller) ===== */}
       <View style={[styles.tableCard, { marginHorizontal: 10, marginBottom: 10, flex: 1 }]}>
         <FlatList
           data={filteredRows}
           keyExtractor={(r) => r.key}
           style={{ flex: 1 }}
+          contentContainerStyle={{
+            paddingBottom: Math.max(insets.bottom, 16),
+          }}
+          showsVerticalScrollIndicator
+          keyboardShouldPersistTaps="handled"
+          overScrollMode="always"
+          nestedScrollEnabled={false}
+          removeClippedSubviews
+          initialNumToRender={20}
+          maxToRenderPerBatch={30}
+          windowSize={10}
+          updateCellsBatchingPeriod={40}
+          onEndReachedThreshold={0.25}
+          onEndReached={onEndReached}
+          onMomentumScrollBegin={onMomentumScrollBegin}
           refreshing={refreshing}
           onRefresh={onRefresh}
-          onEndReachedThreshold={0.3}
-          onEndReached={onEndReached}
+          stickyHeaderIndices={[0]}
           ListHeaderComponent={
             <View>
-              {/* Table header */}
-              <View style={[styles.tr, styles.thRow]} onLayout={onHeaderLayout}>
-                <View style={[styles.thCell, styles.colTruck]}><Text style={styles.th}>Truck</Text></View>
-                <View style={[styles.thCell, styles.colTx]}><Text style={styles.th}>Transaction</Text></View>
-                <View style={[styles.thCell, styles.colAmt]}><Text style={[styles.th, styles.num]}>Amount</Text></View>
+              <View style={[styles.tr, styles.thRow]}>
+                <View style={[styles.thCell, styles.colTruck]}>
+                  <Text style={styles.th}>Truck</Text>
+                </View>
+                <View style={[styles.thCell, styles.colTx]}>
+                  <Text style={styles.th}>Transaction</Text>
+                </View>
+                <View style={[styles.thCell, styles.colAmt]}>
+                  <Text style={[styles.th, styles.num]}>Amount</Text>
+                </View>
               </View>
             </View>
           }
@@ -505,9 +514,15 @@ export default function VendorPaymentsScreen() {
             return (
               <View style={[styles.tr, odd && styles.striped]}>
                 <View style={[styles.cell, styles.colTruck]}>
-                  <Text style={styles.td} numberOfLines={1}>{item.truckType}</Text>
-                  <Text style={styles.tdSub} numberOfLines={1}>{item.truckPlate}</Text>
-                  <Text style={styles.tdSub} numberOfLines={1}>{item.datePretty}</Text>
+                  <Text style={styles.td} numberOfLines={1}>
+                    {item.truckType}
+                  </Text>
+                  <Text style={styles.tdSub} numberOfLines={1}>
+                    {item.truckPlate}
+                  </Text>
+                  <Text style={styles.tdSub} numberOfLines={1}>
+                    {item.datePretty}
+                  </Text>
                 </View>
                 <View style={[styles.cell, styles.colTx]}>
                   <Text style={[styles.td, styles.txWrap]} numberOfLines={3} ellipsizeMode="tail">
@@ -515,7 +530,9 @@ export default function VendorPaymentsScreen() {
                   </Text>
                 </View>
                 <View style={[styles.cell, styles.colAmt]}>
-                  <Text style={[styles.td, styles.num, styles.paid]} numberOfLines={1}>{formatCurrency(item.amount)}</Text>
+                  <Text style={[styles.td, styles.num, styles.paid]} numberOfLines={1}>
+                    {formatCurrency(item.amount)}
+                  </Text>
                   <Text style={[styles.tdSub, styles.num, { color: COLOR_RED }]} numberOfLines={1}>
                     {formatCurrency(item.balanceSnapshot)}
                   </Text>
@@ -526,22 +543,16 @@ export default function VendorPaymentsScreen() {
           ListFooterComponent={ListFooter}
           ListEmptyComponent={
             !loading ? (
-              <View style={[styles.tr, { borderBottomWidth: 0 }]}>
-                <Text style={[styles.tdSub, { textAlign: 'center', width: '100%' }]}>No payments</Text>
+              <View style={{ paddingVertical: 24, alignItems: 'center' }}>
+                <Text style={[styles.tdSub]}>No payments</Text>
               </View>
             ) : null
           }
-          showsVerticalScrollIndicator
         />
       </View>
 
       {/* Filters Modal */}
-      <Modal
-        visible={showFilters}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setShowFilters(false)}
-      >
+      <Modal visible={showFilters} transparent animationType="fade" onRequestClose={() => setShowFilters(false)}>
         <View style={styles.filterOverlay}>
           <View style={[styles.filterContent, { paddingBottom: (insets.bottom || 0) + 8 }]}>
             <View style={styles.modalHeader}>
@@ -555,17 +566,26 @@ export default function VendorPaymentsScreen() {
             <View style={styles.filterSection}>
               <Text style={styles.filterLabel}>Quick Ranges</Text>
               <View style={styles.quickChips}>
-                <TouchableOpacity onPress={() => applyQuickRange('today')} style={[styles.chip, isTodayActive && styles.chipActive]}>
+                <TouchableOpacity
+                  onPress={() => applyQuickRange('today')}
+                  style={[styles.chip, isTodayActive && styles.chipActive]}
+                >
                   <Text style={[styles.chipText, isTodayActive && styles.chipTextActive]}>
                     Today ({dayjs().format('ddd')})
                   </Text>
                 </TouchableOpacity>
-                <TouchableOpacity onPress={() => applyQuickRange('month')} style={[styles.chip, isMonthActive && styles.chipActive]}>
+                <TouchableOpacity
+                  onPress={() => applyQuickRange('month')}
+                  style={[styles.chip, isMonthActive && styles.chipActive]}
+                >
                   <Text style={[styles.chipText, isMonthActive && styles.chipTextActive]}>
                     This Month ({dayjs().format('MMM')})
                   </Text>
                 </TouchableOpacity>
-                <TouchableOpacity onPress={() => applyQuickRange('year')} style={[styles.chip, isYearActive && styles.chipActive]}>
+                <TouchableOpacity
+                  onPress={() => applyQuickRange('year')}
+                  style={[styles.chip, isYearActive && styles.chipActive]}
+                >
                   <Text style={[styles.chipText, isYearActive && styles.chipTextActive]}>
                     This Year ({dayjs().format('YYYY')})
                   </Text>
@@ -599,7 +619,7 @@ export default function VendorPaymentsScreen() {
             </View>
 
             {/* Actions */}
-            <View className="filterActions" style={styles.filterActions}>
+            <View style={styles.filterActions}>
               <TouchableOpacity
                 style={styles.resetBtn}
                 onPress={() => {
@@ -629,13 +649,8 @@ export default function VendorPaymentsScreen() {
         </View>
       </Modal>
 
-      {/* Truck Plate Picker Modal (searchable dropdown) */}
-      <Modal
-        visible={platePickerOpen}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setPlatePickerOpen(false)}
-      >
+      {/* Truck Plate Picker Modal */}
+      <Modal visible={platePickerOpen} transparent animationType="fade" onRequestClose={() => setPlatePickerOpen(false)}>
         <TouchableWithoutFeedback onPress={() => setPlatePickerOpen(false)}>
           <View style={styles.plateOverlay}>
             <TouchableWithoutFeedback onPress={() => {}}>
@@ -647,7 +662,6 @@ export default function VendorPaymentsScreen() {
                   </TouchableOpacity>
                 </View>
 
-                {/* Small search field */}
                 <View style={styles.plateSearchBox}>
                   <Feather name="search" size={12} color={COLOR_MUTED} />
                   <TextInput
@@ -682,10 +696,7 @@ export default function VendorPaymentsScreen() {
                     filteredPlates.map((pl) => (
                       <TouchableOpacity
                         key={pl}
-                        style={[
-                          styles.plateItem,
-                          selectedPlate === pl && styles.plateItemActive,
-                        ]}
+                        style={[styles.plateItem, selectedPlate === pl && styles.plateItemActive]}
                         onPress={() => {
                           setSelectedPlate(pl);
                           setPlatePickerOpen(false);
@@ -723,14 +734,19 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   backBtn: {
-    width: 30, height: 30, borderRadius: 8,
+    width: 30,
+    height: 30,
+    borderRadius: 8,
     backgroundColor: 'rgba(255,255,255,0.15)',
-    alignItems: 'center', justifyContent: 'center',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   headerTitle: { color: '#fff', fontSize: 14, fontWeight: '900' },
   headerSub: { color: '#cbd5e1', fontSize: 10, marginTop: 2 },
   headerFilterBtn: {
-    flexDirection: 'row', alignItems: 'center', gap: 6,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
     backgroundColor: '#FFFFFF',
     paddingVertical: 6,
     paddingHorizontal: 10,
@@ -741,19 +757,36 @@ const styles = StyleSheet.create({
   headerFilterTxt: { color: '#0B2447', fontSize: 11, fontWeight: '900' },
 
   filterRow: {
-    paddingHorizontal: 12, paddingTop: 8, paddingBottom: 8,
-    flexDirection: 'row', gap: 8, alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingTop: 8,
+    paddingBottom: 8,
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'center',
   },
   searchBox: {
-    flex: 1, flexDirection: 'row', alignItems: 'center', gap: 6,
-    borderWidth: 1, borderColor: COLOR_DIV, borderRadius: 10,
-    paddingHorizontal: 10, height: 36, backgroundColor: '#fff',
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    borderWidth: 1,
+    borderColor: COLOR_DIV,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    height: 36,
+    backgroundColor: '#fff',
   },
   searchInput: { flex: 1, color: COLOR_TEXT, fontSize: 12, padding: 0 },
   filterBtn: {
-    flexDirection: 'row', alignItems: 'center', gap: 6,
-    backgroundColor: '#fff', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 10,
-    borderWidth: 1, borderColor: '#E5E7EB',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#fff',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
   },
   filterBtnTxt: { color: '#0B2447', fontSize: 11, fontWeight: '900' },
 
@@ -761,7 +794,8 @@ const styles = StyleSheet.create({
   kpiRow: { paddingHorizontal: 12, marginBottom: 8 },
   kpiCard: {
     backgroundColor: COLOR_CARD,
-    borderWidth: 1, borderColor: COLOR_DIV,
+    borderWidth: 1,
+    borderColor: COLOR_DIV,
     borderRadius: 12,
     paddingVertical: 10,
     paddingHorizontal: 12,
@@ -821,23 +855,31 @@ const styles = StyleSheet.create({
 
   /* Table card */
   tableCard: {
-    borderWidth: 1, borderColor: COLOR_DIV, borderRadius: 10, overflow: 'hidden', backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: COLOR_DIV,
+    borderRadius: 10,
+    overflow: 'hidden',
+    backgroundColor: '#fff',
     flex: 1,
   },
 
   /* Row layout */
   tr: {
-    flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: COLOR_DIV,
-    alignItems: 'stretch', minHeight: 44, paddingHorizontal: 6,
+    flexDirection: 'row',
+    borderBottomWidth: 1,
+    borderBottomColor: COLOR_DIV,
+    alignItems: 'stretch',
+    minHeight: 44,
+    paddingHorizontal: 6,
   },
   thRow: { backgroundColor: '#F8FAFC' },
 
-  colTruck: { flex: 0.50, minWidth: 0 },
-  colTx:    { flex: 0.20, minWidth: 0 },
-  colAmt:   { flex: 0.30, minWidth: 0, alignItems: 'flex-end', paddingLeft: 14 },
+  colTruck: { flex: 0.5, minWidth: 0 },
+  colTx: { flex: 0.2, minWidth: 0 },
+  colAmt: { flex: 0.3, minWidth: 0, alignItems: 'flex-end', paddingLeft: 14 },
 
   thCell: { justifyContent: 'center', paddingVertical: 8, paddingHorizontal: 4 },
-  cell:   { justifyContent: 'center', paddingVertical: 7, paddingHorizontal: 4 },
+  cell: { justifyContent: 'center', paddingVertical: 7, paddingHorizontal: 4 },
 
   th: { color: COLOR_TEXT, fontSize: 11, fontWeight: '800' },
   td: { color: COLOR_TEXT, fontSize: 11 },
@@ -848,7 +890,6 @@ const styles = StyleSheet.create({
 
   striped: { backgroundColor: '#FBFDFF' },
 
-  // Paid green
   paid: { color: COLOR_GREEN, fontWeight: '900' },
 
   /* Modal (shared) */

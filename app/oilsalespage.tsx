@@ -26,6 +26,7 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import EditOilSaleModal from "./Shidaal/editoilsalemodal";
+import ReverseOilSaleModal from "./Shidaal/oilsalerevemodal";
 
 /* ======================= Utilities ======================= */
 const fmtNumber = (value: number | null | undefined, digits: number = 2) => {
@@ -192,22 +193,26 @@ function ReceiptModal({
   sale,
   onEdit,
   onAskDelete,
+  onOpenReverse,
 }: {
   visible: boolean;
   onClose: () => void;
   sale: OilSaleRead | null;
   onEdit: () => void;
   onAskDelete: () => void;
+  onOpenReverse: () => void;
 }) {
   if (!sale) return null;
   const isUSD = (sale.currency || "USD").toUpperCase() === "USD";
   const unitName = String(sale.unit_type || "—").toLowerCase();
-  const units = sale.unit_type === "liters" ? (sale.liters_sold ?? sale.unit_qty ?? 0) : (sale.unit_qty ?? sale.liters_sold ?? 0);
+  const units =
+    sale.unit_type === "liters" ? (sale.liters_sold ?? sale.unit_qty ?? 0) : (sale.unit_qty ?? sale.liters_sold ?? 0);
   const ppu =
     sale.price_per_unit_type ??
     (sale.price_per_l != null ? sale.price_per_l * unitCapacity(unitName, sale.liters_sold) : null);
   const subTotal = (sale.total_native ?? 0) - (sale.tax_native ?? 0) + (sale.discount_native ?? 0);
-  const subtotalUSD = !isUSD && sale.fx_rate_to_usd && sale.fx_rate_to_usd > 0 ? subTotal / sale.fx_rate_to_usd : sale.total_native ?? 0;
+  const subtotalUSD =
+    !isUSD && sale.fx_rate_to_usd && sale.fx_rate_to_usd > 0 ? subTotal / sale.fx_rate_to_usd : sale.total_native ?? 0;
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
@@ -220,7 +225,12 @@ function ReceiptModal({
             </TouchableOpacity>
           </View>
 
-          <ScrollView style={{ maxHeight: 520 }} contentContainerStyle={{ paddingBottom: 8 }} nestedScrollEnabled showsVerticalScrollIndicator>
+          <ScrollView
+            style={{ maxHeight: 520 }}
+            contentContainerStyle={{ paddingBottom: 8 }}
+            nestedScrollEnabled
+            showsVerticalScrollIndicator
+          >
             <View style={styles.rcHeaderRow}>
               <View style={{ flex: 1 }}>
                 <Text style={styles.rcTitle} numberOfLines={1} ellipsizeMode="tail" allowFontScaling={false}>
@@ -260,7 +270,12 @@ function ReceiptModal({
               </View>
 
               <View style={styles.rcRow}>
-                <Text style={[styles.rcCell, { flex: 2 }]} numberOfLines={1} ellipsizeMode="tail" allowFontScaling={false}>
+                <Text
+                  style={[styles.rcCell, { flex: 2 }]}
+                  numberOfLines={1}
+                  ellipsizeMode="tail"
+                  allowFontScaling={false}
+                >
                   {sale.oil_type} — {unitName === "liters" ? "L" : unitName}
                 </Text>
                 <Text style={[styles.rcCell, { flex: 1, textAlign: "center" }]} allowFontScaling={false}>
@@ -269,7 +284,11 @@ function ReceiptModal({
                 <Text style={[styles.rcCell, { flex: 1, textAlign: "right" }]} allowFontScaling={false}>
                   {ppu != null ? fmtMoney(ppu, sale.currency) : "—"}
                 </Text>
-                <MoneyInline amount={sale.total_native} currency={sale.currency} style={[styles.rcCell, { flex: 1.2, textAlign: "right", fontWeight: "800" }]} />
+                <MoneyInline
+                  amount={sale.total_native}
+                  currency={sale.currency}
+                  style={[styles.rcCell, { flex: 1.2, textAlign: "right", fontWeight: "800" }]}
+                />
               </View>
 
               {(sale.currency || "").toUpperCase() !== "USD" && (
@@ -331,6 +350,16 @@ function ReceiptModal({
             <TouchableOpacity style={[styles.rcBtn, styles.rcBtnDanger]} onPress={onAskDelete}>
               <Feather name="trash-2" size={14} color="#fff" />
               <Text style={styles.rcBtnDangerTxt} allowFontScaling={false}>Delete</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.rcBtn, { backgroundColor: "#0B2447" }]}
+              onPress={onOpenReverse}
+            >
+              <Feather name="rotate-ccw" size={14} color="#fff" />
+              <Text style={{ color: "#fff", fontSize: 11, fontWeight: "900" }} allowFontScaling={false}>
+                Reverse
+              </Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -467,9 +496,6 @@ function ExportModal({
 
 /* ======================= Main Page ======================= */
 const { width } = Dimensions.get("window");
-const CARD_MARGIN = 6;
-const CARD_W_TWO = (width - 32 - CARD_MARGIN) / 2;
-const CARD_W_THREE = (width - 36 - CARD_MARGIN * 2) / 3;
 
 export default function OilSalesPage() {
   const insets = useSafeAreaInsets();
@@ -479,6 +505,7 @@ export default function OilSalesPage() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [reverseOpen, setReverseOpen] = useState(false);
 
   const [items, setItems] = useState<OilSaleRead[]>([]);
   const [totals, setTotals] = useState<TotalsPayload | null>(null);
@@ -499,10 +526,11 @@ export default function OilSalesPage() {
     endDate: dayjs().endOf("day").toDate(),
   });
 
-  // NEW: plate filtering UI
   const [platePickerOpen, setPlatePickerOpen] = useState(false);
   const [plateQuery, setPlateQuery] = useState("");
   const [selectedPlate, setSelectedPlate] = useState<string | null>(null);
+
+  const [newSaleOpen, setNewSaleOpen] = useState(false);
 
   const pathname = usePathname();
   const router = useRouter();
@@ -564,15 +592,15 @@ export default function OilSalesPage() {
       if (selectedPlate && (r.truck_plate || "").trim() !== selectedPlate) return false;
       if (!q) return true;
       const plate = (r.truck_plate || "").toLowerCase();
-      const hay = `${r.oil_type ?? ""} ${plate} ${r.customer ?? ""} ${r.unit_type ?? ""} ${(r.currency || "").toUpperCase()}`.toLowerCase();
+      const hay = `${r.oil_type ?? ""} ${plate} ${r.customer ?? ""} ${r.unit_type ?? ""} ${(r.currency || "")
+        .toUpperCase()}`.toLowerCase();
       const dateStr = fmtLocalDate(r.created_at).toLowerCase();
       return hay.includes(q) || dateStr.includes(q);
     });
   }, [items, search, selectedPlate]);
 
-  // Derived KPI from filteredItems (USD revenue + unit counts)
+  // Derived KPI: total USD + unit quantities
   const derived = useMemo(() => {
-    // Total revenue in USD (convert where needed)
     const toUSD = (r: OilSaleRead) => {
       const cur = (r.currency || "USD").toUpperCase();
       if (cur === "USD") return Number(r.total_native || 0);
@@ -611,23 +639,112 @@ export default function OilSalesPage() {
     return { totalUSD, unitLabels };
   }, [filteredItems]);
 
+  // Unit type COUNTS
+  const unitTypeCounts = useMemo(() => {
+    const counts: Record<"liters" | "fuusto" | "caag" | "lot", number> = {
+      liters: 0,
+      fuusto: 0,
+      caag: 0,
+      lot: 0,
+    };
+    filteredItems.forEach((r) => {
+      if (counts[r.unit_type] != null) counts[r.unit_type] += 1;
+    });
+    const labels: string[] = [];
+    (["liters", "fuusto", "caag", "lot"] as const).forEach((k) => {
+      if (counts[k] > 0) labels.push(`${counts[k]} ${k}`);
+    });
+    return { counts, labels };
+  }, [filteredItems]);
+
+  const oilTypeStat = useMemo(() => {
+    const toUSD = (r: OilSaleRead) => {
+      const cur = (r.currency || "USD").toUpperCase();
+      if (cur === "USD") return Number(r.total_native || 0);
+      if (r.total_usd != null) return Number(r.total_usd || 0);
+      if (r.fx_rate_to_usd && r.fx_rate_to_usd > 0) return Number(r.total_native || 0) / r.fx_rate_to_usd;
+      return 0;
+    };
+    const map = new Map<string, { count: number; revenue: number }>();
+    filteredItems.forEach((r) => {
+      const k = r.oil_type || "—";
+      const prev = map.get(k) || { count: 0, revenue: 0 };
+      prev.count += 1;
+      prev.revenue += toUSD(r);
+      map.set(k, prev);
+    });
+    let top = { name: "—", count: 0, revenue: 0 };
+    map.forEach((v, k) => {
+      if (v.revenue > top.revenue) top = { name: k, count: v.count, revenue: v.revenue };
+    });
+    return { top, distinct: map.size };
+  }, [filteredItems]);
+
   useFocusEffect(
     React.useCallback(() => {
       const onBackPress = () => {
+        if (
+          detailOpen ||
+          editOpen ||
+          confirmOpen ||
+          exportOpen ||
+          platePickerOpen ||
+          newSaleOpen ||
+          reverseOpen ||
+          showFilters ||
+          showDatePicker !== null
+        ) {
+          setDetailOpen(false);
+          setEditOpen(false);
+          setConfirmOpen(false);
+          setExportOpen(false);
+          setPlatePickerOpen(false);
+          setNewSaleOpen(false);
+          setReverseOpen(false);
+          setShowFilters(false);
+          setShowDatePicker(null);
+          return true;
+        }
+
+        if (router.canGoBack()) {
+          router.back();
+          return true;
+        }
+
         if (pathname !== "/menu") {
           router.replace("/menu");
+          return true;
         }
+
         return true;
       };
+
       const sub = BackHandler.addEventListener("hardwareBackPress", onBackPress);
       return () => sub.remove();
-    }, [router, pathname])
+    }, [
+      router,
+      pathname,
+      detailOpen,
+      editOpen,
+      confirmOpen,
+      exportOpen,
+      platePickerOpen,
+      newSaleOpen,
+      reverseOpen,
+      showFilters,
+      showDatePicker,
+    ])
   );
 
   /* ===== Row Renderer ===== */
   const getSaleTypeBadge = (qty?: number | null, unit?: OilSaleRead["unit_type"], liters?: number | null) => {
     const u = String(unit || "—").toLowerCase();
-    const label = u === "liters" ? `${fmtNumber(liters ?? 0, 0)} liters` : u === "lot" ? "1 lot" : `${fmtNumber(qty ?? 0, 0)} ${u}`;
+    const label =
+      u === "liters"
+        ? `${fmtNumber(liters ?? 0, 0)} liters`
+        : u === "lot"
+        ? "1 lot"
+        : `${fmtNumber(qty ?? 0, 0)} ${u}`;
     const palette: Record<string, { bg: string; color: string }> = {
       fuusto: { bg: "#FFFBEB", color: "#92400E" },
       caag: { bg: "#ECFDF5", color: "#065F46" },
@@ -672,14 +789,23 @@ export default function OilSalesPage() {
 
           <View style={styles.txnTypeWrap}>
             <View style={[styles.txnTypeBadge, { backgroundColor: typeBadge.bg }]}>
-              <Text style={[styles.txnTypeText, { color: typeBadge.color }]} numberOfLines={1} ellipsizeMode="clip" allowFontScaling={false}>
+              <Text
+                style={[styles.txnTypeText, { color: typeBadge.color }]}
+                numberOfLines={1}
+                ellipsizeMode="clip"
+                allowFontScaling={false}
+              >
                 {typeBadge.label}
               </Text>
             </View>
           </View>
 
           <View style={styles.txnAmountWrap}>
-            <MoneyInline amount={r.total_native} currency={r.currency} style={[styles.txnAmount, { color: visuals.amountColor }]} />
+            <MoneyInline
+              amount={r.total_native}
+              currency={r.currency}
+              style={[styles.txnAmount, { color: visuals.amountColor }]}
+            />
             {!isUSD && r.total_usd != null ? (
               <Text style={styles.txnAmountUsd} numberOfLines={1} allowFontScaling={false}>
                 {fmtMoney(r.total_usd, "USD")}
@@ -692,7 +818,7 @@ export default function OilSalesPage() {
     );
   };
 
-  /* ======================= EXPORT (dynamic currency columns) ======================= */
+  /* ======================= EXPORT ======================= */
   const composeUnit = (r: OilSaleRead) => {
     const u = r.unit_type;
     if (u === "liters") return `${fmtNumber(r.liters_sold, 0)} L`;
@@ -757,9 +883,9 @@ export default function OilSalesPage() {
 
       const unitSummary = derived.unitLabels.map((l) => `<li>${l}</li>`).join("");
 
-      const title = `Oil Sales • ${dayjs(dateRange.startDate).format("MMM D, YYYY")} – ${dayjs(dateRange.endDate).format(
-        "MMM D, YYYY"
-      )}`;
+      const title = `Oil Sales • ${dayjs(dateRange.startDate).format("MMM D, YYYY")} – ${dayjs(
+        dateRange.endDate
+      ).format("MMM D, YYYY")}`;
 
       const html = `
       <html>
@@ -847,44 +973,9 @@ export default function OilSalesPage() {
     );
   };
 
-  /* ======================= UI ======================= */
-  return (
-    <View style={[styles.screen, { paddingBottom: insets.bottom + 8 }]}>
-      {/* Header */}
-      <LinearGradient
-        colors={["#0B2447", "#0B2447"]}
-        style={[styles.header, { paddingTop: Math.max(insets.top + 8, 20) }]}
-        start={{ x: 0, y: 0 }}
-        end={{ x: 1, y: 0 }}
-      >
-        <View style={styles.headerBar}>
-          <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
-            <TouchableOpacity
-              onPress={() => router.replace("/menu")}
-              style={styles.backBtn}
-              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-            >
-              <Feather name="arrow-left" size={16} color="#E0E7FF" />
-            </TouchableOpacity>
-          </View>
-
-          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-            <TouchableOpacity onPress={() => setShowFilters(true)} style={styles.headerBtn}>
-              <Feather name="filter" size={14} color="#0B2447" />
-              <Text style={styles.headerBtnTxt} allowFontScaling={false}>Filter</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-
-        {/* Centered title/date */}
-        <View pointerEvents="none" style={[styles.headerCenter, { top: Math.max(insets.top + 8, 20) }]}>
-          <Text style={styles.headerTitle} allowFontScaling={false}>Oil Sales</Text>
-          <Text style={styles.headerDate} numberOfLines={1} allowFontScaling={false}>
-            {dayjs(dateRange.startDate).format("MMM D, YYYY")} – {dayjs(dateRange.endDate).format("MMM D, YYYY")}
-          </Text>
-        </View>
-      </LinearGradient>
-
+  /* ======================= Compact KPIs (Unit Types + Revenue) ======================= */
+  const listHeader = (
+    <View>
       {!!error && (
         <TouchableOpacity style={styles.errorBanner} onPress={() => Alert.alert("Error", error)}>
           <Feather name="alert-triangle" size={12} color="#991b1b" />
@@ -892,58 +983,52 @@ export default function OilSalesPage() {
         </TouchableOpacity>
       )}
 
-      {/* === ONE KPI CARD (like vendor bills) === */}
       {!loading && (
-        <View style={styles.kpiWrapper}>
-          <View style={styles.kpiOneCard}>
-            {/* Left: Total + units */}
-            <View style={{ flex: 1 }}>
-              <Text style={styles.kpiLabel} allowFontScaling={false}>Total Revenue</Text>
-              <Text style={styles.kpiBig} allowFontScaling={false}>{fmtMoney(derived.totalUSD, "USD")}</Text>
-
-              <View style={styles.unitChipsRow}>
-                {(derived.unitLabels.length ? derived.unitLabels : ["—"]).slice(0, 4).map((lab, i) => (
-                  <View key={`${lab}_${i}`} style={styles.unitChip}>
-                    <Text style={styles.unitChipTxt} allowFontScaling={false}>{lab}</Text>
-                  </View>
-                ))}
-              </View>
+        <View style={styles.kpiRow}>
+          {/* Revenue (USD) */}
+          <View style={styles.kpiCardSm}>
+            <View style={styles.kpiIconWrap}>
+              <MaterialCommunityIcons name="cash-multiple" size={18} color="#FACC15" />
             </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.kpiLabelSm} allowFontScaling={false}>Revenue (USD)</Text>
+              <Text style={styles.kpiValueSm} numberOfLines={1} allowFontScaling={false}>
+                {fmtMoney(derived.totalUSD, "USD")}
+              </Text>
+            </View>
+          </View>
 
-            {/* Right: plate dropdown */}
-            <View style={styles.plateCol}>
-              <Text style={styles.plateLabel} allowFontScaling={false}>Truck Plate</Text>
-              <TouchableOpacity
-                style={styles.plateBtn}
-                onPress={() => {
-                  setPlateQuery("");
-                  setPlatePickerOpen(true);
-                }}
-                activeOpacity={0.9}
-              >
-                <Feather name="truck" size={14} color="#0B2447" />
-                <Text style={styles.plateBtnTxt} allowFontScaling={false}>
-                  {selectedPlate ? selectedPlate : "All plates"}
-                </Text>
-                <Feather name="chevron-down" size={16} color="#0B2447" />
-              </TouchableOpacity>
+          {/* Unit Types, just text + values */}
+          <View style={styles.kpiCardSm}>
+            <View style={styles.kpiIconWrap}>
+              <MaterialCommunityIcons name="gas-station" size={18} color="#38BDF8" />
+            </View>
+            <View style={{ flex: 1 }}>
+              
+              <View style={styles.unitLines}>
+                <View style={styles.unitLineRow}>
+                  <Text style={styles.unitLineLabel} allowFontScaling={false}>Fuusto</Text>
+                  <Text style={styles.unitLineValue} allowFontScaling={false}>
+                    {unitTypeCounts.counts.fuusto || 0}
+                  </Text>
+                </View>
+                <View style={styles.unitLineRow}>
+                  <Text style={styles.unitLineLabel} allowFontScaling={false}>Caag</Text>
+                  <Text style={styles.unitLineValue} allowFontScaling={false}>
+                    {unitTypeCounts.counts.caag || 0}
+                  </Text>
+                </View>
+                <View style={styles.unitLineRow}>
+                  <Text style={styles.unitLineLabel} allowFontScaling={false}>Liters</Text>
+                  <Text style={styles.unitLineValue} allowFontScaling={false}>
+                    {unitTypeCounts.counts.liters || 0}
+                  </Text>
+                </View>
+              </View>
             </View>
           </View>
         </View>
       )}
-
-      {/* Actions */}
-      <View style={styles.actionsRow}>
-        <TouchableOpacity onPress={() => router.push("/Shidaal/oilsaleformcashsale")} style={styles.iibBtn}>
-          <Feather name="plus" size={18} color="#1E3A8A" />
-          <Text style={styles.iibBtnTxt} allowFontScaling={false}>Iib Cusub</Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity onPress={exportPDF} style={styles.pdfBtnBig}>
-          <Feather name="share-2" size={18} color="#1E3A8A" />
-          <Text style={styles.iibBtnTxt} allowFontScaling={false}>Export</Text>
-        </TouchableOpacity>
-      </View>
 
       {/* Search */}
       <View style={styles.searchRow}>
@@ -964,18 +1049,87 @@ export default function OilSalesPage() {
           )}
         </View>
       </View>
+    </View>
+  );
+
+  /* ======================= UI ======================= */
+  return (
+    <View style={[styles.screen, { paddingBottom: insets.bottom + 8 }]}>
+      {/* Gradient Header with Filter */}
+      <LinearGradient
+        colors={["#0B2447", "#0B2447"]}
+        style={[styles.header, { paddingTop: Math.max(insets.top + 8, 20) }]}
+        start={{ x: 0, y: 0 }}
+        end={{ x: 1, y: 0 }}
+      >
+        <View style={styles.headerBar}>
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+            <TouchableOpacity
+              onPress={() => {
+                if (
+                  detailOpen ||
+                  editOpen ||
+                  confirmOpen ||
+                  exportOpen ||
+                  platePickerOpen ||
+                  newSaleOpen ||
+                  reverseOpen ||
+                  showFilters ||
+                  showDatePicker !== null
+                ) {
+                  setDetailOpen(false);
+                  setEditOpen(false);
+                  setConfirmOpen(false);
+                  setExportOpen(false);
+                  setPlatePickerOpen(false);
+                  setNewSaleOpen(false);
+                  setReverseOpen(false);
+                  setShowFilters(false);
+                  setShowDatePicker(null);
+                  return;
+                }
+                if (router.canGoBack()) {
+                  router.back();
+                } else if (pathname !== "/menu") {
+                  router.replace("/menu");
+                }
+              }}
+              style={styles.backBtn}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
+              <Feather name="arrow-left" size={16} color="#E0E7FF" />
+            </TouchableOpacity>
+          </View>
+
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+            <TouchableOpacity onPress={() => setShowFilters(true)} style={styles.headerBtn}>
+              <Feather name="filter" size={14} color="#0B2447" />
+              <Text style={styles.headerBtnTxt} allowFontScaling={false}>Filter</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        <View pointerEvents="none" style={[styles.headerCenter, { top: Math.max(insets.top + 8, 20) }]}>
+          <Text style={styles.headerTitle} allowFontScaling={false}>Oil Sales</Text>
+          <Text style={styles.headerDate} numberOfLines={1} allowFontScaling={false}>
+            {dayjs(dateRange.startDate).format("MMM D, YYYY")} – {dayjs(dateRange.endDate).format("MMM D, YYYY")}
+          </Text>
+        </View>
+      </LinearGradient>
 
       {/* Feed */}
-      <View style={[styles.cardFeed, { overflow: "visible" }]}>
-        <View style={{ borderRadius: 12, overflow: "hidden", flex: 1 }}>
+      <View style={[styles.cardFeed, { flex: 1, marginHorizontal: 0 }]}>
+        <View style={{ borderRadius: 0, overflow: "hidden", flex: 1, width: "100%" }}>
           <FlatList
             data={filteredItems}
             keyExtractor={(r, i) => String(r.id ?? i)}
             renderItem={({ item, index }) => renderRow(item, index)}
+            style={{ flex: 1 }}
             contentContainerStyle={{ paddingVertical: 4 }}
             refreshing={refreshing}
             onRefresh={onRefresh}
             showsVerticalScrollIndicator
+            ListHeaderComponent={listHeader}
             ListEmptyComponent={
               <View style={{ padding: 14, alignItems: "center" }}>
                 <Feather name="package" size={28} color="#6b7280" />
@@ -988,6 +1142,21 @@ export default function OilSalesPage() {
         </View>
       </View>
 
+      {/* FAB — rounded square (icon only) */}
+      <TouchableOpacity
+        accessible
+        accessibilityRole="button"
+        accessibilityLabel="Add sale"
+        activeOpacity={0.9}
+        onPress={() => setNewSaleOpen(true)}
+        style={[
+          styles.fabSquare,
+          { bottom: (insets.bottom || 0) + 24 },
+        ]}
+      >
+        <Feather name="plus" size={22} color="#FFFFFF" />
+      </TouchableOpacity>
+
       {/* Detail & Edit & Delete */}
       <ReceiptModal
         visible={detailOpen}
@@ -995,6 +1164,7 @@ export default function OilSalesPage() {
         onClose={() => setDetailOpen(false)}
         onEdit={() => setEditOpen(true)}
         onAskDelete={() => setConfirmOpen(true)}
+        onOpenReverse={() => setReverseOpen(true)}
       />
       <EditOilSaleModal
         visible={editOpen}
@@ -1005,6 +1175,18 @@ export default function OilSalesPage() {
           setEditOpen(false);
           setSelected(updated);
           fetchSummary();
+        }}
+      />
+
+      <ReverseOilSaleModal
+        visible={reverseOpen}
+        onClose={() => setReverseOpen(false)}
+        token={token}
+        sale={selected}
+        onSuccess={async () => {
+          setReverseOpen(false);
+          setDetailOpen(false);
+          await fetchSummary();
         }}
       />
       <DeleteConfirmModal visible={confirmOpen} onCancel={() => setConfirmOpen(false)} onConfirm={doDelete} />
@@ -1021,7 +1203,13 @@ export default function OilSalesPage() {
               </TouchableOpacity>
             </View>
 
-            <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 12 }} nestedScrollEnabled keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator>
+            <ScrollView
+              style={{ flex: 1 }}
+              contentContainerStyle={{ paddingBottom: 12 }}
+              nestedScrollEnabled
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator
+            >
               <View style={styles.filterSection}>
                 <Text style={styles.filterLabel} allowFontScaling={false}>Date Range</Text>
                 <View style={styles.dateRangeContainer}>
@@ -1049,15 +1237,43 @@ export default function OilSalesPage() {
                   />
                 )}
 
+                {/* Truck Plate selection */}
+                <View style={{ marginTop: 10 }}>
+                  <Text style={styles.filterLabel} allowFontScaling={false}>Truck Plate</Text>
+                  <TouchableOpacity
+                    style={styles.plateBtn}
+                    onPress={() => {
+                      setPlateQuery("");
+                      setPlatePickerOpen(true);
+                    }}
+                    activeOpacity={0.9}
+                  >
+                    <Feather name="truck" size={14} color="#0B2447" />
+                    <Text style={styles.plateBtnTxt} allowFontScaling={false}>
+                      {selectedPlate ? selectedPlate : "All plates"}
+                    </Text>
+                    <Feather name="chevron-down" size={16} color="#0B2447" />
+                  </TouchableOpacity>
+                </View>
+
+                {/* Degso Xisaab */}
+                <View style={{ marginTop: 10 }}>
+                  <Text style={styles.filterLabel} allowFontScaling={false}>Degso Xisaab</Text>
+                  <TouchableOpacity onPress={exportPDF} style={styles.exportInlineBtn}>
+                    <Text style={styles.exportInlineTxt} allowFontScaling={false}>Generate / Export PDF</Text>
+                  </TouchableOpacity>
+                </View>
+
                 <View style={styles.filterActions}>
                   <TouchableOpacity
                     style={styles.resetBtn}
-                    onPress={() =>
+                    onPress={() => {
                       setDateRange({
                         startDate: dayjs().startOf("month").toDate(),
                         endDate: dayjs().endOf("day").toDate(),
-                      })
-                    }
+                      });
+                      setSelectedPlate(null);
+                    }}
                   >
                     <Text style={styles.resetTxt} allowFontScaling={false}>Reset</Text>
                   </TouchableOpacity>
@@ -1078,7 +1294,12 @@ export default function OilSalesPage() {
       </Modal>
 
       {/* Truck Plate Picker Modal */}
-      <Modal visible={platePickerOpen} transparent animationType="fade" onRequestClose={() => setPlatePickerOpen(false)}>
+      <Modal
+        visible={platePickerOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setPlatePickerOpen(false)}
+      >
         <TouchableWithoutFeedback onPress={() => setPlatePickerOpen(false)}>
           <View style={styles.plateOverlay}>
             <TouchableWithoutFeedback onPress={() => {}}>
@@ -1146,6 +1367,52 @@ export default function OilSalesPage() {
         </TouchableWithoutFeedback>
       </Modal>
 
+      {/* New Sale chooser popup */}
+      <Modal visible={newSaleOpen} transparent animationType="fade" onRequestClose={() => setNewSaleOpen(false)}>
+        <TouchableWithoutFeedback onPress={() => setNewSaleOpen(false)}>
+          <View style={styles.newSaleOverlay}>
+            <TouchableWithoutFeedback onPress={() => {}}>
+              <View style={styles.newSaleCard}>
+                <View style={styles.newSaleHeader}>
+                  <Text style={styles.newSaleTitle} allowFontScaling={false}>Dooro Nooca Iibka</Text>
+                  <TouchableOpacity onPress={() => setNewSaleOpen(false)} style={styles.newSaleClose}>
+                    <AntDesign name="close" size={16} color="#1F2937" />
+                  </TouchableOpacity>
+                </View>
+
+                <Text style={styles.newSaleSub} allowFontScaling={false}>Please choose the sale type</Text>
+
+                <View style={styles.newSaleActions}>
+                  <TouchableOpacity
+                    activeOpacity={0.9}
+                    style={[styles.chooseBtn, styles.choosePrimary]}
+                    onPress={() => {
+                      setNewSaleOpen(false);
+                      router.push({ pathname: "/Shidaal/oilsaleforminvoice" });
+                    }}
+                  >
+                    <Feather name="file-text" size={16} color="#fff" />
+                    <Text style={styles.choosePrimaryTxt} allowFontScaling={false}>Deyn</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    activeOpacity={0.9}
+                    style={[styles.chooseBtn, styles.chooseGhost]}
+                    onPress={() => {
+                      setNewSaleOpen(false);
+                      router.push({ pathname: "/Shidaal/oilsaleformcashsale" });
+                    }}
+                  >
+                    <Feather name="dollar-sign" size={16} color="#0B2447" />
+                    <Text style={styles.chooseGhostTxt} allowFontScaling={false}>Cash Sale</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </TouchableWithoutFeedback>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
+
       {/* Export modal */}
       <ExportModal visible={exportOpen} onClose={() => setExportOpen(false)} pdfUri={lastPdfUri} />
     </View>
@@ -1204,35 +1471,78 @@ const styles = StyleSheet.create({
   },
   errorText: { color: "#991b1b", fontSize: 10 },
 
-  actionsRow: {
-    marginTop: 8,
-    marginHorizontal: 16,
+  /* Compact KPI cards row */
+  kpiRow: {
+    marginTop: 10,
+    marginHorizontal: 12,
+    flexDirection: "row",
+    gap: 8,
+  },
+  kpiCardSm: {
+    flex: 1,
+    backgroundColor: "#0B2447",
+    borderWidth: 1,
+    borderColor: "#1D4ED8",
+    borderRadius: 12,
+    paddingVertical: 6, // smaller height
+    paddingHorizontal: 8, // smaller padding
     flexDirection: "row",
     alignItems: "center",
+    gap: 8,
+  },
+  kpiIconWrap: {
+    width: 24,
+    height: 24,
+    borderRadius: 7,
+    backgroundColor: "rgba(15,23,42,0.7)",
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "rgba(148,163,184,0.6)",
+  },
+  kpiLabelSm: {
+    fontSize: 9,
+    color: "#E0E7FF",
+    fontWeight: "900",
+    letterSpacing: 0.3,
+    textTransform: "uppercase",
+  },
+  kpiValueSm: { marginTop: 2, fontSize: 12, fontWeight: "900", color: "#F9FAFB" },
+  kpiSubSm: { marginTop: 2, fontSize: 10, color: "#CBD5E1", fontWeight: "700" },
+
+  unitChipsRowSm: { flexDirection: "row", flexWrap: "nowrap", gap: 4, marginTop: 4 },
+  unitChipSm: {
+    paddingVertical: 2,
+    paddingHorizontal: 6,
+    borderRadius: 999,
+    backgroundColor: "#EEF2FF",
+    borderWidth: 1,
+    borderColor: "#DDE3F0",
+  },
+  unitChipTxtSm: { fontSize: 9.5, fontWeight: "900", color: "#0B2447" },
+  kpiMicroNote: { marginTop: 4, fontSize: 9, color: "#E2E8F0" },
+
+  // compact unit text lines
+  unitLines: {
+    marginTop: 2,
+    gap: 2,
+  },
+  unitLineRow: {
+    flexDirection: "row",
     justifyContent: "space-between",
-  },
-  iibBtn: {
-    flexDirection: "row",
     alignItems: "center",
-    gap: 8,
-    backgroundColor: "#DBEAFE",
-    paddingVertical: 8,
-    paddingHorizontal: 14,
-    borderRadius: 10,
-    borderWidth: 1.5,
-    borderColor: "#1E3A8A",
   },
-  iibBtnTxt: { color: "#1E3A8A", fontSize: 12, fontWeight: "900" },
-  pdfBtnBig: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    backgroundColor: "#DBEAFE",
-    paddingVertical: 8,
-    paddingHorizontal: 14,
-    borderRadius: 10,
-    borderWidth: 1.5,
-    borderColor: "#1E3A8A",
+  unitLineLabel: {
+    fontSize: 9,
+    fontWeight: "700",
+    color: "#E0E7FF",
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+  },
+  unitLineValue: {
+    fontSize: 11,
+    fontWeight: "900",
+    color: "#FACC15",
   },
 
   /* Search */
@@ -1242,8 +1552,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "#E2E8F0",
+    borderWidth: 1.5,
+    borderColor: "#CBD5E1",
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
@@ -1254,13 +1564,12 @@ const styles = StyleSheet.create({
   /* Feed container */
   cardFeed: {
     backgroundColor: "white",
-    borderRadius: 12,
-    marginHorizontal: 8,
-    marginTop: 8,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "#e5e7eb",
+    borderRadius: 0,
+    marginHorizontal: 0,
+    borderWidth: 0,
+    borderColor: "transparent",
     overflow: "hidden",
-    flex: 1,
+    width: "100%",
   },
 
   /* List rows */
@@ -1270,61 +1579,29 @@ const styles = StyleSheet.create({
   txnTitle: { fontSize: 12, fontWeight: "800", color: "#1F2937", marginBottom: 1 },
   txnRef: { fontSize: 10, color: "#334155" },
   txnDate: { fontSize: 9, color: "#6B7280", marginTop: 1 },
-  txnTypeWrap: { width: 92, alignItems: "center", justifyContent: "center", paddingHorizontal: 4, alignSelf: "center", marginHorizontal: 4 },
-  txnTypeBadge: { paddingVertical: 3, paddingHorizontal: 8, borderRadius: 999, borderWidth: StyleSheet.hairlineWidth, borderColor: "#e5e7eb", maxWidth: 100 },
-  txnTypeText: { fontSize: 9.5, fontWeight: "900", letterSpacing: 0.3, textAlign: "center" },
-  txnAmountWrap: { alignItems: "flex-end", minWidth: 96, flexShrink: 0, marginLeft: 4 },
-  txnAmount: { fontSize: 12, fontWeight: "900" },
-  txnAmountUsd: { fontSize: 12, fontWeight: "900", marginTop: 2, color: "#111827" },
-  divider: { height: 1, backgroundColor: "#F3F4F6", marginVertical: 2 },
-
-  /* === Single KPI Card (vendorbills style) === */
-  kpiWrapper: { marginTop: 10, marginHorizontal: 12 },
-  kpiOneCard: {
-    backgroundColor: "#fff",
-    borderWidth: 1,
-    borderColor: "#E5E7EB",
-    borderRadius: 12,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    flexDirection: "row",
-    alignItems: "stretch",
-    gap: 12,
+  txnTypeWrap: {
+    width: 92,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 4,
+    alignSelf: "center",
+    marginHorizontal: 4,
   },
-  kpiLabel: {
-    fontSize: 10,
-    color: "#64748B",
-    fontWeight: "900",
-    letterSpacing: 0.3,
-    textTransform: "uppercase",
-  },
-  kpiBig: {
-    marginTop: 2,
-    fontSize: 18,
-    fontWeight: "900",
-    color: "#0B1221",
-  },
-  unitChipsRow: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 6 },
-  unitChip: {
+  txnTypeBadge: {
     paddingVertical: 3,
     paddingHorizontal: 8,
     borderRadius: 999,
-    backgroundColor: "#EEF2FF",
-    borderWidth: 1,
-    borderColor: "#DDE3F0",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#e5e7eb",
+    maxWidth: 100,
   },
-  unitChipTxt: { fontSize: 10.5, fontWeight: "900", color: "#0B2447" },
+  txnTypeText: { fontSize: 9.5, fontWeight: "900", letterSpacing: 0.3, textAlign: "center" },
+  txnAmountWrap: { alignItems: "flex-end", minWidth: 96, flexShrink: 0, marginLeft: 4 },
+  txnAmount: { fontSize: 10, fontWeight: "900" },
+  txnAmountUsd: { fontSize: 10, fontWeight: "900", marginTop: 2, color: "#111827" },
+  divider: { height: 1, backgroundColor: "#F3F4F6", marginVertical: 2 },
 
-  // Right column (plate control)
-  plateCol: { width: 190, justifyContent: "flex-start" },
-  plateLabel: {
-    fontSize: 10,
-    color: "#64748B",
-    fontWeight: "900",
-    letterSpacing: 0.3,
-    textTransform: "uppercase",
-    marginBottom: 6,
-  },
+  // Re-used plate/export buttons
   plateBtn: {
     flexDirection: "row",
     alignItems: "center",
@@ -1337,6 +1614,20 @@ const styles = StyleSheet.create({
     borderColor: "#DDE3F0",
   },
   plateBtnTxt: { color: "#0B2447", fontWeight: "900", fontSize: 12, flex: 1 },
+  exportInlineBtn: {
+    marginTop: 4,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: "#DBEAFE",
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1.5,
+    borderColor: "#1E3A8A",
+    alignSelf: "stretch",
+  },
+  exportInlineTxt: { color: "#1E3A8A", fontSize: 12, fontWeight: "900" },
 
   /* Filters sheet */
   modalOverlay: { flex: 1, justifyContent: "flex-end", backgroundColor: "rgba(0,0,0,0.5)" },
@@ -1373,7 +1664,7 @@ const styles = StyleSheet.create({
   },
   dateBtnText: { color: "#1F2937", fontSize: 11, fontWeight: "700" },
   rangeSep: { fontSize: 10, color: "#6B7280", marginHorizontal: 8 },
-  filterActions: { flexDirection: "row", justifyContent: "space-between", marginTop: 6 },
+  filterActions: { flexDirection: "row", justifyContent: "space-between", marginTop: 12 },
   resetBtn: {
     flex: 1,
     padding: 10,
@@ -1479,9 +1770,23 @@ const styles = StyleSheet.create({
   rcTitle: { fontSize: 15, fontWeight: "900", color: "#0B1220" },
   rcSub: { fontSize: 10, color: "#6B7280", marginTop: 2 },
   rcBlock: { paddingHorizontal: 12, paddingVertical: 8 },
-  rcBlockTitle: { fontSize: 10, fontWeight: "900", color: "#6B7280", letterSpacing: 0.3, textTransform: "uppercase", marginBottom: 4 },
+  rcBlockTitle: {
+    fontSize: 10,
+    fontWeight: "900",
+    color: "#6B7280",
+    letterSpacing: 0.3,
+    textTransform: "uppercase",
+    marginBottom: 4,
+  },
   rcLine: { fontSize: 11, color: "#111827" },
-  rcRowHead: { flexDirection: "row", paddingVertical: 5, borderTopWidth: 1, borderBottomWidth: 1, borderColor: "#E5E7EB", backgroundColor: "#F9FAFB" },
+  rcRowHead: {
+    flexDirection: "row",
+    paddingVertical: 5,
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: "#E5E7EB",
+    backgroundColor: "#F9FAFB",
+  },
   rcHeadCell: { fontSize: 10, fontWeight: "800", color: "#111827", paddingHorizontal: 4 },
   rcRow: { flexDirection: "row", paddingVertical: 6 },
   rcCell: { fontSize: 11, color: "#111827", paddingHorizontal: 4 },
@@ -1502,7 +1807,15 @@ const styles = StyleSheet.create({
   /* Delete */
   delBackdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.45)", alignItems: "center", justifyContent: "center", padding: 18 },
   delCard: { width: "100%", maxWidth: 440, backgroundColor: "#fff", borderRadius: 16, padding: 16, borderWidth: 1, borderColor: "#F1F5F9" },
-  delIconWrap: { width: 40, height: 40, borderRadius: 20, backgroundColor: "#FEE2E2", alignItems: "center", justifyContent: "center", alignSelf: "center" },
+  delIconWrap: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: "#FEE2E2",
+    alignItems: "center",
+    justifyContent: "center",
+    alignSelf: "center",
+  },
   delTitle: { marginTop: 8, textAlign: "center", fontWeight: "900", color: "#111827", fontSize: 14 },
   delBody: { marginTop: 6, textAlign: "center", color: "#6B7280", fontSize: 11, lineHeight: 17 },
   delActions: { flexDirection: "row", justifyContent: "flex-end", gap: 10, marginTop: 12 },
@@ -1517,7 +1830,16 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   delCancelTxt: { color: "#0F172A", fontWeight: "800" },
-  delConfirm: { paddingHorizontal: 12, height: 34, borderRadius: 8, backgroundColor: "#DC2626", alignItems: "center", justifyContent: "center", flexDirection: "row", gap: 6 },
+  delConfirm: {
+    paddingHorizontal: 12,
+    height: 34,
+    borderRadius: 8,
+    backgroundColor: "#DC2626",
+    alignItems: "center",
+    justifyContent: "center",
+    flexDirection: "row",
+    gap: 6,
+  },
   delConfirmTxt: { color: "#fff", fontWeight: "900" },
 
   /* Export modal — CENTERED */
@@ -1530,7 +1852,10 @@ const styles = StyleSheet.create({
     padding: 16,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: "#E5E7EB",
-    ...Platform.select({ ios: { shadowColor: "#000", shadowOpacity: 0.18, shadowRadius: 16, shadowOffset: { width: 0, height: 12 } }, android: { elevation: 8 } }),
+    ...Platform.select({
+      ios: { shadowColor: "#000", shadowOpacity: 0.18, shadowRadius: 16, shadowOffset: { width: 0, height: 12 } },
+      android: { elevation: 8 },
+    }),
   },
   expCloseAbsolute: {
     position: "absolute",
@@ -1553,4 +1878,55 @@ const styles = StyleSheet.create({
   expBtnPrimaryTxt: { color: "#fff", fontWeight: "900" },
   expBtnGhost: { borderWidth: 1, borderColor: "#E2E8F0", backgroundColor: "#fff" },
   expBtnGhostTxt: { color: "#0B2447", fontWeight: "900" },
+
+  /* New Sale chooser popup */
+  newSaleOverlay: { flex: 1, backgroundColor: "rgba(2,6,23,0.45)", alignItems: "center", justifyContent: "center", padding: 16 },
+  newSaleCard: {
+    width: "92%",
+    maxWidth: 420,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    padding: 16,
+    ...Platform.select({
+      ios: { shadowColor: "#000", shadowOpacity: 0.16, shadowRadius: 14, shadowOffset: { width: 0, height: 10 } },
+      android: { elevation: 10 },
+    }),
+  },
+  newSaleHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  newSaleTitle: { fontSize: 14, fontWeight: "900", color: "#0B1221" },
+  newSaleClose: {
+    width: 28,
+    height: 28,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    backgroundColor: "#fff",
+  },
+  newSaleSub: { marginTop: 6, color: "#64748B", fontSize: 11 },
+  newSaleActions: { marginTop: 12, gap: 8 },
+  chooseBtn: { height: 44, borderRadius: 10, alignItems: "center", justifyContent: "center", flexDirection: "row", gap: 8 },
+  choosePrimary: { backgroundColor: "#0B2447" },
+  choosePrimaryTxt: { color: "#fff", fontWeight: "900", fontSize: 13 },
+  chooseGhost: { borderWidth: 1, borderColor: "#E2E8F0", backgroundColor: "#fff" },
+  chooseGhostTxt: { color: "#0B2447", fontWeight: "900", fontSize: 13 },
+
+  /* FAB — rounded square */
+  fabSquare: {
+    position: "absolute",
+    right: 16,
+    width: 56,
+    height: 56,
+    borderRadius: 16,
+    backgroundColor: "#0B2447",
+    alignItems: "center",
+    justifyContent: "center",
+    ...Platform.select({
+      ios: { shadowColor: "#000", shadowOpacity: 0.2, shadowRadius: 12, shadowOffset: { width: 0, height: 6 } },
+      android: { elevation: 8 },
+    }),
+  },
 });

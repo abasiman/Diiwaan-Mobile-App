@@ -75,6 +75,10 @@ const KEY_REMEMBER = 'diiwaan.remember';
 const KEY_USERNAME = 'diiwaan.username';
 const KEY_PASSWORD = 'diiwaan.password';
 
+// NEW: one-shot prefill keys used after signup
+const KEY_PREFILL_USERNAME = 'diiwaan.prefill.username';
+const KEY_PREFILL_PASSWORD = 'diiwaan.prefill.password';
+
 const WHATSAPP_NUMBER =
   (process.env.EXPO_PUBLIC_WHATSAPP_NUMBER as string) ||
   (process.env.NEXT_PUBLIC_WHATSAPP_NUMBER as string) ||
@@ -122,11 +126,11 @@ export default function LoginForm({ onSuccess }: { onSuccess?: () => void }) {
 
   const canSubmit = useMemo(() => !isSubmitting, [isSubmitting]);
 
- 
   useEffect(() => {
     (async () => {
       try {
-        const [rememberStr, username] = await Promise.all([
+        // Normal "Remember me" flow
+        const [rememberStr, rememberedUsername] = await Promise.all([
           AsyncStorage.getItem(KEY_REMEMBER),
           AsyncStorage.getItem(KEY_USERNAME),
         ]);
@@ -134,12 +138,27 @@ export default function LoginForm({ onSuccess }: { onSuccess?: () => void }) {
         setRemember(remembered);
 
         if (remembered) {
-          if (username) setValue('username', username, { shouldDirty: false });
+          if (rememberedUsername) setValue('username', rememberedUsername, { shouldDirty: false });
           const savedPassword = await SecureStore.getItemAsync(KEY_PASSWORD);
           if (savedPassword) setValue('password', savedPassword, { shouldDirty: false });
         }
+
+        // NEW: one-shot prefill from signup (independent of Remember me)
+        const [prefillUser, prefillPass] = await Promise.all([
+          AsyncStorage.getItem(KEY_PREFILL_USERNAME),
+          SecureStore.getItemAsync(KEY_PREFILL_PASSWORD),
+        ]);
+
+        if (prefillUser) {
+          setValue('username', prefillUser, { shouldDirty: false });
+          await AsyncStorage.removeItem(KEY_PREFILL_USERNAME); // clear after use
+        }
+        if (prefillPass) {
+          setValue('password', prefillPass, { shouldDirty: false });
+          await SecureStore.deleteItemAsync(KEY_PREFILL_PASSWORD); // clear after use
+        }
       } catch {
-   
+        // noop
       } finally {
         setPrefilling(false);
       }
@@ -158,18 +177,16 @@ export default function LoginForm({ onSuccess }: { onSuccess?: () => void }) {
     setFormError(null);
     clearErrors();
 
-    const loginOrEmail = data.username.trim(); 
+    const loginOrEmail = data.username.trim();
     const password = data.password;
 
     try {
-
       const info = await withTimeout(login(loginOrEmail, password));
 
       routeByRole(info.role);
-
       onSuccess?.();
 
-      
+      // Persist based on "Remember me"
       if (remember) {
         const toSet: [string, string][] = [
           [KEY_REMEMBER, '1'],
@@ -333,8 +350,12 @@ export default function LoginForm({ onSuccess }: { onSuccess?: () => void }) {
             </TouchableOpacity>
 
             {/* Create account */}
-            <TouchableOpacity style={styles.createBtn} onPress={() => router.replace('/(auth)/signup')} activeOpacity={0.9}>
-              <Text style={styles.createBtnText}>Macmiil Cusub</Text>
+            <TouchableOpacity
+              style={styles.createBtn}
+              onPress={() => router.replace('/(auth)/signup')}
+              activeOpacity={0.9}
+            >
+              <Text style={styles.createBtnText}>Furo Account Cusub</Text>
             </TouchableOpacity>
 
             {/* Contact Card */}

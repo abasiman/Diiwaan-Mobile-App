@@ -716,9 +716,7 @@ export default function OilExtraCostModal({
                     </Text>
                   </View>
 
-                  {currencyKey && currencyKey !== 'USD' && !(rateVal > 0) ? (
-                    <Text style={styles.rateHint}>Enter a valid exchange rate to calculate USD total.</Text>
-                  ) : null}
+                 
                 </View>
 
                 {/* Submit */}

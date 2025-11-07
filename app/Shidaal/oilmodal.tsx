@@ -326,7 +326,7 @@ export default function OilCreatePage() {
   const [truckPlate, setTruckPlate] = useState('');
   const [truckType, setTruckType] = useState<TruckType | undefined>(undefined);
   const [oilType, setOilType] = useState<OilTypeOrBoth | undefined>(undefined);
-  const [qty, setQty] = useState('');
+ 
   const [liters, setLiters] = useState('');
   const [supplierName, setSupplierName] = useState(''); // optional
   const [fromLocation, setFromLocation] = useState('');
@@ -396,12 +396,11 @@ export default function OilCreatePage() {
   const extrasTotalBoth = taxShared + truckRentNum + depotCostNum;
   const grandTotalBoth = landedSum + extrasTotalBoth;
 
-  const validateStep0 = () => {
-    if (!oilType) return false;
-    if (!qty) return false;
-    if (!isBoth && !liters) return false;
-    return true;
-  };
+ const validateStep0 = () => {
+  if (!oilType) return false;
+  if (!isBoth && !liters) return false;
+  return true;
+ };
 
   const validateStep1 = () => {
     if (isBoth) {
@@ -494,9 +493,24 @@ export default function OilCreatePage() {
           location_notes: undefined,
           pay_ment_status: undefined,
           lines: [
-            { oil_type: 'diesel', qty: Number(qty), liters: Number(dLit), landed_cost_per_l: dCost || undefined, oil_well: oilWell || undefined, oil_well_cost: 0 },
-            { oil_type: 'petrol', qty: Number(qty), liters: Number(pLit), landed_cost_per_l: pCost || undefined, oil_well: oilWell || undefined, oil_well_cost: 0 },
-          ],
+          {
+            oil_type: 'diesel',
+            qty: undefined,
+            liters: Number(dLit),
+            landed_cost_per_l: dCost || undefined,
+            oil_well: oilWell || undefined,
+            oil_well_cost: 0,
+          },
+          {
+            oil_type: 'petrol',
+            qty: undefined,
+            liters: Number(pLit),
+            landed_cost_per_l: pCost || undefined,
+            oil_well: oilWell || undefined,
+            oil_well_cost: 0,
+          },
+        ],
+
         };
 
         const res = await api.post('/diiwaanoil', header, { headers: { Authorization: `Bearer ${token}` } });
@@ -560,7 +574,7 @@ export default function OilCreatePage() {
       // SINGLE
       const payload: any = {
         oil_type: oilType,
-        qty: Number(qty),
+        qty: undefined,
         liters: Number(liters),
         ...commonHeader,
         landed_cost_per_l: landedCostPerL ? Number(landedCostPerL) : undefined,
@@ -723,18 +737,26 @@ export default function OilCreatePage() {
               </GridRow>
 
               {/* Qty & liters (single) OR just qty (both) */}
+              
+              {/* Liters (single only) */}
+            {!isBoth && (
               <GridRow>
                 <GridCol>
-                  <FloatingTextInput label="Tirada gawaarida *" value={qty} onChangeText={(t) => setQty(filterInt(t))} keyboardType="number-pad" returnKeyType="next" containerStyle={styles.inputCompact} />
+                  <FloatingTextInput
+                    label="Liters *"
+                    value={liters}
+                    onChangeText={(t) => setLiters(filterInt(t))}
+                    keyboardType="number-pad"
+                    returnKeyType="next"
+                    containerStyle={styles.inputCompact}
+                  />
                 </GridCol>
-                {!isBoth ? (
-                  <GridCol>
-                    <FloatingTextInput label="Liters *" value={liters} onChangeText={(t) => setLiters(filterInt(t))} keyboardType="number-pad" returnKeyType="next" containerStyle={styles.inputCompact} />
-                  </GridCol>
-                ) : (
-                  <GridCol><View /></GridCol>
-                )}
+                <GridCol>
+                  <View />
+                </GridCol>
               </GridRow>
+            )}
+
 
               {/* From / To */}
               <GridRow>
@@ -878,7 +900,7 @@ export default function OilCreatePage() {
         </TouchableWithoutFeedback>
         <View style={summaryStyles.centerWrap}>
           <View style={summaryStyles.card}>
-            <Text style={summaryStyles.title}>Oil Record Summary</Text>
+            <Text style={summaryStyles.title}>Fadlan Iska Hubi</Text>
 
             {/* Header chips */}
             <View style={summaryStyles.section}>
