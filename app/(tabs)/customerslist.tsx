@@ -43,6 +43,12 @@ import {
   type CustomerRow as Customer,
 } from '../db/customerRepo';
 
+// 🔹 NEW: pending payments helper
+import {
+  CreatePaymentPayload,
+  getPendingPaymentsLocal,
+} from '@/app/ManageInvoice/paymentOfflineRepo';
+
 const BRAND_BLUE = '#0B2447';
 const BRAND_BLUE_2 = '#0B2447';
 const ACCENT = '#576CBC';
@@ -247,12 +253,70 @@ export default function CustomersList() {
 
         console.log('[CustomersList] getCustomersLocal returned', data.length, 'rows');
 
+        // 🔹 NEW: apply pending offline payments so balances match CustomerInvoicesPage
+        let adjusted = data;
+        try {
+          const pending = getPendingPaymentsLocal(user.id, 500);
+          if (pending.length) {
+            const extraByCustomer = new Map<number, number>();
+
+            for (const row of pending) {
+              try {
+                const payload = JSON.parse(row.payload_json) as CreatePaymentPayload;
+                if (payload.customer_id) {
+                  const prev = extraByCustomer.get(payload.customer_id) || 0;
+                  extraByCustomer.set(payload.customer_id, prev + (payload.amount || 0));
+                }
+              } catch {
+                // ignore bad rows
+              }
+            }
+
+            if (extraByCustomer.size) {
+              adjusted = data.map((c) => {
+                if (typeof c.id !== 'number') return c;
+                const extra = extraByCustomer.get(c.id) || 0;
+                if (!extra) return c;
+                return {
+                  ...c,
+                  amount_paid: (c.amount_paid || 0) + extra,
+                  amount_due: Math.max(0, (c.amount_due || 0) - extra),
+                };
+              });
+            }
+          }
+        } catch (e: any) {
+          console.log(
+            '[CustomersList] applying pending payments failed',
+            e?.message || e
+          );
+        }
+
+        // 🔹 NEW: de-duplicate customers by (name + phone) so offline + server rows merge
+        const dedupMap = new Map<string, Customer>();
+        for (const c of adjusted) {
+          const key =
+            `${(c.name || '').trim().toLowerCase()}|${(c.phone || '').trim()}`;
+          // newest row wins (later rows overwrite earlier)
+          dedupMap.set(key, c);
+        }
+        const deduped = Array.from(dedupMap.values());
+
         setCustomers((prev) => {
-          if (reset) return data;
-          return [...prev, ...data];
+          if (reset) return deduped;
+          // when loading more, still dedupe with existing ones
+          const combined = [...prev, ...deduped];
+          const outMap = new Map<string, Customer>();
+          for (const c of combined) {
+            const key =
+              `${(c.name || '').trim().toLowerCase()}|${(c.phone || '').trim()}`;
+            outMap.set(key, c);
+          }
+          return Array.from(outMap.values());
         });
 
         setHasMore(data.length === limit);
+
         offsetRef.current = localOffset + data.length;
         setOffset(offsetRef.current);
         setError(null);
@@ -352,7 +416,7 @@ export default function CustomersList() {
       (async () => {
         try {
           console.log('[CustomersList] initial sync+pull START');
-          await syncCustomersWithServer(api);
+          await syncCustomersWithServer(api, user.id); // 🔹 pass ownerId here
           await pullLatestFromServer();
           loadPage(true);
           console.log('[CustomersList] initial sync+pull DONE');
@@ -378,7 +442,7 @@ export default function CustomersList() {
     setRefreshing(true);
     try {
       if (token && user?.id) {
-        await syncCustomersWithServer(api);
+        await syncCustomersWithServer(api, user.id);  // 🔹 scoped by owner
         await pullLatestFromServer();
       }
       loadPage(true);
@@ -502,7 +566,10 @@ export default function CustomersList() {
             } else {
               // offline: mark deleted + dirty, so sync can send DELETE later
               markCustomerDeletedLocal(selectedCustomer.id);
-              console.log('[CustomersList] marked customer deleted locally (offline)', selectedCustomer.id);
+              console.log(
+                '[CustomersList] marked customer deleted locally (offline)',
+                selectedCustomer.id
+              );
             }
             closeSettings();
             loadPage(true);
@@ -654,11 +721,7 @@ export default function CustomersList() {
             keyboardDismissMode="on-drag"
             showsVerticalScrollIndicator
             refreshControl={
-              <RefreshControl
-                refreshing={refreshing}
-                onRefresh={onRefresh}
-                tintColor={ACCENT}
-              />
+              <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={ACCENT} />
             }
             ListEmptyComponent={
               !loading ? <Text style={styles.emptyText}>No customers yet.</Text> : null

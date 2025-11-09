@@ -19,29 +19,24 @@ import {
   View,
 } from 'react-native';
 
-
-
-import { queueOilRepriceForSync } from '../dbform/oilRepriceOfflineRepo';
-
-import { upsertLocalWakaaladSellOption } from '../dbform/wakaaladSellOptionsRepo';
-
 import {
+  createOrUpdateCustomerLocal,
   getCustomersLocal,
   upsertCustomersFromServer
 } from '../db/customerRepo';
-
-
-
-
-import { getWakaaladSellOptionsLocal, type WakaaladSellOption } from '../dbform/wakaaladSellOptionsRepo';
-
-
+import { queueOilRepriceForSync } from '../dbform/oilRepriceOfflineRepo';
+import { getWakaaladSellOptionsLocal, upsertLocalWakaaladSellOption, type WakaaladSellOption } from '../dbform/wakaaladSellOptionsRepo';
 
 import NetInfo from '@react-native-community/netinfo';
 
 import { queueOilSaleForSync } from '../dbform/invocieoilSalesOfflineRepo';
 import SaleCurrencyModal, { CurrencyKey } from './SaleCurrencyModal';
 import CustomerCreateModal from './customercreate';
+
+
+import { registerOfflineOilInvoiceDelta } from '../offlineincomestatement/incomeStatementRepo';
+
+
 
 const BORDER = '#CBD5E1';
 
@@ -350,7 +345,7 @@ function ChangePriceMiniModal({
   const parsed = parseFloat((amount || '').replace(',', '.'));
   const valid = Number.isFinite(parsed) && parsed > 0;
 
-    async function save() {
+  async function save() {
     if (!valid) return;
     try {
       setBusy(true);
@@ -393,7 +388,6 @@ function ChangePriceMiniModal({
       setBusy(false);
     }
   }
-
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
@@ -652,7 +646,7 @@ function WakaaladPickerModal({
 
 export default function OilSaleInvoiceForm() {
   const router = useRouter();
- const { token, user } = useAuth();
+  const { token, user } = useAuth();
   const { show: showToast, ToastView } = useToast();
 
   const [options, setOptions] = useState<WakaaladSellOption[]>([]);
@@ -700,121 +694,110 @@ export default function OilSaleInvoiceForm() {
   const offsetRef = useRef(0);
   const loadingRef = useRef(false);
 
-
-
-
   const [online, setOnline] = useState(true);
 
-useEffect(() => {
-  const sub = NetInfo.addEventListener((state) => {
-    const ok = Boolean(state.isConnected && state.isInternetReachable);
-    setOnline(ok);
-  });
-  return () => sub();
-}, []);
-
-// when we come online, try to sync any pending sales
-/* useEffect(() => {
-  if (!online || !token || !user?.id) return;
-  syncPendingOilSales(token, user.id).catch((e) =>
-    console.warn('syncPendingOilSales failed', e)
-  );
-}, [online, token, user?.id]); */
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
 
   const loadCustomers = useCallback(
-  async (reset = false) => {
-    if (!user?.id) return;
-    if (loadingRef.current) return;
-    loadingRef.current = true;
+    async (reset = false) => {
+      if (!user?.id) return;
+      if (loadingRef.current) return;
+      loadingRef.current = true;
 
-    try {
-      if (reset) {
-        setLoading(true);
-        setHasMore(true);
-        offsetRef.current = 0;
-      }
-
-      const localOffset = reset ? 0 : offsetRef.current;
-      let data: Customer[] = [];
-
-      if (online && token) {
-        // ONLINE → hit API
-        const res = await api.get('/diiwaancustomers', {
-          params: {
-            q: search || undefined,
-            offset: localOffset,
-            limit,
-          },
-          headers: { Authorization: `Bearer ${token}` },
-        });
-
-        const raw: any = res.data;
-        const list: any[] = Array.isArray(raw?.items)
-          ? raw.items
-          : Array.isArray(raw)
-          ? raw
-          : [];
-
-        // optional: keep local cache up to date
-        if (list.length) {
-          upsertCustomersFromServer(list, user.id);
+      try {
+        if (reset) {
+          setLoading(true);
+          setHasMore(true);
+          offsetRef.current = 0;
         }
 
-        data = list.map((c: any) => ({
-          id: c.id,
-          name: c.name,
-          contact: c.contact ?? c.phone ?? null,
-          phone: c.phone ?? null,
-        }));
-      } else {
-        // OFFLINE (or no token) → purely local SQLite
-        const rows = getCustomersLocal(search, limit, localOffset, user.id);
-        data = rows.map((c) => ({
-          id: c.id,
-          name: c.name || '',
-          contact: c.phone ?? null,
-          phone: c.phone ?? null,
-        }));
-      }
-
-      setCustomers((prev) => {
-        if (reset) return data;
-        const map = new Map(prev.map((c) => [c.id, c]));
-        data.forEach((c) => map.set(c.id, { ...map.get(c.id), ...c }));
-        return Array.from(map.values());
-      });
-
-      setHasMore(data.length === limit);
-      offsetRef.current = localOffset + data.length;
-      setError(null);
-    } catch (e: any) {
-      console.warn('loadCustomers failed', e?.response?.data || e?.message || e);
-
-      // Final fallback: try local if something blew up while online
-      try {
         const localOffset = reset ? 0 : offsetRef.current;
-        const rows = getCustomersLocal(search, limit, localOffset, user?.id || 0);
-        const data = rows.map((c) => ({
-          id: c.id,
-          name: c.name || '',
-          contact: c.phone ?? null,
-          phone: c.phone ?? null,
-        }));
+        let data: Customer[] = [];
 
-        setCustomers((prev) => (reset ? data : [...prev, ...data]));
+        if (online && token) {
+          // ONLINE → hit API
+          const res = await api.get('/diiwaancustomers', {
+            params: {
+              q: search || undefined,
+              offset: localOffset,
+              limit,
+            },
+            headers: { Authorization: `Bearer ${token}` },
+          });
+
+          const raw: any = res.data;
+          const list: any[] = Array.isArray(raw?.items)
+            ? raw.items
+            : Array.isArray(raw)
+            ? raw
+            : [];
+
+          // optional: keep local cache up to date
+          if (list.length) {
+            upsertCustomersFromServer(list, user.id);
+          }
+
+          data = list.map((c: any) => ({
+            id: c.id,
+            name: c.name,
+            contact: c.contact ?? c.phone ?? null,
+            phone: c.phone ?? null,
+          }));
+        } else {
+          // OFFLINE (or no token) → purely local SQLite
+          const rows = getCustomersLocal(search, limit, localOffset, user.id);
+          data = rows.map((c) => ({
+            id: c.id,
+            name: c.name || '',
+            contact: c.phone ?? null,
+            phone: c.phone ?? null,
+          }));
+        }
+
+        setCustomers((prev) => {
+          if (reset) return data;
+          const map = new Map(prev.map((c) => [c.id, c]));
+          data.forEach((c) => map.set(c.id, { ...map.get(c.id), ...c }));
+          return Array.from(map.values());
+        });
+
         setHasMore(data.length === limit);
         offsetRef.current = localOffset + data.length;
         setError(null);
-      } catch (inner: any) {
-        setError(inner?.message || 'Failed to load customers.');
+      } catch (e: any) {
+        console.warn('loadCustomers failed', e?.response?.data || e?.message || e);
+
+        // Final fallback: try local if something blew up while online
+        try {
+          const localOffset = reset ? 0 : offsetRef.current;
+          const rows = getCustomersLocal(search, limit, localOffset, user?.id || 0);
+          const data = rows.map((c) => ({
+            id: c.id,
+            name: c.name || '',
+            contact: c.phone ?? null,
+            phone: c.phone ?? null,
+          }));
+
+          setCustomers((prev) => (reset ? data : [...prev, ...data]));
+          setHasMore(data.length === limit);
+          offsetRef.current = localOffset + data.length;
+          setError(null);
+        } catch (inner: any) {
+          setError(inner?.message || 'Failed to load customers.');
+        }
+      } finally {
+        setLoading(false);
+        loadingRef.current = false;
       }
-    } finally {
-      setLoading(false);
-      loadingRef.current = false;
-    }
-  },
-  [user?.id, token, online, search, limit]
-);
+    },
+    [user?.id, token, online, search, limit]
+  );
 
   useEffect(() => {
     if (custPickerOpen) loadCustomers(true);
@@ -848,34 +831,32 @@ useEffect(() => {
     setValOpen(true);
   };
 
-  // fetch wakaalad options
-  // instead of calling api.get('/wakaalad_diiwaan/sell-options'...)
-useEffect(() => {
-  if (!user?.id) return;
+  // fetch wakaalad options from local db
+  useEffect(() => {
+    if (!user?.id) return;
 
-  let cancelled = false;
+    let cancelled = false;
 
-  try {
-    setLoadingOptions(true);
-    const opts = getWakaaladSellOptionsLocal(user.id, {
-      onlyAvailable: true,
-      limit: 200,
-    });
-    if (!cancelled) setOptions(opts);
-  } catch (e: any) {
-    if (!cancelled) {
-      console.warn('Local wakaalad options load failed', e);
-      openValidation('Load failed', 'Failed to load wakaalad sell options.');
+    try {
+      setLoadingOptions(true);
+      const opts = getWakaaladSellOptionsLocal(user.id, {
+        onlyAvailable: true,
+        limit: 200,
+      });
+      if (!cancelled) setOptions(opts);
+    } catch (e: any) {
+      if (!cancelled) {
+        console.warn('Local wakaalad options load failed', e);
+        openValidation('Load failed', 'Failed to load wakaalad sell options.');
+      }
+    } finally {
+      if (!cancelled) setLoadingOptions(false);
     }
-  } finally {
-    if (!cancelled) setLoadingOptions(false);
-  }
 
-  return () => {
-    cancelled = true;
-  };
-}, [user?.id]);
-
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id]);
 
   // default price
   useEffect(() => {
@@ -1013,65 +994,93 @@ useEffect(() => {
   };
 
   const confirmAndCreate = async (pickedCurrencyKey: CurrencyKey, fxRateStr: string) => {
-  if (!selected) return;
-  if (!user?.id) {
-    openValidation('Missing user', 'User ID is required to create sales.');
-    return;
-  }
-
-  const saleCurrency = saleCurrencyFromKey(pickedCurrencyKey);
-  const fxRaw = parseFloat((fxRateStr || '').replace(',', '.'));
-  const fxValid = !isNaN(fxRaw) && fxRaw > 0 ? fxRaw : undefined;
-
-  const perL_sale = convertPerL(lotCurrency, saleCurrency, perLInLotCurrency, fxValid);
-
-  if (lotCurrency !== saleCurrency && !fxValid) {
-    openValidation('FX required', 'Please provide a valid exchange rate.');
-    return;
-  }
-
-  const payload: CreateSalePayload = {
-    oil_id: selected.oil_id,
-    wakaalad_id: selected.wakaalad_id,
-    unit_type: unitType,
-    sale_type: SALE_TYPE,
-    liters_sold: unitType === 'liters' ? qtyNum : undefined,
-    unit_qty: unitType === 'fuusto' || unitType === 'caag' ? qtyNum : undefined,
-    price_per_l: perL_sale || undefined,
-    customer: custName?.trim() ? custName.trim() : undefined,
-    customer_contact: custContact?.trim() ? custContact.trim() : undefined,
-    currency: saleCurrency,
-    fx_rate_to_usd: saleCurrency === 'USD' ? undefined : fxValid,
-  };
-
-  setSubmitting(true);
-  setFinalOpen(false);
-
-  try {
-    if (online && token) {
-      // ONLINE: normal API flow
-      const res = await api.post<OilSaleRead>('/oilsale', payload, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      setReceipt(res.data);
-      setReceiptOpen(true);
-      showToast('Invoice created successfully');
-    } else {
-      // OFFLINE: enqueue to local SQLite queue
-      await queueOilSaleForSync(user.id, payload);
-      showToast('Invoice saved offline – will sync when online');
+    if (!selected) return;
+    if (!user?.id) {
+      openValidation('Missing user', 'User ID is required to create sales.');
+      return;
     }
 
-    goToInvoices();
-  } catch (e: any) {
-    openValidation(
-      'Create failed',
-      String(e?.response?.data?.detail || e?.message || 'Unable to create invoice sale.')
-    );
-  } finally {
-    setSubmitting(false);
-  }
-};
+    const saleCurrency = saleCurrencyFromKey(pickedCurrencyKey);
+    const fxRaw = parseFloat((fxRateStr || '').replace(',', '.'));
+    const fxValid = !isNaN(fxRaw) && fxRaw > 0 ? fxRaw : undefined;
+
+    const perL_sale = convertPerL(lotCurrency, saleCurrency, perLInLotCurrency, fxValid);
+
+    if (lotCurrency !== saleCurrency && !fxValid) {
+      openValidation('FX required', 'Please provide a valid exchange rate.');
+      return;
+    }
+
+    const payload: CreateSalePayload = {
+      oil_id: selected.oil_id,
+      wakaalad_id: selected.wakaalad_id,
+      unit_type: unitType,
+      sale_type: SALE_TYPE,
+      liters_sold: unitType === 'liters' ? qtyNum : undefined,
+      unit_qty: unitType === 'fuusto' || unitType === 'caag' ? qtyNum : undefined,
+      price_per_l: perL_sale || undefined,
+      customer: custName?.trim() ? custName.trim() : undefined,
+      customer_contact: custContact?.trim() ? custContact.trim() : undefined,
+      currency: saleCurrency,
+      fx_rate_to_usd: saleCurrency === 'USD' ? undefined : fxValid,
+    };
+
+    setSubmitting(true);
+    setFinalOpen(false);
+
+    try {
+      if (online && token) {
+        // ONLINE: normal API flow
+        const res = await api.post<OilSaleRead>('/oilsale', payload, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        setReceipt(res.data);
+        setReceiptOpen(true);
+        showToast('Invoice created successfully');
+      } else {
+        // OFFLINE: enqueue to local SQLite queue
+        await queueOilSaleForSync(user.id, payload);
+
+        // 🔹 NEW: record local income-statement delta so tenant-accounts
+        // will show this invoice immediately while offline.
+        try {
+          const createdAt = new Date().toISOString();
+          const totalNativeSale = billedLiters * (perL_sale || 0);
+
+          let totalUsd = 0;
+          if (saleCurrency === 'USD') {
+            totalUsd = totalNativeSale;
+          } else if (saleCurrency === 'SOS' && fxValid) {
+            totalUsd = totalNativeSale / fxValid;
+          }
+
+          if (totalNativeSale > 0 && totalUsd > 0 && Number.isFinite(totalUsd)) {
+            registerOfflineOilInvoiceDelta({
+              ownerId: user.id,
+              createdAt,
+              truckPlate: selected.truck_plate || null,
+              currency: saleCurrency,
+              totalNative: totalNativeSale,
+              totalUsd,
+            });
+          }
+        } catch (e) {
+          console.warn('registerOfflineOilInvoiceDelta failed', e);
+        }
+
+        showToast('Invoice saved offline – will sync when online');
+      }
+
+      goToInvoices();
+    } catch (e: any) {
+      openValidation(
+        'Create failed',
+        String(e?.response?.data?.detail || e?.message || 'Unable to create invoice sale.')
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   const amountUSD: number | null = useMemo(() => {
     if (lineTotal <= 0) return null;
@@ -1364,7 +1373,7 @@ useEffect(() => {
       />
 
       {/* Change price mini modal */}
-            {selected && (
+      {selected && (
         <ChangePriceMiniModal
           visible={changeOpen}
           onClose={() => setChangeOpen(false)}
@@ -1469,49 +1478,63 @@ useEffect(() => {
 
       {/* Create Customer Modal */}
       <CustomerCreateModal
-  visible={createOpen}
-  mode="add"
-  submitting={createSubmitting}
-  onClose={() => setCreateOpen(false)}
-  onSubmit={async (payload) => {
-    if (!payload.name?.trim()) return;
-    if (!user?.id) {
-      showToast('Missing tenant – cannot create customer');
-      return;
-    }
+        visible={createOpen}
+        mode="add"
+        submitting={createSubmitting}
+        onClose={() => setCreateOpen(false)}
+        onSubmit={async (payload) => {
+          if (!payload.name?.trim()) return;
+          if (!user?.id) {
+            showToast('Missing tenant – cannot create customer');
+            return;
+          }
 
-    setCreateSubmitting(true);
-    try {
-      let createdName = payload.name;
-      let createdContact = payload.phone;
+          setCreateSubmitting(true);
+          try {
+            let createdName = payload.name;
+            let createdContact = payload.phone;
 
-      if (online && token) {
-        // ONLINE: hit API, then upsert into local DB
-        const res = await api.post('/diiwaancustomers', payload, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        const created = res?.data || {};
+            if (online && token) {
+              // ✅ ONLINE: server + SQLite
+              const res = await api.post('/diiwaancustomers', payload, {
+                headers: { Authorization: `Bearer ${token}` },
+              });
+              const created = res?.data || {};
+              upsertCustomersFromServer([created], user.id);
 
-        upsertCustomersFromServer([created], user.id);
+              createdName = created?.name || payload.name;
+              createdContact =
+                created?.contact || created?.phone || payload.phone || null;
+            } else {
+              // ✅ OFFLINE: write to local SQLite so other screens see it
+              const localRow = createOrUpdateCustomerLocal(
+                {
+                  name: payload.name.trim(),
+                  phone: payload.phone?.trim() || null,
+                  address: payload.address ?? null,
+                  status: 'active',
+                },
+                user.id
+              );
 
-        createdName = created?.name || payload.name;
-        createdContact = created?.contact || created?.phone || payload.phone || null;
-      }
+              createdName = localRow.name || payload.name;
+              createdContact = localRow.phone || payload.phone || null;
+            }
 
-      setCustName(createdName);
-      setCustContact(createdContact || '');
+            setCustName(createdName);
+            setCustContact(createdContact || '');
 
-      // refresh picker list from whatever source we just wrote to
-      loadCustomers(true);
-      setCreateOpen(false);
-      showToast('Customer created');
-    } catch (e: any) {
-      showToast(String(e?.response?.data?.detail || e?.message || 'Create failed'));
-    } finally {
-      setCreateSubmitting(false);
-    }
-  }}
-/>
+            // will now include offline customer as well
+            loadCustomers(true);
+            setCreateOpen(false);
+            showToast('Customer created');
+          } catch (e: any) {
+            showToast(String(e?.response?.data?.detail || e?.message || 'Create failed'));
+          } finally {
+            setCreateSubmitting(false);
+          }
+        }}
+      />
 
       {/* Wakaalad Picker Popup */}
       <WakaaladPickerModal

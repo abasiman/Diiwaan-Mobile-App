@@ -2,7 +2,7 @@
   "expo": {
     "name": "Diiwaan",
     "slug": "Diiwaan",
-    "version": "1.0.1",
+    "version": "1.0.3",
     "scheme": "diiwaan",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
@@ -33,7 +33,7 @@
     },
     "android": {
       "package": "com.luneksa.diiwaan",
-      "versionCode": 203,
+      "versionCode": 205,
       "icon": "./assets/images/android/ic_launcher.png",
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/android/ic_launcher_foreground.png",

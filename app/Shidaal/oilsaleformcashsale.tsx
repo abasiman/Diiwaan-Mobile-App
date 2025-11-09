@@ -4,6 +4,8 @@ import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 import { Feather } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import { registerOfflineOilInvoiceDelta } from '../offlineincomestatement/incomeStatementRepo';
+
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -24,6 +26,7 @@ import {
 import NetInfo from '@react-native-community/netinfo';
 
 import {
+  createOrUpdateCustomerLocal,
   getCustomersLocal,
   upsertCustomersFromServer,
 } from '../db/customerRepo';
@@ -998,7 +1001,7 @@ export default function OilSaleCashSaleForm() {
   };
 
   // create sale with payment_method, supporting offline queue (same pattern as invoice form)
-  const confirmAndCreate = async (
+   const confirmAndCreate = async (
     pickedCurrencyKey: CurrencyKey,
     fxRateStr: string,
     paymentMethodServer: 'cash' | 'bank'
@@ -1050,6 +1053,33 @@ export default function OilSaleCashSaleForm() {
       } else {
         // OFFLINE: enqueue to local SQLite queue
         await queueOilSaleForSync(user.id, payload);
+
+        // Also register local delta so tenant accounts reflect this cash sale while offline
+        try {
+          const createdAt = new Date().toISOString();
+          const totalNativeSale = billedLiters * (perL_sale || 0);
+
+          let totalUsd = 0;
+          if (saleCurrency === 'USD') {
+            totalUsd = totalNativeSale;
+          } else if (saleCurrency === 'SOS' && fxValid) {
+            totalUsd = totalNativeSale / fxValid;
+          }
+
+          if (totalNativeSale > 0 && totalUsd > 0 && Number.isFinite(totalUsd)) {
+            registerOfflineOilInvoiceDelta({
+              ownerId: user.id,
+              createdAt,
+              truckPlate: selected.truck_plate || null,
+              currency: saleCurrency,
+              totalNative: totalNativeSale,
+              totalUsd,
+            });
+          }
+        } catch (e) {
+          console.warn('registerOfflineOilInvoiceDelta failed', e);
+        }
+
         showToast('Cash sale saved offline – will sync when online');
       }
 
@@ -1064,6 +1094,7 @@ export default function OilSaleCashSaleForm() {
       setSubmitting(false);
     }
   };
+
 
   // USD preview for summary
   const amountUSD: number | null = useMemo(() => {
@@ -1502,7 +1533,7 @@ export default function OilSaleCashSaleForm() {
             let createdContact = payload.phone;
 
             if (online && token) {
-              // ONLINE: hit API, then upsert into local DB
+              // ✅ ONLINE: server + SQLite
               const res = await api.post('/diiwaancustomers', payload, {
                 headers: { Authorization: `Bearer ${token}` },
               });
@@ -1512,6 +1543,20 @@ export default function OilSaleCashSaleForm() {
 
               createdName = created?.name || payload.name;
               createdContact = created?.contact || created?.phone || payload.phone || null;
+            } else {
+              // ✅ OFFLINE: write to local SQLite so other screens see it
+              const localRow = createOrUpdateCustomerLocal(
+                {
+                  name: payload.name.trim(),
+                  phone: payload.phone?.trim() || null,
+                  address: payload.address ?? null,
+                  status: 'active',
+                },
+                user.id
+              );
+
+              createdName = localRow.name || payload.name;
+              createdContact = localRow.phone || payload.phone || null;
             }
 
             setCustName(createdName);
@@ -1847,7 +1892,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
   },
   segmentBtnActive: {
-    borderColor: '#0B1221',
+    borderColor: '#0B122A',
     backgroundColor: '#0B1221',
   },
   segmentText: { fontWeight: '800', color: '#0B1221', fontSize: 12 },

@@ -4,6 +4,7 @@ import { FormInput } from '@/components/FormInput';
 import { Colors } from '@/constants/Colors';
 import api from '@/services/api';
 import { Ionicons } from '@expo/vector-icons';
+import NetInfo from '@react-native-community/netinfo';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
 import { useEffect, useMemo, useState } from 'react';
@@ -22,7 +23,14 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+
 import { useAuth } from '../../src/context/AuthContext';
+import {
+  getMeLocal,
+  upsertMeFromServer,
+  type MeProfile,
+} from '../profile/meProfileRepo';
+
 
 type MeResponse = {
   id: number;
@@ -65,7 +73,17 @@ function parseApiError(err: any): string {
 
 export default function ProfileScreen() {
   const router = useRouter();
-  const { logout } = useAuth();
+  const { logout, token, user } = useAuth();
+
+  const [online, setOnline] = useState(true);
+
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
 
   // view/edit state
   const [me, setMe] = useState<MeResponse | null>(null);
@@ -102,22 +120,58 @@ export default function ProfileScreen() {
 
   useEffect(() => {
     (async () => {
-      try {
-        const resp = await api.get<MeResponse>('/diiwaan/me');
-        setMe(resp.data);
+      if (!user?.id) {
+        setLoading(false);
+        return;
+      }
+
+      const applyProfile = (p: MeProfile | MeResponse | null) => {
+        if (!p) return;
+        setMe(p as MeResponse);
         reset({
-          company_name: resp.data.company_name,
-          username: resp.data.username,
-          phone_number: resp.data.phone_number,
+          company_name: p.company_name,
+          username: p.username,
+          phone_number: p.phone_number,
         });
+      };
+
+      try {
+        // ONLINE → API then cache
+        if (online && token) {
+          const resp = await api.get<MeResponse>('/diiwaan/me');
+          applyProfile(resp.data);
+          upsertMeFromServer(resp.data as MeProfile);
+          return;
+        }
+
+        // OFFLINE or no token → local cache
+        const local = getMeLocal(user.id);
+        if (local) {
+          applyProfile(local);
+        } else if (online && token) {
+          // fallback: try online once
+          const resp = await api.get<MeResponse>('/diiwaan/me');
+          applyProfile(resp.data);
+          upsertMeFromServer(resp.data as MeProfile);
+        } else {
+          Alert.alert(
+            'Offline',
+            'Profile is not yet available offline. Open this screen once while online.'
+          );
+        }
       } catch (err) {
-        Alert.alert('Error', parseApiError(err));
+        const local = user?.id ? getMeLocal(user.id) : null;
+        if (local) {
+          applyProfile(local);
+        } else {
+          Alert.alert('Error', parseApiError(err));
+        }
       } finally {
         setLoading(false);
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [online, token, user?.id]);
 
   const onEditToggle = () => {
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
@@ -143,12 +197,23 @@ export default function ProfileScreen() {
   };
 
   const onSaveProfile = async (data: ProfileForm) => {
+    if (!online || !token) {
+      Alert.alert('Offline', 'You must be online to update your profile.');
+      return;
+    }
+
     try {
       setSaving(true);
       const payload = {
-        company_name: data.company_name && data.company_name.trim() !== '' ? data.company_name.trim() : null,
+        company_name:
+          data.company_name && data.company_name.trim() !== ''
+            ? data.company_name.trim()
+            : null,
         username: data.username.trim(),
-        phone_number: data.phone_number && data.phone_number.trim() !== '' ? data.phone_number.trim() : null,
+        phone_number:
+          data.phone_number && data.phone_number.trim() !== ''
+            ? data.phone_number.trim()
+            : null,
       };
       const resp = await api.put<MeResponse>('/diiwaan/me', payload);
       setMe(resp.data);
@@ -157,6 +222,10 @@ export default function ProfileScreen() {
         username: resp.data.username,
         phone_number: resp.data.phone_number,
       });
+
+      // update offline cache
+      upsertMeFromServer(resp.data as MeProfile);
+
       LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
       setEditing(false);
       Alert.alert('Saved', 'Your profile has been updated.');
@@ -179,6 +248,11 @@ export default function ProfileScreen() {
   };
 
   const onSavePassword = async (data: PasswordForm) => {
+    if (!online || !token) {
+      Alert.alert('Offline', 'You must be online to change your password.');
+      return;
+    }
+
     try {
       if (data.new_password.length < 6) {
         Alert.alert('Weak password', 'New password must be at least 6 characters.');

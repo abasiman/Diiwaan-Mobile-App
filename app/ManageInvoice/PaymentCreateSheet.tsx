@@ -1,4 +1,4 @@
-// paymentcreatesheet.tsx
+// app/ManageInvoice/PaymentCreateSheet.tsx
 import api from '@/services/api';
 import { Feather, FontAwesome } from '@expo/vector-icons';
 import * as Sharing from 'expo-sharing';
@@ -21,7 +21,6 @@ import {
   TouchableWithoutFeedback,
   View,
 } from 'react-native';
-
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { captureRef } from 'react-native-view-shot';
 import { queuePaymentForSync } from './paymentOfflineRepo';
@@ -129,15 +128,14 @@ export default function PaymentCreateSheet({
     onClose();
   };
 
-  /** Prefill & sync the form whenever the sheet opens or due changes */
+  /** Prefill whenever the sheet opens or due changes */
   useEffect(() => {
     if (visible) {
       const due = Number.isFinite(currentDue) ? currentDue : 0;
       setPrevDue(due);
       setNewDue(due);
-      // prefill "Amount to receive" with the due (rounded to 2dp), but empty if no due
+      // prefill with due (2dp), empty if no due
       setAmount(due > 0 ? (Math.round(due * 100) / 100).toFixed(2) : '');
-      // default to Cash when opening; keep custom text but not selected
       setMethod('cash');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -162,8 +160,14 @@ export default function PaymentCreateSheet({
   };
 
   const typedAmt = sanitizeAmountToNumber(amount);
-  const remainingPreview = Math.max(0, (currentDue || 0) - typedAmt);
-  const isOverpay = typedAmt > (currentDue || 0);
+
+  // ✅ work in CENTS to avoid float weirdness
+  const centsDue = Math.round(Math.max(0, currentDue || 0) * 100);
+  const centsTyped = Math.round(typedAmt * 100);
+
+  const remainingPreview = Math.max(0, (centsDue - centsTyped) / 100);
+  const isOverpay = centsTyped > centsDue;
+  const overBy = Math.max(0, (centsTyped - centsDue) / 100);
 
   /** Somali share message */
   const buildShareMessage = (paid: number, remain: number) => {
@@ -249,104 +253,101 @@ export default function PaymentCreateSheet({
     };
   }, [showReceipt, newDue, paidAmt]);
 
- const onSave = async () => {
-  if (!customerId) return Alert.alert('Fadlan', 'Macmiilka lama helin.');
-  const amtNum = sanitizeAmountToNumber(amount);
-  if (!(amtNum > 0)) return Alert.alert('Fadlan', 'Geli lacag sax ah (ka weyn 0).');
-
-  // Clamp overpay to due (never create negative balances)
-  const dueNow = Math.max(0, currentDue || 0);
-  const payAmount = Math.min(amtNum, dueNow);
-
-  if (amtNum > dueNow && dueNow > 0) {
-    Alert.alert(
-      'Overpayment adjusted',
-      `Waxaad gelisay ${fmtMoney(amtNum)}, balse kugu dhiman waa ${fmtMoney(
-        dueNow
-      )}. Waxaan kuu qaadanay ${fmtMoney(payAmount)}.`
-    );
-  }
-  if (dueNow === 0) {
-    Alert.alert('No amount due', 'Macmiilkan lama laha wax deyn ah.');
-    return;
-  }
-
-  const paymentMethod =
-    method === 'cash' ? 'cash' : (customMethod.trim() || 'custom');
-
-  const payload = {
-    amount: payAmount,
-    customer_id: customerId,
-    payment_method: paymentMethod,
-  };
-
-  setSubmitting(true);
-  try {
-    let handledOffline = false;
-
-    // 1) If we *believe* we are online and have token → try API
-    if (online && token) {
-      try {
-        await api.post('/diiwaanpayments', payload, { headers: authHeader });
-      } catch (e: any) {
-        const isNetworkError = !e?.response; // no HTTP response → likely offline / network
-        if (ownerId && isNetworkError) {
-          // ✅ fallback to offline queue instead of showing network error popup
-          queuePaymentForSync(ownerId, payload);
-          handledOffline = true;
-          Alert.alert(
-            'Offline mode',
-            'Internet ma jiro. Bixinta waxaa lagu kaydiyay offline, waxaana lala sync-gareyn doonaa marka aad online noqoto.'
-          );
-        } else {
-          // real server error – rethrow so catch below handles it
-          throw e;
-        }
-      }
-    } else {
-      // 2) Clearly offline (or no token) → queue directly
-      if (!ownerId) {
-        Alert.alert(
-          'Offline payment',
-          'Owner ID lama helin, lama kaydin karo bixinta offline.'
-        );
-        return;
-      }
-      queuePaymentForSync(ownerId, payload);
-      handledOffline = true;
-      Alert.alert(
-        'Offline mode',
-        'Bixinta ayaa offline loogu kaydiyay. Waxaa lala sync-gareyn doonaa marka aad online noqoto.'
-      );
+  const onSave = async () => {
+    if (!customerId) return Alert.alert('Fadlan', 'Macmiilka lama helin.');
+    const amtNum = sanitizeAmountToNumber(amount);
+    if (!(amtNum > 0)) {
+      return Alert.alert('Fadlan', 'Geli lacag sax ah (ka weyn 0).');
     }
 
-    // If we reached here, either:
-    // - online API succeeded, OR
-    // - we queued offline successfully.
-    const remain = Math.max(0, dueNow - payAmount);
-    setPaidAmt(payAmount);
-    setPrevDue(dueNow);
-    setNewDue(remain);
-    setSavedAt(new Date());
+    // ✅ use cents here too
+    const centsDueNow = Math.round(Math.max(0, currentDue || 0) * 100);
+    const centsAmt = Math.round(amtNum * 100);
 
-    onCreated?.();
+    const payCents = Math.min(centsAmt, centsDueNow);
+    const payAmount = payCents / 100;
+    const dueNow = centsDueNow / 100;
 
-    // reset inputs
-    setAmount('');
-    setMethod('cash');
+    if (centsAmt > centsDueNow && centsDueNow > 0) {
+      Alert.alert(
+        'Overpayment adjusted',
+        `Waxaad gelisay ${fmtMoney(amtNum)}, balse kugu dhiman waa ${fmtMoney(
+          dueNow
+        )}. Waxaan kuu qaadanay ${fmtMoney(payAmount)}.`
+      );
+    }
+    if (centsDueNow === 0) {
+      Alert.alert('No amount due', 'Macmiilkan lama laha wax deyn ah.');
+      return;
+    }
 
-    onClose();            // close form
-    setShowReceipt(true); // open receipt
-  } catch (e: any) {
-    // Only show this for *real* failures (not network fallback)
-    Alert.alert(
-      'Error',
-      String(e?.response?.data?.detail || e?.message || 'Save failed.')
-    );
-  } finally {
-    setSubmitting(false);
-  }
-};
+    const paymentMethod =
+      method === 'cash' ? 'cash' : (customMethod.trim() || 'custom');
+
+    const payload = {
+      amount: payAmount,
+      customer_id: customerId,
+      payment_method: paymentMethod,
+    };
+
+    setSubmitting(true);
+    try {
+      // try online first if we think we are online
+      if (online && token) {
+        try {
+          await api.post('/diiwaanpayments', payload, { headers: authHeader });
+        } catch (e: any) {
+          const isNetworkError = !e?.response;
+          if (ownerId && isNetworkError) {
+            // fallback to offline queue
+            queuePaymentForSync(ownerId, payload);
+            Alert.alert(
+              'Offline mode',
+              'Internet ma jiro. Bixinta waxaa lagu kaydiyay offline, waxaana lala sync-gareyn doonaa marka aad online noqoto.'
+            );
+          } else {
+            throw e;
+          }
+        }
+      } else {
+        // fully offline
+        if (!ownerId) {
+          Alert.alert(
+            'Offline payment',
+            'Owner ID lama helin, lama kaydin karo bixinta offline.'
+          );
+          return;
+        }
+        queuePaymentForSync(ownerId, payload);
+        Alert.alert(
+          'Offline mode',
+          'Bixinta ayaa offline loogu kaydiyay. Waxaa lala sync-gareyn doonaa marka aad online noqoto.'
+        );
+      }
+
+      // success: either online or queued offline
+      const remain = Math.max(0, (centsDueNow - payCents) / 100);
+      setPaidAmt(payAmount);
+      setPrevDue(dueNow);
+      setNewDue(remain);
+      setSavedAt(new Date());
+
+      onCreated?.();
+
+      setAmount('');
+      setMethod('cash');
+
+      onClose();
+      setShowReceipt(true);
+    } catch (e: any) {
+      Alert.alert(
+        'Error',
+        String(e?.response?.data?.detail || e?.message || 'Save failed.')
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   const shareImage = async () => {
     if (!receiptUri) return;
@@ -465,6 +466,7 @@ export default function PaymentCreateSheet({
                         backgroundColor: '#FFF7F7',
                       },
                     ]}
+                    keyboardType="decimal-pad"
                     maxLength={18}
                   />
                   {/* live helper */}
@@ -477,9 +479,7 @@ export default function PaymentCreateSheet({
                     }}
                   >
                     {isOverpay
-                      ? `Over by ${fmtMoney(
-                          typedAmt - Math.max(0, currentDue || 0)
-                        )} (will be adjusted)`
+                      ? `Over by ${fmtMoney(overBy)} (will be adjusted)`
                       : `Remaining after receive: ${fmtMoney(
                           remainingPreview
                         )}`}

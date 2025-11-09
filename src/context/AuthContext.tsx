@@ -1,3 +1,4 @@
+// src/context/AuthContext.tsx
 import { upsertLocalUser } from '@/app/db/userRepo';
 import api from '@/services/api';
 import NetInfo from '@react-native-community/netinfo';
@@ -50,6 +51,7 @@ export type AuthContextType = {
 export const AuthContext = createContext<AuthContextType>({} as AuthContextType);
 
 const TOKEN_KEY = 'userToken';
+const USER_KEY = 'authUser';          // 🔹 new
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(null);
@@ -78,6 +80,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await SecureStore.deleteItemAsync(TOKEN_KEY);
   };
 
+  const saveUser = async (u: AuthUser) => {
+    setUser(u);
+    try {
+      await SecureStore.setItemAsync(USER_KEY, JSON.stringify(u));
+    } catch (e) {
+      console.warn('[Auth] saveUser failed', e);
+    }
+  };
+
+  const clearUser = async () => {
+    setUser(null);
+    try {
+      await SecureStore.deleteItemAsync(USER_KEY);
+    } catch (e) {
+      console.warn('[Auth] clearUser failed', e);
+    }
+  };
+
   // 🔑 real profile loader that uses an explicit token
   const fetchProfileWithToken = async (tok: string) => {
     try {
@@ -88,7 +108,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const u = res.data;
       console.log('[Auth] fetchProfileWithToken success', { id: u.id, username: u.username });
 
-      setUser(u);
+      await saveUser(u);
 
       upsertLocalUser({
         id: u.id,
@@ -98,12 +118,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         status: u.status,
       });
     } catch (err: any) {
-      console.log(
-        '[Auth] fetchProfileWithToken error',
-        err?.response?.status,
-        err?.response?.data || err?.message
-      );
-      // do NOT nuke user here; keep whatever we had
+      const status = err?.response?.status;
+      const message = err?.message;
+      console.log('[Auth] fetchProfileWithToken error', status, err?.response?.data || message);
+
+      const isNetworkError =
+        !status &&
+        (err?.code === 'ERR_NETWORK' ||
+          message === 'Network Error' ||
+          message === 'Network request failed');
+
+      if (status === 401 || status === 403) {
+        // 🔴 Token invalid → fully logout
+        await clearToken();
+        await clearUser();
+      } else if (isNetworkError) {
+        // ✅ Offline or unreachable → keep cached user & token
+        console.log('[Auth] offline / server unreachable, keeping cached auth');
+      } else {
+        console.warn('[Auth] /diiwaan/me failed, keeping cached user', err?.response?.data || err);
+      }
     }
   };
 
@@ -111,26 +145,39 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const refreshProfile = async () => {
     if (!token) {
       console.log('[Auth] refreshProfile: no token, clearing user');
-      setUser(null);
+      await clearUser();
       return;
     }
     await fetchProfileWithToken(token);
   };
 
-  // Restore token + profile on app start
+  // Restore token + user on app start (offline-friendly)
   useEffect(() => {
     (async () => {
       try {
-        const saved = await SecureStore.getItemAsync(TOKEN_KEY);
-        console.log('from secure store', !!saved);
-        if (saved) {
-          applyAuthHeader(saved);
-          setToken(saved);
-          // ⚠️ IMPORTANT: use saved token directly, not refreshProfile()
-          await fetchProfileWithToken(saved);
-        } else {
-          console.log('[Auth] no token in secure store');
-          setUser(null);
+        const [savedToken, savedUserJson] = await Promise.all([
+          SecureStore.getItemAsync(TOKEN_KEY),
+          SecureStore.getItemAsync(USER_KEY),
+        ]);
+        console.log('[Auth] restore', { hasToken: !!savedToken, hasUser: !!savedUserJson });
+
+        if (savedToken) {
+          applyAuthHeader(savedToken);
+          setToken(savedToken);
+        }
+
+        if (savedUserJson) {
+          try {
+            const parsed: AuthUser = JSON.parse(savedUserJson);
+            setUser(parsed); // ✅ immediately have user offline
+          } catch (e) {
+            console.warn('[Auth] failed to parse cached user', e);
+          }
+        }
+
+        // If we do have a token, try to refresh profile (but this won't nuke on offline)
+        if (savedToken) {
+          await fetchProfileWithToken(savedToken);
         }
       } finally {
         setRestoring(false);
@@ -174,7 +221,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       status: loginResp.data.status ?? null,
     };
     console.log('[Auth] signup quickUser', quickUser);
-    setUser(quickUser);
+    await saveUser(quickUser);
 
     upsertLocalUser({
       id: quickUser.id,
@@ -195,7 +242,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       });
     });
 
-    // Use explicit token to avoid race with setToken
     fetchProfileWithToken(loginResp.data.access_token).catch(() => {});
   };
 
@@ -224,7 +270,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       status: resp.data.status ?? null,
     };
     console.log('[Auth] login quickUser', quickUser);
-    setUser(quickUser);
+    await saveUser(quickUser);
 
     upsertLocalUser({
       id: quickUser.id,
@@ -245,7 +291,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       });
     });
 
-    // Again: explicit token to avoid race
     fetchProfileWithToken(resp.data.access_token).catch(() => {});
 
     return {
@@ -258,7 +303,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = async () => {
     console.log('[Auth] logout');
-    setUser(null);
+    await clearUser();
     await clearToken();
   };
 

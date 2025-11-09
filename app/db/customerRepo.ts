@@ -1,5 +1,4 @@
 // app/db/customerRepo.ts
-
 import type { AxiosInstance } from 'axios';
 import { db } from './db';
 
@@ -236,40 +235,25 @@ export function applyLocalCustomerBalanceDeltaByName(
       [ownerId, name]
     );
 
-    if (existing) {
-      // Just bump the balance locally. We deliberately do NOT touch `dirty`
-      // so we don't send any bogus "amount_due" to the server. Server will
-      // recompute from real sales after sync.
-      db.runSync(
-        `
-        UPDATE customers
-        SET amount_due      = amount_due + ?,
-            amount_due_usd  = COALESCE(amount_due_usd, 0) + ?,
-            updated_at      = ?
-        WHERE id = ?;
-      `,
-        [deltaAmountDueUsd, deltaAmountDueUsd, now, existing.id]
-      );
-    } else {
-      // No customer row yet: create a temporary one with this opening balance.
-      const id = getNextTempId();
-      db.runSync(
-        `
-        INSERT INTO customers (
-          id, owner_id, name, phone, address, status,
-          amount_due, amount_due_usd, amount_due_native, amount_paid,
-          created_at, updated_at, dirty, deleted
-        ) VALUES (
-          ?, ?, ?, NULL, NULL, 'active',
-          ?, ?, 0, 0,
-          ?, ?, 1, 0
-        );
-      `,
-        [id, ownerId, name, deltaAmountDueUsd, deltaAmountDueUsd, now, now]
-      );
+    if (!existing) {
+      // 🔹 No auto-create: if the customer doesn't exist locally, do nothing.
+      return;
     }
+
+    // 🔹 Only bump local numbers; still NOT touching `dirty`
+    db.runSync(
+      `
+      UPDATE customers
+      SET amount_due      = amount_due + ?,
+          amount_due_usd  = COALESCE(amount_due_usd, 0) + ?,
+          updated_at      = ?
+      WHERE id = ?;
+    `,
+      [deltaAmountDueUsd, deltaAmountDueUsd, now, existing.id]
+    );
   });
 }
+
 
 // ---------- Local delete helpers ----------
 export function markCustomerDeletedLocal(id: number) {
@@ -287,10 +271,13 @@ export function hardDeleteCustomerLocal(id: number) {
   db.runSync('DELETE FROM customers WHERE id = ?;', [id]);
 }
 
-// ---------- Sync dirty → server ----------
-export async function syncCustomersWithServer(api: AxiosInstance) {
+// ---------- Sync dirty → server (scoped by owner) ----------
+export async function syncCustomersWithServer(api: AxiosInstance, ownerId: number) {
+  if (!ownerId) return;
+
   const dirtyRows = db.getAllSync<CustomerRow>(
-    'SELECT * FROM customers WHERE dirty = 1;'
+    'SELECT * FROM customers WHERE dirty = 1 AND owner_id = ?;',
+    [ownerId]
   );
 
   for (const row of dirtyRows) {
@@ -321,7 +308,8 @@ export async function syncCustomersWithServer(api: AxiosInstance) {
         const c = res.data;
         db.withTransactionSync(() => {
           db.runSync('DELETE FROM customers WHERE id = ?;', [row.id]);
-          upsertCustomersFromServer([c], row.owner_id);
+          // ensure we store under the current ownerId
+          upsertCustomersFromServer([c], ownerId);
         });
       } catch {
         continue;
@@ -334,7 +322,7 @@ export async function syncCustomersWithServer(api: AxiosInstance) {
           payload
         );
         const c = res.data;
-        upsertCustomersFromServer([c], row.owner_id);
+        upsertCustomersFromServer([c], ownerId);
       } catch {
         continue;
       }

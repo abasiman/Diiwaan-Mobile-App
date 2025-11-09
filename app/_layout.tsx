@@ -3,9 +3,16 @@ import * as NavigationBar from 'expo-navigation-bar';
 import { Redirect, Slot, usePathname } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import * as Updates from 'expo-updates';
+// app/layout.tsx
+
+import { initIncomeStatementDb } from './offlineincomestatement/incomeStatementDb';
+
 import React, { useCallback, useEffect, useLayoutEffect } from 'react';
 import { AppState, Platform, Text, View } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
+
+import { initMeProfileDb } from './profile/meProfileDb';
+import { syncMeProfile } from './profile/meProfileSync';
 
 
 import { syncPendingPayments } from './ManageInvoice/paymentOfflineRepo';
@@ -48,8 +55,10 @@ import { syncAllOilSellOptions } from './WakaaladOffline/oilSellOptionsSync';
 import { initWakaaladDb } from './WakaaladOffline/wakaaladOfflineDb';
 import { syncWakaaladFromServer } from './WakaaladOffline/wakaaladSync';
 
+import { syncIncomeStatement } from './offlineincomestatement/incomeStatementSync';
 import { initWakaaladFormDb } from './wakaaladformoffline/wakaaladFormDb';
 import { syncPendingWakaaladForms } from './wakaaladformoffline/wakaaladFormSync';
+
 
 import { syncAllOilSales } from './db/oilSalesPageSync';
 
@@ -72,6 +81,7 @@ export default function RootLayout() {
     initCustomerInvoiceDb();
     initCustomerLedgerDb();
     initOilSalesPageDb();
+    initIncomeStatementDb(); // 👈 NEW
     
     // 🔹 NEW: vendor payments screen cache
     initVendorPaymentsScreenDb();
@@ -99,6 +109,7 @@ export default function RootLayout() {
 
      initWakaaladActionsOfflineDb();
      initPaymentOfflineDb();
+      initMeProfileDb();
   }, []);
 
   return (
@@ -123,7 +134,6 @@ function GlobalSync() {
   const [online, setOnline] = React.useState(true);
   const syncingRef = React.useRef(false);
 
-  // track connectivity
   useEffect(() => {
     const sub = NetInfo.addEventListener((state) => {
       const ok = Boolean(state.isConnected && state.isInternetReachable);
@@ -132,80 +142,119 @@ function GlobalSync() {
     return () => sub();
   }, []);
 
- useEffect(() => {
-  if (!token || !user?.id || !online) return;
-  if (syncingRef.current) return;
-  syncingRef.current = true;
+  useEffect(() => {
+    if (!token || !user?.id || !online) return;
+    if (syncingRef.current) return;
+    syncingRef.current = true;
 
-  (async () => {
-    try {
+    (async () => {
       const ownerId = user.id;
       const now = new Date();
       const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
 
-      // 🔹 0) FIRST: push any offline oilmodal forms
-      await syncPendingOilModalForms(ownerId, token);
+      const run = async (
+        label: string,
+        fn: () => Promise<unknown> | unknown
+      ) => {
+        try {
+          await fn();
+        } catch (e) {
+          console.warn(`${label} failed`, e);
+        }
+      };
 
-      // 1) offline-created invoice oil sales
-      await syncPendingOilSales(token, ownerId);
+      try {
+        // income statement first, so it's always prefetched
+        await run('syncIncomeStatement', () =>
+          syncIncomeStatement(ownerId, token)
+        );
+
+        await run('syncPendingOilModalForms', () =>
+          syncPendingOilModalForms(ownerId, token)
+        );
+        await run('syncPendingOilSales', () =>
+          syncPendingOilSales(token, ownerId)
+        );
+        await run('syncPendingOilReprices', () =>
+          syncPendingOilReprices(token, ownerId)
+        );
+        await run('syncPendingOilExtraCosts', () =>
+          syncPendingOilExtraCosts(token, ownerId)
+        );
+        await run('syncPendingPayments', () =>
+          syncPendingPayments(token, ownerId)
+        );
+        await run('syncPendingOilSaleReversals', () =>
+          syncPendingOilSaleReversals(token, ownerId)
+        );
+
+        await run('getVendorPaymentsScreenWithSync', () =>
+          getVendorPaymentsScreenWithSync({
+            token,
+            ownerId,
+            force: true,
+            fromDate: ninetyDaysAgo.toISOString(),
+            toDate: now.toISOString(),
+          })
+        );
+
+        await run('syncPendingWakaaladActions', () =>
+          syncPendingWakaaladActions(token, ownerId)
+        );
+        await run('syncPendingWakaaladForms', () =>
+          syncPendingWakaaladForms(ownerId, token)
+        );
+
+        await run('syncAllOilSales', () =>
+          syncAllOilSales(ownerId, token)
+        );
+        await run('syncAllWakaaladSellOptions', () =>
+          syncAllWakaaladSellOptions(ownerId, token)
+        );
+        await run('syncAllOilSellOptions', () =>
+          syncAllOilSellOptions(ownerId, token)
+        );
+
+        await run('getWakaaladMovementScreenWithSync', () =>
+          getWakaaladMovementScreenWithSync({
+            token,
+            ownerId,
+            force: true,
+            fromDate: ninetyDaysAgo.toISOString(),
+            toDate: now.toISOString(),
+          })
+        );
 
 
-        // 1a) offline reprices
-      await syncPendingOilReprices(token, ownerId);
-
-      // 1b) extra-costs
-      await syncPendingOilExtraCosts(token, ownerId);
+        await run('syncMeProfile', () => syncMeProfile(token));
 
 
-       await syncPendingPayments(token, ownerId);
+        await run('getVendorBillsWithSync', () =>
+          getVendorBillsWithSync({ token, ownerId, force: true })
+        );
 
-      // 2) reversals
-      await syncPendingOilSaleReversals(token, ownerId);
-
-      // 2a) vendor payments list
-      await getVendorPaymentsScreenWithSync({
-        token,
-        ownerId,
-        force: true,
-        fromDate: ninetyDaysAgo.toISOString(),
-        toDate: now.toISOString(),
-      });
-
-      await syncPendingWakaaladActions(token, ownerId);
-      await syncPendingWakaaladForms(ownerId, token);
-
-      // 3) oil sales & options
-      await syncAllOilSales(ownerId, token);
-      await syncAllWakaaladSellOptions(ownerId, token);
-      await syncAllOilSellOptions(ownerId, token);
-
-      await getWakaaladMovementScreenWithSync({
-        token,
-        ownerId,
-        force: true,
-        fromDate: ninetyDaysAgo.toISOString(),
-        toDate: now.toISOString(),
-      });
-
-      // 🔹 now that oils are synced, vendor bills make sense
-      await getVendorBillsWithSync({
-        token,
-        ownerId,
-        force: true,
-      });
-
-      await syncAllExtraCosts(ownerId, token);
-      await syncPendingVendorPayments(token, ownerId);
-      await syncOilSummaryAndWakaaladStats(token, ownerId);
-      await syncWakaaladFromServer({ token, ownerId, startDate: ninetyDaysAgo, endDate: now });
-    } catch (e) {
-      console.warn('Global sync failed', e);
-    } finally {
-      syncingRef.current = false;
-    }
-  })();
-}, [token, user?.id, online]);
-
+        await run('syncAllExtraCosts', () =>
+          syncAllExtraCosts(ownerId, token)
+        );
+        await run('syncPendingVendorPayments', () =>
+          syncPendingVendorPayments(token, ownerId)
+        );
+        await run('syncOilSummaryAndWakaaladStats', () =>
+          syncOilSummaryAndWakaaladStats(token, ownerId)
+        );
+        await run('syncWakaaladFromServer', () =>
+          syncWakaaladFromServer({
+            token,
+            ownerId,
+            startDate: ninetyDaysAgo,
+            endDate: now,
+          })
+        );
+      } finally {
+        syncingRef.current = false;
+      }
+    })();
+  }, [token, user?.id, online]);
 
   return null;
 }

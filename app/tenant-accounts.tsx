@@ -29,46 +29,18 @@ import { captureRef } from 'react-native-view-shot';
 
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
+import NetInfo from '@react-native-community/netinfo';
 
-/* ─────────────────── Types from /diiwaantenantsaccounts/summary ─────────────────── */
-type AccountType = 'ar' | 'ap' | 'revenue' | 'cash' | 'inventory';
 
-type AccountBalance = {
-  account_type: AccountType;
-  balance_native: number;
-  balance_usd: number;
-};
 
-type AccountSummary = {
-  per_account: AccountBalance[];
-
-  ar_native: number; ap_native: number; revenue_native: number; cash_native: number; inventory_native: number;
-  ar_usd: number;    ap_usd: number;    revenue_usd: number;    cash_usd: number;    inventory_usd: number;
-
-  oil_asset_native: number;
-  oil_asset_usd: number;
-  cogs_native: number;
-  cogs_usd: number;
-  net_profit_native: number;
-  net_profit_usd: number;
-
-  // NEW: report-only petrol fuusto shorts
-  petrol_fuusto_shorts_native: number;
-  petrol_fuusto_shorts_usd: number;
-
-  truck_plate?: string | null;
-};
-
-type AccountTruckPlate = {
-  truck_plate: string;
-  summary: AccountSummary;
-};
-
-type AccountSummaryResponse = {
-  overall: AccountSummary;
-  trucks: AccountTruckPlate[];
-};
-
+import {
+  getIncomeStatementLocal,
+  upsertIncomeStatementFromServer,
+  type AccountSummary,
+  type AccountSummaryResponse,
+  type AccountTruckPlate,
+  type AccountType,
+} from './offlineincomestatement/incomeStatementRepo';
 /* ─────────────────── Theme / helpers ─────────────────── */
 const BORDER = '#E5E7EB';
 const BRAND = '#0B2447';
@@ -151,7 +123,17 @@ function Dropdown({
 export default function TenantAccountsStatement() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { token } = useAuth();
+  const { token, user } = useAuth();
+
+  const [online, setOnline] = useState(true);
+
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
 
   // Mode & date controls
   const [mode, setMode] = useState<'annual'|'monthly'|'custom'>('annual');
@@ -192,24 +174,19 @@ export default function TenantAccountsStatement() {
   const [loading, setLoading] = useState(true);
 
   const fetchSummary = useCallback(async () => {
-    if (!token) return;
+    const ownerId = user?.id;
+    if (!ownerId) return;
+
     setLoading(true);
-    try {
-      const { start, end } = buildRange();
-      const params: any = { start, end };
-      if (truckPlate) params.truck_plate = truckPlate;
+    const { start, end, label } = buildRange();
 
-      const res = await api.get<AccountSummaryResponse>('/diiwaantenantsaccounts/summary', {
-        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-        params,
-      });
-
-      setSummary(res.data.overall);
-      setTrucksData(res.data.trucks || []);
+    const applyResponse = (overall: AccountSummary | null, trucks: AccountTruckPlate[]) => {
+      setSummary(overall);
+      setTrucksData(trucks || []);
 
       // Gather plates from response
       const plates = Array.from(
-        new Set((res.data.trucks || [])
+        new Set((trucks || [])
           .map(t => (t.truck_plate || '').trim())
           .filter(Boolean))
       );
@@ -231,16 +208,63 @@ export default function TenantAccountsStatement() {
       setTruckItems(items);
 
       setShotUri(null);
+    };
+
+    try {
+      const params: any = {};
+      if (start) params.start = start;
+      if (end) params.end = end;
+      if (truckPlate) params.truck_plate = truckPlate;
+
+      // ONLINE → API + cache
+      if (online && token) {
+        const res = await api.get<AccountSummaryResponse>('/diiwaantenantsaccounts/summary', {
+          headers: { Authorization: `Bearer ${token}` },
+          params,
+        });
+
+        const data = res.data;
+        applyResponse(data.overall, data.trucks || []);
+
+        upsertIncomeStatementFromServer({
+          ownerId,
+          start: start ?? null,
+          end: end ?? null,
+          truckPlate,
+          label,
+          response: data,
+        });
+      } else {
+        // OFFLINE → local snapshot
+        const local = getIncomeStatementLocal({
+          ownerId,
+          start: start ?? null,
+          end: end ?? null,
+          truckPlate,
+        });
+        applyResponse(local.overall, local.trucks);
+      }
     } catch (e: any) {
       console.error(e);
-      Alert.alert('Load failed', e?.response?.data?.detail ?? 'Unable to load tenant accounts summary.');
-      setSummary(null);
-      setTrucksData([]);
-      setTruckItems([{ label: 'All Trucks', value: '' }]);
+      // API failed → fallback to local cache
+      try {
+        const local = getIncomeStatementLocal({
+          ownerId,
+          start: start ?? null,
+          end: end ?? null,
+          truckPlate,
+        });
+        applyResponse(local.overall, local.trucks);
+      } catch (err) {
+        Alert.alert('Load failed', e?.response?.data?.detail ?? 'Unable to load tenant accounts summary.');
+        setSummary(null);
+        setTrucksData([]);
+        setTruckItems([{ label: 'All Trucks', value: '' }]);
+      }
     } finally {
       setLoading(false);
     }
-  }, [token, buildRange, truckPlate]);
+  }, [user?.id, token, online, buildRange, truckPlate]);
 
   useEffect(() => { fetchSummary(); }, [fetchSummary]);
 
@@ -382,7 +406,6 @@ export default function TenantAccountsStatement() {
 
   /* ─────────────────── Render ─────────────────── */
   if (loading) {
-    // Removed the purple/blue color override; keep a small, default spinner
     return (
       <View style={styles.loading}>
         <ActivityIndicator />
@@ -543,7 +566,6 @@ export default function TenantAccountsStatement() {
               <Text style={styles.sheetTitle}>Degso Statement</Text>
               {busyShot ? (
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                  {/* keep this a small, neutral spinner */}
                   <ActivityIndicator size="small" />
                   <Text style={styles.sheetHint}>Preparing image…</Text>
                 </View>

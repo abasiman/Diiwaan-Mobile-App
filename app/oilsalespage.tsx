@@ -1865,6 +1865,7 @@ export default function OilSalesPage() {
         visible={editOpen}
         onClose={() => setEditOpen(false)}
         token={token}
+        
         sale={selected}
         onSuccess={(updated) => {
           setEditOpen(false);
@@ -1877,6 +1878,7 @@ export default function OilSalesPage() {
         visible={reverseOpen}
         onClose={() => setReverseOpen(false)}
         token={token}
+        ownerId={user?.id ?? undefined}  
         sale={selected}
         onSuccess={async () => {
           setReverseOpen(false);
