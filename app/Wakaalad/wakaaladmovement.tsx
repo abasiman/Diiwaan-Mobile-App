@@ -1,6 +1,7 @@
 // app/app/Wakaalad/wakaaladmovement.tsx
 import { Feather } from '@expo/vector-icons';
 import DateTimePicker from '@react-native-community/datetimepicker';
+import NetInfo from '@react-native-community/netinfo';
 import dayjs from 'dayjs';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
@@ -25,6 +26,11 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 
+import {
+  getWakaaladMovementsForOwner,
+  saveWakaaladMovementsForOwner,
+} from '../wakaaladMovementoffline/wakaaladMovementScreenRepo';
+
 type OilType = 'diesel' | 'petrol' | 'kerosene' | 'jet' | 'hfo' | 'crude' | 'lube';
 type MovementType = 'restock' | 'adjustment_in' | 'adjustment_out' | 'sale';
 
@@ -41,7 +47,7 @@ type WakaaladMovementRead = {
   note?: string | null;
 
   movement_date: string; // ISO
-  created_at: string;    // ISO
+  created_at: string; // ISO
 };
 
 const COLOR_BG = '#FFFFFF';
@@ -62,18 +68,32 @@ function formatDateLocal(iso?: string | null) {
   if (!iso) return '—';
   const d = new Date(iso);
   if (isNaN(d.getTime())) return '—';
-  return new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric' }).format(d);
+  return new Intl.DateTimeFormat(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  }).format(d);
 }
 
 const WakaaladMovement: React.FC = () => {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { token } = useAuth();
+  const { token, user } = useAuth();
 
   const headers = useMemo(
     () => (token ? { Authorization: `Bearer ${token}` } : undefined),
     [token]
   );
+
+  const [online, setOnline] = useState(true);
+
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
 
   // filters
   const [search, setSearch] = useState('');
@@ -99,50 +119,114 @@ const WakaaladMovement: React.FC = () => {
       router.replace('/menu');
       return true;
     };
-    const sub = BackHandler.addEventListener('hardwareBackPress', onHardwareBackPress);
+    const sub = BackHandler.addEventListener(
+      'hardwareBackPress',
+      onHardwareBackPress
+    );
     return () => sub.remove();
   }, [router]);
 
-  const fetchMovements = useCallback(async (reset = false, atOffset?: number) => {
-
-    if (!headers || fetchingRef.current) return;
+ const fetchMovements = useCallback(
+  async (reset = false, atOffset?: number) => {
+    if (fetchingRef.current) return;
     fetchingRef.current = true;
+
+    const ownerId = user?.id ?? 0;
+    const { startDate, endDate } = dateRange;
+
     try {
       if (reset) {
         setLoading(true);
         setOffset(0);
       }
-      const currentOffset = reset ? 0 : (atOffset ?? 0);
+
+      const currentOffset = reset ? 0 : atOffset ?? 0;
+
+      // 🔹 OFFLINE or unauthenticated → use cached snapshot
+      if (!online || !token || !ownerId) {
+        console.log('[WakaaladMovement] offline or no token → using local cache only');
+
+        // don't try to paginate cache
+        if (currentOffset !== 0) {
+          setHasMore(false);
+          return;
+        }
+
+        if (!ownerId) {
+          setItems([]);
+          setHasMore(false);
+          setOffset(0);
+          return;
+        }
+
+        const local = await getWakaaladMovementsForOwner(ownerId);
+        setItems(local);
+        setHasMore(false);
+        setOffset(local.length);
+        return;
+      }
+
+      // 🔹 ONLINE → use API pagination as before, with error fallback to cache
       const params: any = {
-        start: dayjs(dateRange.startDate).toISOString(),
-        end: dayjs(dateRange.endDate).toISOString(),
+        start: dayjs(startDate).toISOString(),
+        end: dayjs(endDate).toISOString(),
         offset: currentOffset,
         limit: 100,
         order: 'date_desc',
         _ts: Date.now(),
       };
-
       if (search.trim()) params.q_name = search.trim();
 
-      const res = await api.get('/wakaalad_diiwaan/movements', { headers, params });
-      const data = res?.data;
-      const newItems: WakaaladMovementRead[] = data?.items ?? [];
-      setHasMore(!!data?.has_more);
-      setOffset(reset ? newItems.length : currentOffset + newItems.length);
-      setItems((prev) => (reset ? newItems : [...prev, ...newItems]));
+      try {
+        const res = await api.get('/wakaalad_diiwaan/movements', {
+          headers,
+          params,
+        });
 
+        const data = res?.data;
+        const newItems: WakaaladMovementRead[] = data?.items ?? [];
+
+        // pagination
+        setHasMore(!!data?.has_more);
+        setOffset(currentOffset + newItems.length);
+        setItems((prev) => (reset || currentOffset === 0 ? newItems : [...prev, ...newItems]));
+
+        // 🔹 On first page online, refresh offline cache snapshot for this owner
+        if (ownerId && currentOffset === 0) {
+          try {
+            await saveWakaaladMovementsForOwner(ownerId, newItems);
+          } catch (err) {
+            console.warn('[WakaaladMovement] failed to save offline cache', err);
+          }
+        }
+      } catch (e: any) {
+        console.warn('[WakaaladMovement] API fetch failed, falling back to cache', e);
+
+        // 🔹 Fallback to local cache on ANY error (handles cold-start-offline case)
+        if (ownerId) {
+          const local = await getWakaaladMovementsForOwner(ownerId);
+          setItems(local);
+          setHasMore(false);
+          setOffset(local.length);
+        } else {
+          setItems([]);
+          setHasMore(false);
+          setOffset(0);
+        }
+      }
     } finally {
       setLoading(false);
       fetchingRef.current = false;
     }
-  }, [headers, dateRange, search]);
+  },
+  [headers, dateRange, search, online, token, user?.id]
+);
 
 
   useEffect(() => {
-  fetchMovements(true, 0);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [headers, dateRange, search]);
-
+    fetchMovements(true, 0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [headers, dateRange, search]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -151,14 +235,13 @@ const WakaaladMovement: React.FC = () => {
   }, [fetchMovements]);
 
   const loadMore = useCallback(async () => {
-  if (hasMore && !loading && !fetchingRef.current) {
-    await fetchMovements(false, offset);
-  }
-}, [hasMore, loading, offset, fetchMovements]);
-
+    if (hasMore && !loading && !fetchingRef.current) {
+      await fetchMovements(false, offset);
+    }
+  }, [hasMore, loading, offset, fetchMovements]);
 
   const filtered = useMemo(() => {
-    // Client-side date guard (server already filters)
+    // Client-side date guard (server already filters, cache may not)
     const from = dayjs(dateRange.startDate).startOf('day').valueOf();
     const to = dayjs(dateRange.endDate).endOf('day').valueOf();
     return items.filter((it) => {
@@ -193,7 +276,8 @@ const WakaaladMovement: React.FC = () => {
             <View style={{ flex: 1, alignItems: 'center' }}>
               <Text style={styles.headerTitle}>Wakaalad Movements</Text>
               <Text style={styles.headerDate}>
-                {dayjs(dateRange.startDate).format('MMM D, YYYY')} – {dayjs(dateRange.endDate).format('MMM D, YYYY')}
+                {dayjs(dateRange.startDate).format('MMM D, YYYY')} –{' '}
+                {dayjs(dateRange.endDate).format('MMM D, YYYY')}
               </Text>
             </View>
 
@@ -229,12 +313,18 @@ const WakaaladMovement: React.FC = () => {
           />
           {!!search && (
             <TouchableOpacity
-              onPress={() => { setSearch(''); fetchMovements(true); }}
+              onPress={() => {
+                setSearch('');
+                fetchMovements(true);
+              }}
             >
               <Feather name="x-circle" size={12} color={COLOR_MUTED} />
             </TouchableOpacity>
           )}
-          <TouchableOpacity onPress={() => fetchMovements(true)} style={styles.refreshChip}>
+          <TouchableOpacity
+            onPress={() => fetchMovements(true)}
+            style={styles.refreshChip}
+          >
             <Feather name="rotate-cw" size={12} color={COLOR_ACCENT} />
             <Text style={styles.refreshChipTxt}>Reload</Text>
           </TouchableOpacity>
@@ -244,7 +334,9 @@ const WakaaladMovement: React.FC = () => {
       {/* Table */}
       <ScrollView
         contentContainerStyle={styles.scrollContent}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
+        }
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator
         onMomentumScrollEnd={loadMore}
@@ -253,7 +345,9 @@ const WakaaladMovement: React.FC = () => {
         <View style={styles.tableHeader}>
           <Text style={[styles.th, { flex: 1.2 }]}>Wakaalad</Text>
           <Text style={[styles.th, { flex: 0.9 }]}>Oil</Text>
-          <Text style={[styles.th, { width: 84, textAlign: 'right' }]}>Liters</Text>
+          <Text style={[styles.th, { width: 84, textAlign: 'right' }]}>
+            Liters
+          </Text>
         </View>
 
         {/* Rows */}
@@ -271,23 +365,40 @@ const WakaaladMovement: React.FC = () => {
             <View key={mv.id} style={styles.row}>
               {/* col 1: name + subline date */}
               <View style={{ flex: 1.2, minWidth: 0 }}>
-                <Text style={styles.name} numberOfLines={1}>{mv.wakaalad_name}</Text>
+                <Text style={styles.name} numberOfLines={1}>
+                  {mv.wakaalad_name}
+                </Text>
                 <Text style={styles.subLine} numberOfLines={1}>
-                  {formatDateLocal(mv.movement_date)} • {String(mv.movement_type || '').toUpperCase()}
+                  {formatDateLocal(mv.movement_date)} •{' '}
+                  {String(mv.movement_type || '').toUpperCase()}
                 </Text>
               </View>
 
               {/* col 2: oil type */}
-              <View style={{ flex: 0.9, minWidth: 0, alignItems: 'flex-start' }}>
+              <View
+                style={{
+                  flex: 0.9,
+                  minWidth: 0,
+                  alignItems: 'flex-start',
+                }}
+              >
                 <View style={styles.pill}>
                   <Feather name="droplet" size={10} color={COLOR_TEXT} />
-                  <Text style={styles.pillTxt}>{String(mv.oil_type || '—').toUpperCase()}</Text>
+                  <Text style={styles.pillTxt}>
+                    {String(mv.oil_type || '—').toUpperCase()}
+                  </Text>
                 </View>
               </View>
 
               {/* col 3: liters */}
               <View style={{ width: 84 }}>
-                <Text style={styles.liters} numberOfLines={1} adjustsFontSizeToFit>{formatNumber(mv.liters, 2)}</Text>
+                <Text
+                  style={styles.liters}
+                  numberOfLines={1}
+                  adjustsFontSizeToFit
+                >
+                  {formatNumber(mv.liters, 2)}
+                </Text>
               </View>
             </View>
           ))
@@ -302,7 +413,12 @@ const WakaaladMovement: React.FC = () => {
       </ScrollView>
 
       {/* Filters Modal */}
-      <Modal visible={showFilters} transparent animationType="fade" onRequestClose={() => setShowFilters(false)}>
+      <Modal
+        visible={showFilters}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowFilters(false)}
+      >
         <TouchableWithoutFeedback onPress={() => setShowFilters(false)}>
           <View style={styles.modalBackdrop}>
             <TouchableWithoutFeedback onPress={() => {}}>
@@ -317,20 +433,42 @@ const WakaaladMovement: React.FC = () => {
                 <View style={{ marginTop: 8 }}>
                   <Text style={styles.filterLabel}>Date Range</Text>
                   <View style={styles.dateRangeContainer}>
-                    <TouchableOpacity style={styles.dateBtn} onPress={() => setShowDatePicker('start')}>
-                      <Text style={styles.dateBtnText}>{dayjs(dateRange.startDate).format('MMM D, YYYY')}</Text>
-                      <Feather name="calendar" size={12} color={COLOR_ACCENT} />
+                    <TouchableOpacity
+                      style={styles.dateBtn}
+                      onPress={() => setShowDatePicker('start')}
+                    >
+                      <Text style={styles.dateBtnText}>
+                        {dayjs(dateRange.startDate).format('MMM D, YYYY')}
+                      </Text>
+                      <Feather
+                        name="calendar"
+                        size={12}
+                        color={COLOR_ACCENT}
+                      />
                     </TouchableOpacity>
                     <Text style={styles.rangeSep}>to</Text>
-                    <TouchableOpacity style={styles.dateBtn} onPress={() => setShowDatePicker('end')}>
-                      <Text style={styles.dateBtnText}>{dayjs(dateRange.endDate).format('MMM D, YYYY')}</Text>
-                      <Feather name="calendar" size={12} color={COLOR_ACCENT} />
+                    <TouchableOpacity
+                      style={styles.dateBtn}
+                      onPress={() => setShowDatePicker('end')}
+                    >
+                      <Text style={styles.dateBtnText}>
+                        {dayjs(dateRange.endDate).format('MMM D, YYYY')}
+                      </Text>
+                      <Feather
+                        name="calendar"
+                        size={12}
+                        color={COLOR_ACCENT}
+                      />
                     </TouchableOpacity>
                   </View>
 
                   {showDatePicker && (
                     <DateTimePicker
-                      value={showDatePicker === 'start' ? dateRange.startDate : dateRange.endDate}
+                      value={
+                        showDatePicker === 'start'
+                          ? dateRange.startDate
+                          : dateRange.endDate
+                      }
                       mode="date"
                       display={Platform.OS === 'ios' ? 'spinner' : 'default'}
                       onChange={(_, sel) => {
@@ -338,8 +476,16 @@ const WakaaladMovement: React.FC = () => {
                         if (!sel) return;
                         setDateRange((prev) =>
                           showDatePicker === 'start'
-                            ? { ...prev, startDate: dayjs(sel).startOf('day').toDate() }
-                            : { ...prev, endDate: dayjs(sel).endOf('day').toDate() }
+                            ? {
+                                ...prev,
+                                startDate: dayjs(sel)
+                                  .startOf('day')
+                                  .toDate(),
+                              }
+                            : {
+                                ...prev,
+                                endDate: dayjs(sel).endOf('day').toDate(),
+                              }
                         );
                       }}
                     />
@@ -393,7 +539,11 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
     elevation: 3,
   },
-  headerRowTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  headerRowTop: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
   backBtn: {
     width: 28,
     height: 28,
@@ -404,8 +554,18 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#D8E0F5',
   },
-  headerTitle: { fontSize: 15, fontWeight: '800', color: '#E0E7FF', textAlign: 'center' },
-  headerDate: { color: '#CBD5E1', fontSize: 10, marginTop: 2, textAlign: 'center' },
+  headerTitle: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: '#E0E7FF',
+    textAlign: 'center',
+  },
+  headerDate: {
+    color: '#CBD5E1',
+    fontSize: 10,
+    marginTop: 2,
+    textAlign: 'center',
+  },
   filterBtn: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -489,10 +649,20 @@ const styles = StyleSheet.create({
   },
   pillTxt: { color: COLOR_TEXT, fontSize: 10, fontWeight: '700' },
 
-  liters: { color: COLOR_TEXT, fontSize: 12, fontWeight: '900', textAlign: 'right' },
+  liters: {
+    color: COLOR_TEXT,
+    fontSize: 12,
+    fontWeight: '900',
+    textAlign: 'right',
+  },
 
   loading: { padding: 20, alignItems: 'center', justifyContent: 'center' },
-  empty: { paddingVertical: 36, alignItems: 'center', justifyContent: 'center', gap: 6 },
+  empty: {
+    paddingVertical: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+  },
   emptyText: { color: COLOR_MUTED, fontSize: 12 },
 
   // modal
@@ -511,7 +681,11 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#EBEFF5',
   },
-  modalHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  modalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
   modalTitle: { fontSize: 14, fontWeight: '900', color: COLOR_TEXT },
 
   filterLabel: {
@@ -537,7 +711,11 @@ const styles = StyleSheet.create({
   dateBtnText: { color: '#1F2937', fontSize: 11, fontWeight: '700' },
   rangeSep: { fontSize: 10, color: '#6B7280', marginHorizontal: 8 },
 
-  filterActions: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 10 },
+  filterActions: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 10,
+  },
   resetBtn: {
     flex: 1,
     padding: 9,
@@ -549,6 +727,12 @@ const styles = StyleSheet.create({
     backgroundColor: 'white',
   },
   resetTxt: { fontSize: 11, fontWeight: '800', color: '#1F2937' },
-  applyBtn: { flex: 1, padding: 9, borderRadius: 8, backgroundColor: COLOR_ACCENT, alignItems: 'center' },
+  applyBtn: {
+    flex: 1,
+    padding: 9,
+    borderRadius: 8,
+    backgroundColor: COLOR_ACCENT,
+    alignItems: 'center',
+  },
   applyTxt: { fontSize: 11, fontWeight: '800', color: 'white' },
 });

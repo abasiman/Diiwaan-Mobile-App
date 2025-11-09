@@ -6,20 +6,101 @@ import * as Updates from 'expo-updates';
 import React, { useCallback, useEffect, useLayoutEffect } from 'react';
 import { AppState, Platform, Text, View } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
+
+
+import { syncPendingPayments } from './ManageInvoice/paymentOfflineRepo';
+import { syncPendingOilReprices } from './dbform/oilRepriceOfflineRepo';
+
+import { initOilModalDb } from './OilModalOffline/oilModalDb';
+import { syncPendingOilModalForms } from './OilModalOffline/oilModalSync';
+
+import { initPaymentOfflineDb } from './ManageInvoice/paymentOfflineRepo';
+
+import { syncPendingVendorPayments } from './offlinecreatevendorpayment/vendorPaymentCreateSync';
+
+
+import { getVendorBillsWithSync } from './OilPurchaseOffline/oilpurchasevendorbillsync';
+// at top
+import { syncOilSummaryAndWakaaladStats } from './OilPurchaseOffline/oilSummaryStatsSync';
+
+import { initVendorPaymentDb } from './OilPurchaseOffline/vendorPaymentDb';
+import { getWakaaladMovementScreenWithSync } from './wakaaladMovementoffline/wakaaladMovementScreenSync';
+
+import NetInfo from '@react-native-community/netinfo';
+import { initVendorPaymentsScreenDb } from './vendorPaymentTransactionsOffline/vendorPaymentsScreenDb';
+import { getVendorPaymentsScreenWithSync } from './vendorPaymentTransactionsOffline/vendorPaymentsScreenSync';
+import { initWakaaladActionsOfflineDb } from './wakaaladActionsOffline/wakaaladActionsOfflineDb';
+import { initWakaaladMovementScreenDb } from './wakaaladMovementoffline/wakaaladMovementScreenDb';
+
 import { AuthProvider, useAuth } from '../src/context/AuthContext';
+
 import { initCustomerInvoiceDb } from './db/customerinvoicedb';
 import { initCustomerLedgerDb } from './db/customerledgerdb';
 import { initDb } from './db/db';
+import { initOilSalesPageDb } from './db/oilSalesPageDb';
+
+import { syncPendingOilSales } from './dbform/invocieoilSalesOfflineRepo';
+import { initWakaaladSellOptionsDb, syncAllWakaaladSellOptions } from './dbform/wakaaladSellOptionsRepo';
+import { syncPendingOilSaleReversals } from './dbsalereverse/oilSaleReverseOfflineRepo';
+
+import { initOilSellOptionsDb } from './WakaaladOffline/oilSellOptionsRepo';
+import { syncAllOilSellOptions } from './WakaaladOffline/oilSellOptionsSync';
+import { initWakaaladDb } from './WakaaladOffline/wakaaladOfflineDb';
+import { syncWakaaladFromServer } from './WakaaladOffline/wakaaladSync';
+
+import { initWakaaladFormDb } from './wakaaladformoffline/wakaaladFormDb';
+import { syncPendingWakaaladForms } from './wakaaladformoffline/wakaaladFormSync';
+
+import { syncAllOilSales } from './db/oilSalesPageSync';
+
+// 🔹 NEW: offline extra-costs cache + create-queue
+import { initExtraCostsDb } from './ExtraCostsOffline/extraCostsDb';
+
+import { syncAllExtraCosts } from './ExtraCostsOffline/extraCostsSync';
+import { initExtraCostCreateDb } from './FormExtraCostsOffline/extraCostCreateDb';
+import { syncPendingWakaaladActions } from './wakaaladActionsOffline/wakaaladActionsSync';
+
+
+import { syncPendingOilExtraCosts } from './FormExtraCostsOffline/extraCostCreateSync';
 
 const BRAND_BLUE = '#0B2447';
 
 export default function RootLayout() {
-
-   React.useEffect(() => {
+  useEffect(() => {
+    // DB schemas – runs once on app start
     initDb();
     initCustomerInvoiceDb();
-     initCustomerLedgerDb();
+    initCustomerLedgerDb();
+    initOilSalesPageDb();
+    
+    // 🔹 NEW: vendor payments screen cache
+    initVendorPaymentsScreenDb();
+
+    initWakaaladSellOptionsDb();
+    initWakaaladDb(); // wakaalad offline table
+    initOilSellOptionsDb();
+    initWakaaladFormDb();
+
+
+     // 🔹 wakaalad movements screen cache
+  initWakaaladMovementScreenDb();
+
+     // 🔹 NEW: oil create offline queue
+    initOilModalDb();
+
+
+   
+
+    initVendorPaymentDb();
+    // 🔹 NEW: extra-costs offline tables
+    initExtraCostsDb();        // cache used by ExtraCostsPage
+    initExtraCostCreateDb();   // queue for offline-created extra-costs
+
+
+     initWakaaladActionsOfflineDb();
+     initPaymentOfflineDb();
   }, []);
+
   return (
     <SafeAreaProvider>
       <StatusBar backgroundColor={BRAND_BLUE} style="light" translucent={false} />
@@ -28,11 +109,157 @@ export default function RootLayout() {
       <BottomInsetTint color={BRAND_BLUE} />
       <AuthProvider>
         <OTAUpdates />
+        <GlobalSync />          {/* full pull/push once after login */}
+        <OfflineOilSaleSync />  {/* pending queue sync on connectivity */}
         <GuardedNavigator />
       </AuthProvider>
     </SafeAreaProvider>
   );
 }
+
+/* ----------------------------- Global sync (once per login + online) ----------------------------- */
+function GlobalSync() {
+  const { token, user } = useAuth();
+  const [online, setOnline] = React.useState(true);
+  const syncingRef = React.useRef(false);
+
+  // track connectivity
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
+
+ useEffect(() => {
+  if (!token || !user?.id || !online) return;
+  if (syncingRef.current) return;
+  syncingRef.current = true;
+
+  (async () => {
+    try {
+      const ownerId = user.id;
+      const now = new Date();
+      const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+
+      // 🔹 0) FIRST: push any offline oilmodal forms
+      await syncPendingOilModalForms(ownerId, token);
+
+      // 1) offline-created invoice oil sales
+      await syncPendingOilSales(token, ownerId);
+
+
+        // 1a) offline reprices
+      await syncPendingOilReprices(token, ownerId);
+
+      // 1b) extra-costs
+      await syncPendingOilExtraCosts(token, ownerId);
+
+
+       await syncPendingPayments(token, ownerId);
+
+      // 2) reversals
+      await syncPendingOilSaleReversals(token, ownerId);
+
+      // 2a) vendor payments list
+      await getVendorPaymentsScreenWithSync({
+        token,
+        ownerId,
+        force: true,
+        fromDate: ninetyDaysAgo.toISOString(),
+        toDate: now.toISOString(),
+      });
+
+      await syncPendingWakaaladActions(token, ownerId);
+      await syncPendingWakaaladForms(ownerId, token);
+
+      // 3) oil sales & options
+      await syncAllOilSales(ownerId, token);
+      await syncAllWakaaladSellOptions(ownerId, token);
+      await syncAllOilSellOptions(ownerId, token);
+
+      await getWakaaladMovementScreenWithSync({
+        token,
+        ownerId,
+        force: true,
+        fromDate: ninetyDaysAgo.toISOString(),
+        toDate: now.toISOString(),
+      });
+
+      // 🔹 now that oils are synced, vendor bills make sense
+      await getVendorBillsWithSync({
+        token,
+        ownerId,
+        force: true,
+      });
+
+      await syncAllExtraCosts(ownerId, token);
+      await syncPendingVendorPayments(token, ownerId);
+      await syncOilSummaryAndWakaaladStats(token, ownerId);
+      await syncWakaaladFromServer({ token, ownerId, startDate: ninetyDaysAgo, endDate: now });
+    } catch (e) {
+      console.warn('Global sync failed', e);
+    } finally {
+      syncingRef.current = false;
+    }
+  })();
+}, [token, user?.id, online]);
+
+
+  return null;
+}
+
+/* ----------------------------- Global offline queue sync on connectivity ----------------------------- */
+function OfflineOilSaleSync() {
+  const { token, user } = useAuth();
+  const [online, setOnline] = React.useState(true);
+
+  // track connectivity
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
+
+  // whenever we are online + authenticated → push pending queues
+  useEffect(() => {
+    if (!online || !token || !user?.id) return;
+
+    // invoice oil sales
+    /* syncPendingOilSales(token, user.id).catch((e) =>
+      console.warn('syncPendingOilSales failed', e)
+    ); */
+
+
+     // 🔹 NEW: offline reprices
+    syncPendingOilReprices(token, user.id).catch((e) =>
+      console.warn('syncPendingOilReprices failed', e)
+    );
+
+    // 🔹 extra-costs create queue
+    syncPendingOilExtraCosts(token, user.id).catch((e) =>
+      console.warn('syncPendingOilExtraCosts failed', e)
+    );
+
+    // 🔹 NEW: oil create modal forms (single / both)
+    syncPendingOilModalForms(user.id, token).catch((e) =>
+      console.warn('syncPendingOilModalForms failed', e)
+    );
+
+
+
+     // 💳 NEW: payments queue
+    syncPendingPayments(token, user.id).catch((e) =>
+      console.warn('syncPendingPayments failed', e)
+    );
+  }, [online, token, user?.id]);
+
+  return null;
+}
+
 
 /* ----------------------------- Inset tints ----------------------------- */
 function TopInsetTint({ color }: { color: string }) {
@@ -73,16 +300,9 @@ function BottomInsetTint({ color }: { color: string }) {
 }
 
 /* ----------------------------- OTA updates ----------------------------- */
-/**
- * Silent background-ish updates:
- *  - Checks once when the app loads (production only).
- *  - If an update is available, downloads it quietly.
- *  - Does NOT reload the app; update applies on next cold start.
- *  - No AppState listener → less chance of "battery draining in background".
- */
 function OTAUpdates() {
   useEffect(() => {
-    if (__DEV__) return; // skip OTA checks in dev
+    if (__DEV__) return;
 
     let cancelled = false;
 
@@ -90,10 +310,10 @@ function OTAUpdates() {
       try {
         const res = await Updates.checkForUpdateAsync();
         if (!cancelled && res.isAvailable) {
-          await Updates.fetchUpdateAsync(); // no reload here; apply next launch
+          await Updates.fetchUpdateAsync();
         }
       } catch {
-        // ignore network/update errors
+        // ignore
       }
     })();
 
@@ -143,7 +363,6 @@ class Boundary extends React.Component<{ children: React.ReactNode }, { err?: an
     return { err };
   }
   componentDidCatch(error: any, info: any) {
-    // This prints the component stack to Metro to help locate bad renderers (e.g., bare strings)
     console.error('Render error componentStack:\n', info?.componentStack);
   }
   render() {
@@ -169,10 +388,6 @@ function GuardedNavigator() {
 
   return (
     <Boundary>
-      {/* For debugging a crashing first route, you can force one:
-         <Slot initialRouteName="/(auth)/login" />
-         <Slot initialRouteName="/(tabs)/customerslist" />
-      */}
       <Slot />
     </Boundary>
   );

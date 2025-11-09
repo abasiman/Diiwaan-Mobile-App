@@ -1,7 +1,9 @@
+// app/Wakaladmodels/createwakaladmodal.tsx
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 import { Feather } from '@expo/vector-icons';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import NetInfo from '@react-native-community/netinfo';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Animated,
@@ -21,6 +23,16 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import OilExtraCostModal from '../Shidaal/oilExtraCostModal';
 
+// local sell-options repo
+import {
+  applyOilSellOptionStockDelta,
+  getOilSellOptionsLocal,
+  upsertOilSellOptionsFromServer,
+} from '../WakaaladOffline/oilSellOptionsRepo';
+
+import { queueWakaaladFormForSync } from '../wakaaladformoffline/wakaaladFormRepo';
+import { insertLocalWakaaladFromForm } from '../WakaaladOffline/wakaaladRepo';
+
 const COLOR_BG = '#FFFFFF';
 const COLOR_TEXT = '#0B1221';
 const COLOR_SUB = '#475569';
@@ -38,7 +50,8 @@ const CAAG_L = 20;
 const fuustoCap = (oilType?: string) =>
   (oilType || '').toLowerCase() === 'petrol' ? 240 : FUUSTO_DEFAULT_L;
 
-/** Types */
+/* ----------------------------- Types ----------------------------- */
+
 type OilSellOption = {
   id: number;
   oil_id: number;
@@ -63,35 +76,66 @@ type WakaaladCreatePayload = {
 
 type Props = { visible: boolean; onClose: () => void; onCreated?: (id: number) => void };
 
-/** Toast */
+/* ----------------------------- Toast hook ----------------------------- */
+
 function useToast() {
   const [message, setMessage] = useState<string | null>(null);
   const anim = useRef(new Animated.Value(0)).current;
-  const show = (msg: string, duration = 1800) => {
-    setMessage(msg);
-    Animated.timing(anim, { toValue: 1, duration: 180, useNativeDriver: true }).start(() => {
-      setTimeout(() => {
-        Animated.timing(anim, { toValue: 0, duration: 160, useNativeDriver: true }).start(() => setMessage(null));
-      }, duration);
-    });
-  };
-  const ToastView = () =>
-    message ? (
-      <Animated.View
-        pointerEvents="none"
-        style={[
-          styles.toast,
-          { opacity: anim, transform: [{ translateY: anim.interpolate({ inputRange: [0, 1], outputRange: [12, 0] }) }] },
-        ]}
-      >
-        <Feather name="check-circle" size={16} color="#065F46" />
-        <Text style={styles.toastText}>{message}</Text>
-      </Animated.View>
-    ) : null;
+
+  const show = useCallback(
+    (msg: string, duration = 1800) => {
+      setMessage(msg);
+      Animated.timing(anim, {
+        toValue: 1,
+        duration: 180,
+        useNativeDriver: true,
+        easing: Easing.out(Easing.cubic),
+      }).start(() => {
+        setTimeout(() => {
+          Animated.timing(anim, {
+            toValue: 0,
+            duration: 160,
+            useNativeDriver: true,
+            easing: Easing.in(Easing.cubic),
+          }).start(() => setMessage(null));
+        }, duration);
+      });
+    },
+    [anim]
+  );
+
+  const ToastView = useCallback(
+    () =>
+      message ? (
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.toast,
+            {
+              opacity: anim,
+              transform: [
+                {
+                  translateY: anim.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: [12, 0],
+                  }),
+                },
+              ],
+            },
+          ]}
+        >
+          <Feather name="check-circle" size={16} color="#065F46" />
+          <Text style={styles.toastText}>{message}</Text>
+        </Animated.View>
+      ) : null,
+    [anim, message]
+  );
+
   return { show, ToastView };
 }
 
-/** Floating Input & Picker */
+/* ----------------------------- Floating input & picker ----------------------------- */
+
 function FloatingInput({
   label,
   value,
@@ -151,10 +195,19 @@ function PickerField({
   const hasValue = !!value;
   return (
     <View style={[{ marginBottom: 20 }, style]}>
-      <View style={[styles.floatWrap, { borderColor: DARK_BORDER, backgroundColor: COLOR_INPUT_BG }]}>
-        <Text style={[styles.floatLabel, (hasValue ? true : false) && styles.floatLabelActive]}>{label}</Text>
-        <TouchableOpacity activeOpacity={0.9} onPress={onPress} style={[styles.inputBase, styles.inputPadded]}>
-          <Text numberOfLines={1} style={[styles.inputText, { color: hasValue ? COLOR_TEXT : COLOR_PLACEHOLDER }]}>
+      <View
+        style={[styles.floatWrap, { borderColor: DARK_BORDER, backgroundColor: COLOR_INPUT_BG }]}
+      >
+        <Text style={[styles.floatLabel, hasValue && styles.floatLabelActive]}>{label}</Text>
+        <TouchableOpacity
+          activeOpacity={0.9}
+          onPress={onPress}
+          style={[styles.inputBase, styles.inputPadded]}
+        >
+          <Text
+            numberOfLines={1}
+            style={[styles.inputText, { color: hasValue ? COLOR_TEXT : COLOR_PLACEHOLDER }]}
+          >
             {hasValue ? value : 'Select'}
           </Text>
           <Feather name="chevron-down" size={18} color={COLOR_TEXT} />
@@ -164,10 +217,13 @@ function PickerField({
   );
 }
 
-/** Component */
+/* ----------------------------- Component ----------------------------- */
+
 export default function CreateWakaaladModal({ visible, onClose, onCreated }: Props) {
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const { show: showToast, ToastView } = useToast();
+
+  const [online, setOnline] = useState(true);
 
   const insets = useSafeAreaInsets();
   const bottomSafe = insets.bottom || 0;
@@ -175,13 +231,33 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
   const SHEET_H = Math.round(SCREEN_H * 0.96);
   const slideY = useRef(new Animated.Value(SHEET_H)).current;
 
+  // bottom sheet slide animation – only depends on `visible`
   useEffect(() => {
     if (visible) {
-      Animated.timing(slideY, { toValue: 0, duration: 260, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
+      Animated.timing(slideY, {
+        toValue: 0,
+        duration: 260,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
     } else {
-      slideY.setValue(SHEET_H);
+      Animated.timing(slideY, {
+        toValue: SHEET_H,
+        duration: 200,
+        easing: Easing.in(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
     }
   }, [visible, SHEET_H, slideY]);
+
+  // connectivity
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
 
   // data
   const [loadingOptions, setLoadingOptions] = useState(false);
@@ -190,7 +266,10 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
   const [oilQuery, setOilQuery] = useState('');
 
   const [selectedId, setSelectedId] = useState<number | null>(null);
-  const selected = useMemo(() => options.find((o) => o.id === selectedId) || null, [options, selectedId]);
+  const selected = useMemo(
+    () => options.find((o) => o.id === selectedId) || null,
+    [options, selectedId]
+  );
 
   const [wkName, setWkName] = useState('');
   const [allocAmt, setAllocAmt] = useState('');
@@ -201,40 +280,86 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
   const [creating, setCreating] = useState(false);
   const [showExtraCosts, setShowExtraCosts] = useState(false);
 
-  // Decoupled IDs for extras (so we can clear form without unmounting modal)
+  // Decoupled IDs for extras
   const [extraOilId, setExtraOilId] = useState<number | undefined>(undefined);
   const [extraLotId, setExtraLotId] = useState<number | undefined>(undefined);
 
-  // Prefills for OilExtraCostModal (persist even if form resets)
+  // Prefills for OilExtraCostModal
   const [extraPrefillName, setExtraPrefillName] = useState<string | null>(null);
   const [extraPrefillQty, setExtraPrefillQty] = useState<number | null>(null);
 
-  // fetch options
+  // guard so we don't re-run remote fetch in a tight loop
+  const loadingRef = useRef(false);
+
+  // OFFLINE-FIRST sell-options loader
   useEffect(() => {
-    if (!visible) return;
-    let mounted = true;
-    (async () => {
+    if (!visible || !user?.id) return;
+    if (loadingRef.current) return;
+
+    let cancelled = false;
+    loadingRef.current = true;
+
+    const load = async () => {
       try {
         setLoadingOptions(true);
-        const res = await api.get<OilSellOption[]>('/diiwaanoil/sell-options', {
-          headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-          params: { only_available: true, order: 'created_desc' },
-        });
-        if (!mounted) return;
-        setOptions(res.data || []);
-      } catch (e: any) {
-        showToast(String(e?.response?.data?.detail || 'Failed to load oil lots'));
+
+        // refresh cache when online
+        if (online && token) {
+          try {
+            const res = await api.get<OilSellOption[]>('/diiwaanoil/sell-options', {
+              headers: { Authorization: `Bearer ${token}` },
+              params: { only_available: true, order: 'created_desc' },
+            });
+            if (!cancelled) {
+              const list = Array.isArray(res.data) ? res.data : [];
+              if (list.length) {
+                upsertOilSellOptionsFromServer(list, user.id);
+              }
+            }
+          } catch (e: any) {
+            console.warn(
+              'Remote /diiwaanoil/sell-options failed, falling back to local',
+              e?.response?.data || e?.message || e
+            );
+          }
+        }
+
+        if (cancelled) return;
+
+        // always read local snapshot
+        try {
+          const localOpts = getOilSellOptionsLocal(user.id, {
+            onlyAvailable: true,
+            limit: 200,
+          });
+          if (!cancelled) setOptions(localOpts);
+        } catch (e: any) {
+          if (!cancelled) {
+            console.warn('Local oil sell-options load failed', e?.message || e);
+            showToast(String(e?.message || 'Failed to load oil lots'));
+          }
+        }
       } finally {
-        if (mounted) setLoadingOptions(false);
+        if (!cancelled) {
+          setLoadingOptions(false);
+          loadingRef.current = false;
+        }
       }
-    })();
-    return () => { mounted = false; };
-  }, [visible, token]);
+    };
+
+    load();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [visible, user?.id, online, token, showToast]);
 
   const toDecimal = (s: string) => {
     let out = s.replace(/[^0-9.]/g, '');
     const firstDot = out.indexOf('.');
-    if (firstDot !== -1) out = out.slice(0, firstDot + 1) + out.slice(firstDot + 1).replace(/\./g, '');
+    if (firstDot !== -1) {
+      out = out.slice(0, firstDot + 1) + out.slice(firstDot + 1).replace(/\./g, '');
+    }
     return out;
   };
 
@@ -280,15 +405,18 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
     return Math.floor((count * CAAG_L) / fCap);
   }, [allocAmt, unit, selected?.oil_type, allocLiters]);
 
-  /** Create wakaalad, then TRIGGER OilExtraCostModal (keep this modal open) */
   async function handleSaveOpenExtras() {
     if (!selected || !canSubmit || creating) return;
+
+    if (!user?.id) {
+      showToast('Missing user – cannot save wakaalad');
+      return;
+    }
 
     const prefillName = `${wkName.trim()} - wakaalad`;
     const prefillQty = qtyBarrels;
 
-    // capture IDs for the extras modal BEFORE clearing form state
-    const oilIdForExtras = selected.lot_id ? undefined : (selected.oil_id ?? selected.id);
+    const oilIdForExtras = selected.lot_id ? undefined : selected.oil_id ?? selected.id;
     const lotIdForExtras = selected.lot_id ?? undefined;
 
     const payload: WakaaladCreatePayload = {
@@ -300,23 +428,55 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
     try {
       setCreating(true);
 
-      const res = await api.post('/wakaalad_diiwaan', payload, {
-        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-      });
+      let wakaaladId: number | null = null;
 
-      onCreated?.(Number(res?.data?.id || 0));
-      showToast('Wakaalad saved');
+      if (online && token) {
+        // 🟢 ONLINE → direct API
+        const res = await api.post('/wakaalad_diiwaan', payload, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        wakaaladId = Number(res?.data?.id || 0) || null;
+        showToast('Wakaalad saved');
+      } else {
+        // 🔴 OFFLINE → queue for sync + create local shadow wakaalad in offline DB
+        await queueWakaaladFormForSync(user.id, payload);
 
-      // prime the extras modal
+        const localWakaaladId = await insertLocalWakaaladFromForm({
+          ownerId: user.id,
+          oil_id: payload.oil_id,
+          oil_type: selected.oil_type,
+          wakaalad_name: payload.wakaalad_name,
+          allocate_liters: payload.allocate_liters,
+          date: new Date(),
+        });
+
+        wakaaladId = localWakaaladId;
+        showToast('Wakaalad saved offline – will sync when online');
+      }
+
+      onCreated?.(wakaaladId ?? 0);
+
+      // update local sell-options stock (both online & offline)
+      try {
+        applyOilSellOptionStockDelta(user.id, selected.oil_id ?? selected.id, -allocLiters);
+        const refreshed = getOilSellOptionsLocal(user.id, {
+          onlyAvailable: true,
+          limit: 200,
+        });
+        setOptions(refreshed);
+      } catch (e: any) {
+        console.warn('Failed to update local sell-options stock', e?.message || e);
+      }
+
+      // prime extras modal
       setExtraOilId(oilIdForExtras);
       setExtraLotId(lotIdForExtras);
       setExtraPrefillName(prefillName);
       setExtraPrefillQty(prefillQty);
 
-      // open extras immediately
       setShowExtraCosts(true);
 
-      // reset inputs for next entry (safe because extras modal is now decoupled from `selected`)
+      // reset form
       setSelectedId(null);
       setWkName('');
       setAllocAmt('');
@@ -329,117 +489,156 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
   }
 
   const handleCloseAll = () => {
-    if (showExtraCosts) return; // block dismiss while extra modal is up
+    if (showExtraCosts) return;
     setOilPickerOpen(false);
     setUnitPickerOpen(false);
     onClose();
   };
 
+  /* ----------------------------- Render ----------------------------- */
+
   return (
     <>
+      {/* Bottom sheet modal */}
       <Modal visible={visible} animationType="none" onRequestClose={handleCloseAll} transparent>
-        <TouchableWithoutFeedback onPress={handleCloseAll}>
-          <View style={styles.backdrop} />
-        </TouchableWithoutFeedback>
+        <View style={styles.backdropOuter}>
+          <TouchableWithoutFeedback onPress={handleCloseAll}>
+            <View style={styles.backdrop} />
+          </TouchableWithoutFeedback>
 
-        <Animated.View style={[styles.sheetWrapAbs, { height: SHEET_H, transform: [{ translateY: slideY }] }]}>
-          <KeyboardAvoidingView
-            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-            keyboardVerticalOffset={Platform.OS === 'ios' ? 40 : 0}
-            style={{ flex: 1 }}
+          <Animated.View
+            style={[styles.sheetWrapAbs, { height: SHEET_H, transform: [{ translateY: slideY }] }]}
           >
-            <View style={[styles.sheetCard, { paddingBottom: Math.max(18, bottomSafe) }]}>
-              <View style={styles.sheetHandle} />
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+              keyboardVerticalOffset={Platform.OS === 'ios' ? 40 : 0}
+              style={{ flex: 1 }}
+            >
+              <View style={[styles.sheetCard, { paddingBottom: Math.max(18, bottomSafe) }]}>
+                <View style={styles.sheetHandle} />
 
-              {/* Header */}
-              <View style={styles.headerRow}>
-                <Text style={styles.titleCenter}>Save Wakaalad</Text>
-                <TouchableOpacity
-                  onPress={handleCloseAll}
-                  disabled={showExtraCosts}
-                  style={[styles.closeBtn, showExtraCosts && { opacity: 0.4 }]}
-                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                >
-                  <Feather name="x" size={20} color={COLOR_TEXT} />
-                </TouchableOpacity>
-              </View>
-
-              {/* Content */}
-              <ScrollView
-                keyboardShouldPersistTaps="handled"
-                contentContainerStyle={{ paddingTop: 16, paddingBottom: 24 }}
-                showsVerticalScrollIndicator={false}
-              >
-                <PickerField
-                  label="Dooro Gaariga Shidaalka"
-                  value={selected ? `${(selected.oil_type || '').toUpperCase()} • ${selected.truck_plate || '—'}` : undefined}
-                  onPress={() => {
-                    setOilQuery('');
-                    setOilPickerOpen(true);
-                  }}
-                  style={{ marginTop: 14 }}
-                />
-
-                <View style={{ flexDirection: 'row', gap: 16, marginBottom: 20 }}>
-                  <FloatingInput
-                    label="Wakaalad name"
-                    value={wkName}
-                    onChangeText={setWkName}
-                    placeholder="magaca wakaalada"
-                    style={{ flex: 1, marginBottom: 0 }}
-                  />
-                  <View style={{ flex: 1 }}>
-                    <View style={[styles.floatWrap, { borderColor: DARK_BORDER, backgroundColor: COLOR_INPUT_BG }]}>
-                      <Text style={[styles.floatLabel, styles.floatLabelActive]}>Qoondada</Text>
-                      <TouchableOpacity style={[styles.inputBase, styles.inputPadded]} onPress={() => setUnitPickerOpen(true)} activeOpacity={0.9}>
-                        <Text style={styles.inputText}>{unit === 'fuusto' ? 'Fuusto' : unit === 'caag' ? 'Caag' : 'Litir'}</Text>
-                        <Feather name="chevron-down" size={18} color={COLOR_TEXT} />
-                      </TouchableOpacity>
-                    </View>
-                  </View>
+                {/* Header */}
+                <View style={styles.headerRow}>
+                  <Text style={styles.titleCenter}>Save Wakaalad</Text>
+                  <TouchableOpacity
+                    onPress={handleCloseAll}
+                    disabled={showExtraCosts}
+                    style={[styles.closeBtn, showExtraCosts && { opacity: 0.4 }]}
+                    hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                  >
+                    <Feather name="x" size={20} color={COLOR_TEXT} />
+                  </TouchableOpacity>
                 </View>
 
-                <FloatingInput
-                  label={`Tirada (${unit === 'liters' ? 'litir' : unit})`}
-                  value={allocAmt}
-                  onChangeText={(t) => setAllocAmt(toDecimal(t))}
-                  keyboardType="decimal-pad"
-                />
-
-                {selected && allocLiters > 0 && exceeds && (
-                  <View style={styles.inlineWarning}>
-                    <Feather name="alert-triangle" size={14} color="#92400E" />
-                    <Text style={styles.inlineWarningText}>
-                      {`Requested ${unit === 'liters' ? `${allocLiters.toFixed(2)} L` : `${Number(allocAmt || 0)} ${unit}`} exceeds available ${
-                        unit === 'liters' ? `${Number(selected.in_stock_l || 0).toFixed(2)} L` : `${Math.floor(availableInUnit)} ${unit}`
-                      }.`}
-                    </Text>
-                  </View>
-                )}
-
-                <TouchableOpacity
-                  style={[styles.submitBtn, (!canSubmit || creating) && { opacity: 0.7 }]}
-                  disabled={!canSubmit || creating}
-                  onPress={handleSaveOpenExtras}
-                  activeOpacity={0.9}
+                {/* Content */}
+                <ScrollView
+                  keyboardShouldPersistTaps="handled"
+                  contentContainerStyle={{ paddingTop: 16, paddingBottom: 24 }}
+                  showsVerticalScrollIndicator={false}
                 >
-                  {creating ? (
-                    <ActivityIndicator color="#fff" style={{ marginRight: 6 }} />
-                  ) : (
-                    <Feather name="save" size={16} color="#fff" style={{ marginRight: 6 }} />
-                  )}
-                  <Text style={styles.submitText}>Save Wakaalad</Text>
-                </TouchableOpacity>
-              </ScrollView>
-            </View>
-          </KeyboardAvoidingView>
+                  <PickerField
+                    label="Dooro Gaariga Shidaalka"
+                    value={
+                      selected
+                        ? `${(selected.oil_type || '').toUpperCase()} • ${
+                            selected.truck_plate || '—'
+                          }`
+                        : undefined
+                    }
+                    onPress={() => {
+                      setOilQuery('');
+                      setOilPickerOpen(true);
+                    }}
+                    style={{ marginTop: 14 }}
+                  />
 
-          <ToastView />
-        </Animated.View>
+                  <View style={{ flexDirection: 'row', gap: 16, marginBottom: 20 }}>
+                    <FloatingInput
+                      label="Wakaalad name"
+                      value={wkName}
+                      onChangeText={setWkName}
+                      placeholder="magaca wakaalada"
+                      style={{ flex: 1, marginBottom: 0 }}
+                    />
+                    <View style={{ flex: 1 }}>
+                      <View
+                        style={[
+                          styles.floatWrap,
+                          { borderColor: DARK_BORDER, backgroundColor: COLOR_INPUT_BG },
+                        ]}
+                      >
+                        <Text style={[styles.floatLabel, styles.floatLabelActive]}>Qoondada</Text>
+                        <TouchableOpacity
+                          style={[styles.inputBase, styles.inputPadded]}
+                          onPress={() => setUnitPickerOpen(true)}
+                          activeOpacity={0.9}
+                        >
+                          <Text style={styles.inputText}>
+                            {unit === 'fuusto'
+                              ? 'Fuusto'
+                              : unit === 'caag'
+                              ? 'Caag'
+                              : 'Litir'}
+                          </Text>
+                          <Feather name="chevron-down" size={18} color={COLOR_TEXT} />
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                  </View>
+
+                  <FloatingInput
+                    label={`Tirada (${unit === 'liters' ? 'litir' : unit})`}
+                    value={allocAmt}
+                    onChangeText={(t) => setAllocAmt(toDecimal(t))}
+                    keyboardType="decimal-pad"
+                  />
+
+                  {selected && allocLiters > 0 && exceeds && (
+                    <View style={styles.inlineWarning}>
+                      <Feather name="alert-triangle" size={14} color="#92400E" />
+                      <Text style={styles.inlineWarningText}>
+                        {`Requested ${
+                          unit === 'liters'
+                            ? `${allocLiters.toFixed(2)} L`
+                            : `${Number(allocAmt || 0)} ${unit}`
+                        } exceeds available ${
+                          unit === 'liters'
+                            ? `${Number(selected.in_stock_l || 0).toFixed(2)} L`
+                            : `${Math.floor(availableInUnit)} ${unit}`
+                        }.`}
+                      </Text>
+                    </View>
+                  )}
+
+                  <TouchableOpacity
+                    style={[styles.submitBtn, (!canSubmit || creating) && { opacity: 0.7 }]}
+                    disabled={!canSubmit || creating}
+                    onPress={handleSaveOpenExtras}
+                    activeOpacity={0.9}
+                  >
+                    {creating ? (
+                      <ActivityIndicator color="#fff" style={{ marginRight: 6 }} />
+                    ) : (
+                      <Feather name="save" size={16} color="#fff" style={{ marginRight: 6 }} />
+                    )}
+                    <Text style={styles.submitText}>Save Wakaalad</Text>
+                  </TouchableOpacity>
+                </ScrollView>
+              </View>
+            </KeyboardAvoidingView>
+
+            <ToastView />
+          </Animated.View>
+        </View>
       </Modal>
 
       {/* Oil Lot Popup - Centered */}
-      <Modal visible={oilPickerOpen} transparent animationType="fade" onRequestClose={() => setOilPickerOpen(false)}>
+      <Modal
+        visible={oilPickerOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setOilPickerOpen(false)}
+      >
         <TouchableWithoutFeedback onPress={() => setOilPickerOpen(false)}>
           <View style={styles.backdrop} />
         </TouchableWithoutFeedback>
@@ -453,7 +652,13 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
               </TouchableOpacity>
             </View>
 
-            <View style={{ paddingHorizontal: 12, paddingBottom: 10, marginTop: 8 }}>
+            <View
+              style={{
+                paddingHorizontal: 12,
+                paddingBottom: 10,
+                marginTop: 8,
+              }}
+            >
               <TextInput
                 placeholder="Search oil or plate…"
                 placeholderTextColor={COLOR_PLACEHOLDER}
@@ -483,8 +688,12 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
                     }}
                     activeOpacity={0.9}
                   >
-                    <Text style={styles.pickerMain}>{(o.oil_type || '').toUpperCase()} • {o.truck_plate || '—'}</Text>
-                    <Text style={styles.pickerSub}>Stock: {Number(o.in_stock_l || 0).toFixed(2)} L</Text>
+                    <Text style={styles.pickerMain}>
+                      {(o.oil_type || '').toUpperCase()} • {o.truck_plate || '—'}
+                    </Text>
+                    <Text style={styles.pickerSub}>
+                      Stock: {Number(o.in_stock_l || 0).toFixed(2)} L
+                    </Text>
                   </TouchableOpacity>
                 ))}
               </ScrollView>
@@ -494,7 +703,12 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
       </Modal>
 
       {/* Unit Popup - Centered */}
-      <Modal visible={unitPickerOpen} transparent animationType="fade" onRequestClose={() => setUnitPickerOpen(false)}>
+      <Modal
+        visible={unitPickerOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setUnitPickerOpen(false)}
+      >
         <TouchableWithoutFeedback onPress={() => setUnitPickerOpen(false)}>
           <View style={styles.backdrop} />
         </TouchableWithoutFeedback>
@@ -510,27 +724,55 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
 
             <View style={{ height: 6 }} />
 
-            <TouchableOpacity style={styles.optionRowSm} onPress={() => { setUnit('fuusto'); setUnitPickerOpen(false); }}>
+            <TouchableOpacity
+              style={styles.optionRowSm}
+              onPress={() => {
+                setUnit('fuusto');
+                setUnitPickerOpen(false);
+              }}
+            >
               <Text style={styles.pickerMain}>Fuusto (×{fuustoCap(selected?.oil_type)} L)</Text>
               {selected ? (
-                <Text style={styles.pickerSub}>Available: {Math.floor(Number(selected.in_stock_fuusto || 0))} fuusto</Text>
+                <Text style={styles.pickerSub}>
+                  Available: {Math.floor(Number(selected.in_stock_fuusto || 0))} fuusto
+                </Text>
               ) : null}
             </TouchableOpacity>
 
-            <TouchableOpacity style={styles.optionRowSm} onPress={() => { setUnit('caag'); setUnitPickerOpen(false); }}>
+            <TouchableOpacity
+              style={styles.optionRowSm}
+              onPress={() => {
+                setUnit('caag');
+                setUnitPickerOpen(false);
+              }}
+            >
               <Text style={styles.pickerMain}>Caag (×{CAAG_L} L)</Text>
-              {selected ? <Text style={styles.pickerSub}>Available: {Math.floor(Number(selected.in_stock_caag || 0))} caag</Text> : null}
+              {selected ? (
+                <Text style={styles.pickerSub}>
+                  Available: {Math.floor(Number(selected.in_stock_caag || 0))} caag
+                </Text>
+              ) : null}
             </TouchableOpacity>
 
-            <TouchableOpacity style={[styles.optionRowSm, { borderBottomWidth: 0 }]} onPress={() => { setUnit('liters'); setUnitPickerOpen(false); }}>
+            <TouchableOpacity
+              style={[styles.optionRowSm, { borderBottomWidth: 0 }]}
+              onPress={() => {
+                setUnit('liters');
+                setUnitPickerOpen(false);
+              }}
+            >
               <Text style={styles.pickerMain}>Litir</Text>
-              {selected ? <Text style={styles.pickerSub}>Available: {Number(selected.in_stock_l || 0).toFixed(2)} L</Text> : null}
+              {selected ? (
+                <Text style={styles.pickerSub}>
+                  Available: {Number(selected.in_stock_l || 0).toFixed(2)} L
+                </Text>
+              ) : null}
             </TouchableOpacity>
           </View>
         </View>
       </Modal>
 
-      {/* Extra Costs Modal (triggered right after creation; parent stays open) */}
+      {/* Extra Costs Modal */}
       <OilExtraCostModal
         visible={showExtraCosts}
         onClose={() => setShowExtraCosts(false)}
@@ -538,13 +780,18 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
         lotId={extraLotId}
         defaultCategoryName={extraPrefillName ?? `${wkName.trim()} - wakaalad`}
         defaultQtyBarrel={extraPrefillQty ?? 0}
-        // Do NOT auto-close the parent; let caller decide after finishing extra costs.
       />
     </>
   );
 }
 
+/* ----------------------------- Styles ----------------------------- */
+
 const styles = StyleSheet.create({
+  backdropOuter: {
+    flex: 1,
+    justifyContent: 'flex-end',
+  },
   backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.45)' },
 
   sheetWrapAbs: { position: 'absolute', left: 0, right: 0, bottom: 0 },
@@ -565,19 +812,57 @@ const styles = StyleSheet.create({
     shadowRadius: 16,
     elevation: 20,
   },
-  sheetHandle: { alignSelf: 'center', width: 46, height: 5, borderRadius: 3, backgroundColor: '#E5E7EB', marginBottom: 8 },
-  headerRow: { minHeight: 34, justifyContent: 'center', alignItems: 'center', marginBottom: 8 },
+  sheetHandle: {
+    alignSelf: 'center',
+    width: 46,
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: '#E5E7EB',
+    marginBottom: 8,
+  },
+  headerRow: {
+    minHeight: 34,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
   closeBtn: {
-    position: 'absolute', right: 4, top: -2, width: 36, height: 36, borderRadius: 10,
-    backgroundColor: '#F3F4F6', alignItems: 'center', justifyContent: 'center',
+    position: 'absolute',
+    right: 4,
+    top: -2,
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    backgroundColor: '#F3F4F6',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   titleCenter: { fontSize: 18, fontWeight: '800', color: COLOR_TEXT, textAlign: 'center' },
 
-  floatWrap: { borderWidth: 1.2, borderColor: COLOR_BORDER, borderRadius: 12, backgroundColor: COLOR_INPUT_BG, position: 'relative' },
-  floatLabel: { position: 'absolute', left: 10, top: -10, paddingHorizontal: 6, backgroundColor: COLOR_BG, fontSize: 11, color: COLOR_PLACEHOLDER },
+  floatWrap: {
+    borderWidth: 1.2,
+    borderColor: COLOR_BORDER,
+    borderRadius: 12,
+    backgroundColor: COLOR_INPUT_BG,
+    position: 'relative',
+  },
+  floatLabel: {
+    position: 'absolute',
+    left: 10,
+    top: -10,
+    paddingHorizontal: 6,
+    backgroundColor: COLOR_BG,
+    fontSize: 11,
+    color: COLOR_PLACEHOLDER,
+  },
   floatLabelActive: { color: COLOR_BORDER_FOCUS, fontWeight: '800' },
 
-  inputBase: { minHeight: 48, alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between' },
+  inputBase: {
+    minHeight: 48,
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
   inputPadded: { paddingHorizontal: 12, paddingVertical: 10 },
   inputText: { fontSize: 15, color: COLOR_TEXT },
 
@@ -630,21 +915,43 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   popupHeader: {
-    paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: DARK_BORDER,
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#F8FAFC',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: DARK_BORDER,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#F8FAFC',
   },
   popupTitle: { fontWeight: '800', color: COLOR_TEXT, fontSize: 14 },
-  popupSearch: { borderRadius: 10, borderWidth: 1.2, borderColor: DARK_BORDER, backgroundColor: '#FFFFFF' },
+  popupSearch: {
+    borderRadius: 10,
+    borderWidth: 1.2,
+    borderColor: DARK_BORDER,
+    backgroundColor: '#FFFFFF',
+  },
   popupScroll: { maxHeight: 420 },
 
-  optionRowSm: { paddingHorizontal: 12, paddingVertical: 12, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: COLOR_DIVIDER },
+  optionRowSm: {
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: COLOR_DIVIDER,
+  },
   pickerMain: { fontSize: 13.5, fontWeight: '700', color: COLOR_TEXT },
   pickerSub: { fontSize: 11.5, color: COLOR_SUB, marginTop: 2 },
 
   toast: {
-    position: 'absolute', bottom: 14, left: 14, right: 14,
-    paddingVertical: 10, paddingHorizontal: 12, backgroundColor: '#ECFDF5',
-    borderWidth: 1, borderColor: '#D1FAE5',
+    position: 'absolute',
+    bottom: 14,
+    left: 14,
+    right: 14,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    backgroundColor: '#ECFDF5',
+    borderWidth: 1,
+    borderColor: '#D1FAE5',
     borderRadius: 12,
     flexDirection: 'row',
     alignItems: 'center',

@@ -1,7 +1,12 @@
-// OilExtraCostModal.tsx
+// app/(tabs)/TrackVendorBills/Shidaal/oilExtraCostModal.tsx
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 import VendorPaymentCreateSheet from './vendorpayment';
+
+import { createExtraCostLocal } from '@/app/ExtraCostsOffline/extraCostsRepo';
+import { queueExtraCostForSync } from '../FormExtraCostsOffline/extraCostCreateRepo';
+
+import NetInfo from '@react-native-community/netinfo';
 
 import { Feather } from '@expo/vector-icons';
 import { forwardRef, useEffect, useMemo, useRef, useState } from 'react';
@@ -73,9 +78,6 @@ type SupplierDueResponse = { items: SupplierDueItem[] };
 
 /* ──────────────────────────────────────────────────────────
    Floating Input
-   - Label acts as placeholder.
-   - On focus or when value exists -> label moves into the border line.
-   - When not editable and user taps -> onGuard fires to show inline error.
 ────────────────────────────────────────────────────────── */
 type FloatingInputProps = {
   label: string;
@@ -85,7 +87,7 @@ type FloatingInputProps = {
   editable?: boolean;
   onFocus?: () => void;
   onBlur?: () => void;
-  onGuard?: () => void; // called when user tries to interact while disabled
+  onGuard?: () => void;
   testID?: string;
   error?: string | null;
 };
@@ -118,7 +120,6 @@ const FloatingInput = forwardRef<TextInput, FloatingInputProps>(function FI(
           error && { borderColor: COLOR_ERROR },
         ]}
       >
-        {/* Label chip only when active (focused or has value) */}
         {active && (
           <View style={[styles.labelChipHolder, { backgroundColor: COLOR_BG }]} pointerEvents="none">
             <Text
@@ -133,7 +134,6 @@ const FloatingInput = forwardRef<TextInput, FloatingInputProps>(function FI(
           </View>
         )}
 
-        {/* Input. Placeholder shows the label when not active */}
         <TextInput
           ref={ref}
           testID={testID}
@@ -155,7 +155,6 @@ const FloatingInput = forwardRef<TextInput, FloatingInputProps>(function FI(
           }}
         />
 
-        {/* Invisible overlay to capture taps on disabled fields and trigger guard */}
         {!editable && (
           <Pressable
             onPress={onGuard}
@@ -172,8 +171,6 @@ const FloatingInput = forwardRef<TextInput, FloatingInputProps>(function FI(
 
 /* ──────────────────────────────────────────────────────────
    Currency Button + Popup
-   - Shows "Select" by default until chosen.
-   - When disabled and tapped -> shows guard error for prerequisite field.
 ────────────────────────────────────────────────────────── */
 function CurrencyButton({
   value,
@@ -194,7 +191,7 @@ function CurrencyButton({
       <View
         style={[
           styles.floatWrap,
-          styles.floatWrapFocused, // keep focused color for consistency with chip label
+          styles.floatWrapFocused,
           disabled && styles.inputDisabled,
           error && { borderColor: COLOR_ERROR },
         ]}
@@ -291,10 +288,18 @@ export default function OilExtraCostModal({
   oilId?: number;
   lotId?: number;
 }) {
-
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const anchorId = oilId ?? lotId;
 
+  // connectivity
+  const [online, setOnline] = useState(true);
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
 
   // safe area + sheet geometry + slide animation
   const insets = useSafeAreaInsets();
@@ -321,15 +326,14 @@ export default function OilExtraCostModal({
 
   // Form state
   const [categoryName, setCategoryName] = useState('');
-  const [currencyKey, setCurrencyKey] = useState<CurrencyKey | undefined>(undefined); // default: Select
+  const [currencyKey, setCurrencyKey] = useState<CurrencyKey | undefined>(undefined);
   const currencyObj = CURRENCY_OPTIONS.find((c) => c.key === currencyKey);
   const symbol = currencyObj?.symbol || '';
 
-  const [exchangeToUSD, setExchangeToUSD] = useState(''); // if non-USD
+  const [exchangeToUSD, setExchangeToUSD] = useState('');
   const [perBarrel, setPerBarrel] = useState('');
   const [qtyBarrel, setQtyBarrel] = useState('');
   const isLotContext = !!lotId;
-
 
   // Inline errors
   const [errCategory, setErrCategory] = useState<string | null>(null);
@@ -338,7 +342,7 @@ export default function OilExtraCostModal({
   const [errPerBarrel, setErrPerBarrel] = useState<string | null>(null);
   const [errQty, setErrQty] = useState<string | null>(null);
 
-  // gating (sequential enable)
+  // gating
   const hasCategory = (categoryName || '').trim().length > 0;
   const canPickCurrency = hasCategory;
   const needsRate = currencyKey && currencyKey !== 'USD';
@@ -389,7 +393,7 @@ export default function OilExtraCostModal({
   const toInt = (s: string) => s.replace(/[^0-9]/g, '');
 
   const loadOil = async () => {
-    if (!oilId) return;
+    if (!oilId || !token) return;
     try {
       setLoading(true);
       const oilRes = await api.get(`/diiwaanoil/${oilId}`, { headers: authHeader });
@@ -402,7 +406,6 @@ export default function OilExtraCostModal({
         null;
       setVendorNameOverride(prefer);
 
-      // default currency to oil's if present (still show "Select" if none)
       const oilCur = String(oilData?.currency || '').toUpperCase();
       const found = CURRENCY_OPTIONS.find((c) => c.code === oilCur);
       if (found) setCurrencyKey(found.key);
@@ -420,7 +423,6 @@ export default function OilExtraCostModal({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, oilId, lotId]);
-
 
   const clearErrors = () => {
     setErrCategory(null);
@@ -442,7 +444,7 @@ export default function OilExtraCostModal({
     clearErrors();
   };
 
-  // Guard helpers (called when user tries to move out-of-order)
+  // Guard helpers
   const guardCurrency = () => {
     if (!hasCategory) {
       setErrCategory('Required');
@@ -478,9 +480,10 @@ export default function OilExtraCostModal({
     return true;
   };
 
-  // Optional (refresh due from server later if needed)
+  // Optional (refresh due from server later)
   const fetchExtraDue = async (extraId: number) => {
     try {
+      if (!token) return 0;
       const params = isLotContext
         ? { lot_id: lotId, only_with_payments_q: 'false' }
         : { oil_id: oilId, only_with_payments_q: 'false' };
@@ -503,6 +506,32 @@ export default function OilExtraCostModal({
     }
   };
 
+  // 🔹 helper: offline path (queue + local cache)
+  const enqueueAndStoreOffline = async (finalCategory: string, amountUSD: number) => {
+    if (!user?.id || !anchorId) return;
+
+    // 1) queue for sync
+    queueExtraCostForSync(user.id, anchorId, {
+      category: finalCategory,
+      amountUsd: amountUSD,
+      currencyKey: currencyKey ?? null,
+      exchangeToUsd: needsRate ? rateVal : null,
+      perBarrel: perB || null,
+      qtyBarrel: qty || null,
+    });
+
+    // 2) put into offline "read" DB so ExtraCosts page sees it
+    await createExtraCostLocal({
+      ownerId: user.id,
+      oilId: oilId ?? null,
+      lotId: lotId ?? null,
+      category: finalCategory,
+      description: null,
+      amount: amountUSD,
+      // backend treats amount as USD; store same
+      currency: 'USD',
+    });
+  };
 
   // Submit: send category and amount in USD
   const submitCreate = async () => {
@@ -529,7 +558,6 @@ export default function OilExtraCostModal({
       setErrQty('Enter quantity of barrels');
       ok = false;
     }
-
     if (!ok) return;
 
     const finalCategory = `${categoryName.trim()}-${qty}-barrel`;
@@ -539,15 +567,27 @@ export default function OilExtraCostModal({
       return;
     }
 
-    const payload = {
-      category: finalCategory,
-      amount: amountUSD, // USD sent to backend
-    };
-
     try {
       setLoading(true);
       if (!anchorId) return;
-      const res = await api.post(`/diiwaanoil/${anchorId}/extra-costs`, payload, { headers: authHeader });
+
+      // 🔹 OFFLINE or missing token → queue & local insert only
+      if (!online || !token) {
+        await enqueueAndStoreOffline(finalCategory, amountUSD);
+        clearForm();
+        onClose();
+        return;
+      }
+
+      // 🔹 ONLINE normal POST
+      const payload = {
+        category: finalCategory,
+        amount: amountUSD,
+      };
+
+      const res = await api.post(`/diiwaanoil/${anchorId}/extra-costs`, payload, {
+        headers: authHeader,
+      });
 
       clearForm();
       const newId: number | undefined = res?.data?.id;
@@ -555,8 +595,15 @@ export default function OilExtraCostModal({
       setCreatedExtraId(newId ?? null);
       setCurrentPayable(amountUSD);
       setShowPayPrompt(true);
-    } catch {
-      // optional: toast
+    } catch (e: any) {
+      // 🔹 network / connectivity → treat as offline and queue
+      const isNetworkErr = !e?.response;
+      if (isNetworkErr) {
+        await enqueueAndStoreOffline(finalCategory, amountUSD);
+        clearForm();
+        onClose();
+      }
+      // for 4xx/5xx, you can optionally show an alert/toast if you want
     } finally {
       setLoading(false);
     }
@@ -576,7 +623,6 @@ export default function OilExtraCostModal({
     <>
       {/* Bottom Sheet */}
       <Modal visible={visible} animationType="slide" onRequestClose={handleCloseAll} transparent>
-        {/* backdrop */}
         <TouchableWithoutFeedback onPress={handleCloseAll}>
           <View style={styles.backdrop} />
         </TouchableWithoutFeedback>
@@ -590,7 +636,6 @@ export default function OilExtraCostModal({
             <View style={[styles.sheetCard, { paddingBottom: Math.max(16, bottomSafe) }]}>
               <View style={styles.sheetHandle} />
 
-              {/* Header */}
               <View style={styles.headerRow}>
                 <Text style={styles.titleCenter}>Extra Oil Costs</Text>
                 <TouchableOpacity
@@ -602,17 +647,15 @@ export default function OilExtraCostModal({
                 </TouchableOpacity>
               </View>
 
-              {/* Content: fully scrollable */}
               <ScrollView
                 keyboardShouldPersistTaps="handled"
                 contentContainerStyle={styles.scrollBody}
                 showsVerticalScrollIndicator
                 bounces
               >
-                {/* push the first row down a bit */}
                 <View style={{ height: 10 }} />
 
-                {/* Row: Other charges name + Currency (equal width) */}
+                {/* name + currency */}
                 <View style={styles.row2}>
                   <View style={styles.col}>
                     <FloatingInput
@@ -639,7 +682,7 @@ export default function OilExtraCostModal({
                   </View>
                 </View>
 
-                {/* Exchange rate to $1 — only when NOT USD (and after currency) */}
+                {/* Exchange rate */}
                 {currencyKey && currencyKey !== 'USD' ? (
                   <FloatingInput
                     label={`Exchange rate to $1 (${(currencyObj?.label || 'Currency').split(' ')[0]} per $1)`}
@@ -652,7 +695,6 @@ export default function OilExtraCostModal({
                     keyboardType="decimal-pad"
                     editable={canEditRate}
                     onGuard={() => {
-                      // user tapped while disabled
                       if (!hasCategory) setErrCategory('Required');
                       else if (!currencyKey) setErrCurrency('Please select a currency');
                     }}
@@ -660,7 +702,7 @@ export default function OilExtraCostModal({
                   />
                 ) : null}
 
-                {/* Amount per barrel + Qty */}
+                {/* per-barrel + qty */}
                 <View style={styles.row2}>
                   <View style={styles.col}>
                     <FloatingInput
@@ -698,7 +740,7 @@ export default function OilExtraCostModal({
                   </View>
                 </View>
 
-                {/* Computed totals */}
+                {/* totals */}
                 <View style={styles.summaryCard}>
                   <View style={styles.summaryRow}>
                     <Text style={styles.summaryKey}>{totalSelectedLabel}</Text>
@@ -715,11 +757,9 @@ export default function OilExtraCostModal({
                       ${Number(totalInUSD || 0).toFixed(2)}
                     </Text>
                   </View>
-
-                 
                 </View>
 
-                {/* Submit */}
+                {/* submit */}
                 <TouchableOpacity
                   style={[
                     styles.submitBtn,
@@ -746,7 +786,9 @@ export default function OilExtraCostModal({
                   ) : (
                     <>
                       <Feather name="plus-circle" size={16} color="#fff" style={{ marginRight: 6 }} />
-                      <Text style={styles.submitText}>Add cost</Text>
+                      <Text style={styles.submitText}>
+                        {online && token ? 'Add cost' : 'Save cost offline'}
+                      </Text>
                     </>
                   )}
                 </TouchableOpacity>
@@ -765,7 +807,6 @@ export default function OilExtraCostModal({
         onSelect={(k) => {
           setCurrencyKey(k);
           setErrCurrency(null);
-          // reset rate if switching to USD
           if (k === 'USD') {
             setExchangeToUSD('');
             setErrRate(null);
@@ -773,7 +814,7 @@ export default function OilExtraCostModal({
         }}
       />
 
-      {/* Pay Now? prompt */}
+      {/* Pay Now? prompt – only triggered in online happy path */}
       <Modal
         visible={showPayPrompt}
         transparent
@@ -800,7 +841,9 @@ export default function OilExtraCostModal({
             <Text style={styles.payValue}>${Number(currentPayable || 0).toFixed(2)}</Text>
           </View>
 
-          <Text style={styles.payPromptBody}>Do you want to record a payment for this extra cost now?</Text>
+          <Text style={styles.payPromptBody}>
+            Do you want to record a payment for this extra cost now?
+          </Text>
 
           <View style={styles.payBtnRow}>
             <TouchableOpacity
@@ -831,24 +874,23 @@ export default function OilExtraCostModal({
 
       {/* Vendor Payment Sheet */}
       <VendorPaymentCreateSheet
-      visible={showVendorSheet}
-      onClose={() => setShowVendorSheet(false)}
-      token={token || null}
-      oilId={oilId}
-      lotId={lotId}
-      vendorNameOverride={vendorNameOverride ?? undefined}
-      currentPayable={currentPayable}
-      extraCostId={createdExtraId ?? undefined}
-      onCreated={async () => {
-        if (createdExtraId) {
-          const due = await fetchExtraDue(createdExtraId);
-          setCurrentPayable(due);
-        }
-      }}
-      companyName={undefined}
-      companyContact={undefined}
-    />
-
+        visible={showVendorSheet}
+        onClose={() => setShowVendorSheet(false)}
+        token={token || null}
+        oilId={oilId}
+        lotId={lotId}
+        vendorNameOverride={vendorNameOverride ?? undefined}
+        currentPayable={currentPayable}
+        extraCostId={createdExtraId ?? undefined}
+        onCreated={async () => {
+          if (createdExtraId) {
+            const due = await fetchExtraDue(createdExtraId);
+            setCurrentPayable(due);
+          }
+        }}
+        companyName={undefined}
+        companyContact={undefined}
+      />
     </>
   );
 }
@@ -857,10 +899,8 @@ export default function OilExtraCostModal({
    Styles
 ────────────────────────────────────────────────────────── */
 const styles = StyleSheet.create({
-  // Backdrop
   backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.45)' },
 
-  // Sheet base
   sheetWrapAbs: { position: 'absolute', left: 0, right: 0, bottom: 0 },
   sheetCard: {
     flex: 1,
@@ -906,13 +946,11 @@ const styles = StyleSheet.create({
   },
   titleCenter: { fontSize: 18, fontWeight: '800', color: COLOR_TEXT, textAlign: 'center' },
 
-  // Scroll body padding
   scrollBody: {
     paddingBottom: 18,
     paddingTop: 6,
   },
 
-  // Field frame
   floatWrap: {
     borderWidth: 1.4,
     borderColor: COLOR_BORDER,
@@ -922,7 +960,6 @@ const styles = StyleSheet.create({
   },
   floatWrapFocused: { borderColor: COLOR_BORDER_FOCUS },
 
-  // Label chip that sits over the border line
   labelChipHolder: {
     position: 'absolute',
     left: 12,
@@ -932,7 +969,6 @@ const styles = StyleSheet.create({
   },
   labelChipText: { fontSize: 11 },
 
-  // Input base
   inputBase: {
     minHeight: 48,
     alignItems: 'center',
@@ -943,14 +979,11 @@ const styles = StyleSheet.create({
   inputText: { fontSize: 15, color: COLOR_TEXT },
   inputDisabled: { backgroundColor: '#F8FAFC' },
 
-  // Error text
   errorText: { marginTop: 4, color: COLOR_ERROR, fontSize: 11, fontWeight: '700' },
 
-  // Grid
   row2: { flexDirection: 'row', gap: 12 },
   col: { flex: 1 },
 
-  // Summary
   summaryCard: {
     marginTop: 6,
     marginBottom: 12,
@@ -960,13 +993,16 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#CBD5E1',
   },
-  summaryRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 4 },
+  summaryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 4,
+  },
   summaryKey: { color: '#6B7280', fontSize: 12 },
   summaryVal: { color: '#0B122A', fontWeight: '800', fontSize: 13 },
   divider: { height: 1, backgroundColor: '#E5E7EB', marginVertical: 8 },
-  rateHint: { marginTop: 6, color: '#B45309', fontSize: 11 },
 
-  // Buttons (main submit)
   submitBtn: {
     backgroundColor: COLOR_ACCENT,
     borderRadius: 14,
@@ -982,7 +1018,6 @@ const styles = StyleSheet.create({
   },
   submitText: { color: 'white', fontSize: 15, fontWeight: '800' },
 
-  // Currency popup (small)
   popupBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(2,6,23,0.55)' },
   popupCard: {
     position: 'absolute',
@@ -1020,7 +1055,6 @@ const styles = StyleSheet.create({
   },
   popupCloseTxt: { color: '#FFFFFF', fontWeight: '800', fontSize: 14 },
 
-  // Pay prompt
   payPromptCard: {
     position: 'absolute',
     left: 16,
@@ -1038,7 +1072,6 @@ const styles = StyleSheet.create({
   payLabel: { color: COLOR_SUB, fontSize: 12, fontWeight: '800' },
   payValue: { color: COLOR_TEXT, fontSize: 14, fontWeight: '900' },
 
-  // Pay prompt buttons row
   payBtnRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 12 },
   payBtn: {
     flexGrow: 1,

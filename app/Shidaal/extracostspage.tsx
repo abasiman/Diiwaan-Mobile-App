@@ -2,6 +2,7 @@
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 import { Feather } from '@expo/vector-icons';
+import NetInfo from '@react-native-community/netinfo';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -20,59 +21,20 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import VendorPaymentCreateSheet from './vendorpayment';
-// add this import at the top with others
 import OilExtraCostModal from './oilExtraCostModal';
+import VendorPaymentCreateSheet from './vendorpayment';
 
-/** ---- Types pulled from supplier-dues ---- */
-type ExtraCostItem = {
-  id: number;
-  category?: string | null;
-  description?: string | null;
-  amount: number;
-  total_paid: number;
-  due: number;
-  oil_id?: number | null;
-  currency?: string | null; // not provided by supplier-dues; kept for formatter compatibility
-};
+import type { ExtraCostRead } from '../ExtraCostsOffline/extraCostsRepo';
+import {
+  getExtraCostsLocal,
+  removeExtraCostLocal,
+  upsertExtraCostsFromServer,
+} from '../ExtraCostsOffline/extraCostsRepo';
 
-type ChildOil = {
-  oil_id: number;
-  oil_type?: string | null;
-  liters?: number | null;
-  sold_l?: number | null;
-  in_stock_l?: number | null;
-  oil_total_landed_cost?: number | null;
-  total_extra_cost?: number | null;
-  over_all_cost?: number | null;
-  total_paid?: number | null;
-  amount_due?: number | null;
-  extra_costs?: ExtraCostItem[];
-};
 
-type SupplierDueItem = {
-  supplier_name: string;
-  lot_id?: number | null;
-  oil_id?: number | null;
-  oil_type?: string | null;
-  liters?: number | null;
-  truck_plate?: string | null;
-  truck_type?: string | null;
-  oil_total_landed_cost?: number | null;
-  total_extra_cost?: number | null;
-  over_all_cost?: number | null;
-  total_paid?: number | null;
-  amount_due?: number | null;
-  date?: string | null;
-  last_payment_amount_due_snapshot?: number | null;
-  last_payment_amount?: number | null;
-  last_payment_date?: string | null;
-  last_payment_transaction_type?: string | null;
-  child_oils?: ChildOil[];
-  extra_costs?: ExtraCostItem[];
-};
 
-type SupplierDueResponse = { items: SupplierDueItem[] };
+
+import { syncExtraCostsForAnchor } from '../ExtraCostsOffline/extraCostsSync';
 
 const COLOR_TEXT = '#0B1221';
 const COLOR_MUTED = '#64748B';
@@ -85,23 +47,27 @@ function formatCurrency(n?: number | null, currency?: string) {
   return `${sym}${v.toFixed(2)}`;
 }
 
-
 // helper: parse to number or return null
 const toNum = (v: any) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 };
 
-
 export default function ExtraCostsPage() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { token } = useAuth();
-  const { oil_id, lot_id, plate } = useLocalSearchParams<{ oil_id?: string; lot_id?: string; plate?: string }>();
+  const { token, user } = useAuth();
+  const ownerId = user?.id;
 
+  const { oil_id, lot_id, plate } = useLocalSearchParams<{
+    oil_id?: string;
+    lot_id?: string;
+    plate?: string;
+  }>();
 
   const isLot = !!lot_id;
   const anchorId = useMemo(() => (isLot ? toNum(lot_id) : toNum(oil_id)), [isLot, lot_id, oil_id]);
+
   // normalize plate (handles undefined/array + decodes if encoded)
   const plateLabel = useMemo(() => {
     const raw = Array.isArray(plate) ? plate[0] : plate;
@@ -114,23 +80,25 @@ export default function ExtraCostsPage() {
   }, [plate]);
 
   const headerTitle = plateLabel
-  ? `${plateLabel} • Extra Costs`
-  : (isLot ? `Lot #${anchorId ?? '—'} • Extra Costs` : `Oil #${anchorId ?? '—'} • Extra Costs`);
+    ? `${plateLabel} • Extra Costs`
+    : isLot
+    ? `Lot #${anchorId ?? '—'} • Extra Costs`
+    : `Oil #${anchorId ?? '—'} • Extra Costs`;
 
-
+  const [online, setOnline] = useState(true);
+  const fetchingRef = useRef(false);
 
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [items, setItems] = useState<ExtraCostItem[]>([]);
+  const [items, setItems] = useState<ExtraCostRead[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [addExtraOpen, setAddExtraOpen] = useState(false);
-
 
   // Search
   const [query, setQuery] = useState('');
 
   // Centered actions modal
-  const [openActionFor, setOpenActionFor] = useState<ExtraCostItem | null>(null);
+  const [openActionFor, setOpenActionFor] = useState<ExtraCostRead | null>(null);
 
   // Inline editor
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -150,90 +118,94 @@ export default function ExtraCostsPage() {
   const [payCurrentDue, setPayCurrentDue] = useState<number>(0);
   const payingRef = useRef(false);
 
-
-
-
+  // connectivity watcher
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
 
   // when the modal closes, refresh the list and hide it
-const handleAddExtraClosed = async () => {
-  setAddExtraOpen(false);
-  await fetchList();
-};
-
-const onAddExtraTop = () => {
-  if (!anchorId) {
-    Alert.alert('Missing ID', 'Cannot add extra cost: invalid or missing identifier.');
-    return;
-  }
-  setAddExtraOpen(true);
-};
-
-
-
-  /** Fetch supplier-dues and extract the extras for this oil/lot */
-  const fetchList = useCallback(async () => {
-    if (!token || !anchorId) return;
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await api.get<SupplierDueResponse>('/diiwaanvendorpayments/supplier-dues', {
-        headers: { Authorization: `Bearer ${token}` },
-        params: { _ts: Date.now() },
-      });
-
-      const all = res?.data?.items ?? [];
-
-      // Find a matching entry:
-      // 1) Exact lot match if viewing a lot
-      // 2) Exact oil match if viewing an oil
-      // 3) Or any parent whose child_oils contains our oil_id
-      let match: SupplierDueItem | undefined;
-
-      if (isLot) {
-        match = all.find((it) => it.lot_id === anchorId);
-      } else {
-        match =
-          all.find((it) => it.oil_id === anchorId) ||
-          all.find((it) => (it.child_oils || []).some((c) => c.oil_id === anchorId));
+  const fetchList = useCallback(
+    async (withSpinner: boolean = true): Promise<void> => {
+      if (!ownerId || !anchorId) {
+        setItems([]);
+        setError('Missing oil/lot identifier.');
+        return;
       }
+      if (fetchingRef.current) return;
+      fetchingRef.current = true;
 
-      const extras = (match?.extra_costs ?? []).map((x) => ({
-        ...x,
-        total_paid: Number(x.total_paid ?? 0),
-        due: Number(x.due ?? Math.max(Number(x.amount ?? 0) - Number(x.total_paid ?? 0), 0)),
-      }));
+      if (withSpinner) setLoading(true);
+      setError(null);
 
-      setItems(extras);
-      if (!match) {
-        setError('No matching bill found for this oil/lot.');
+      try {
+        // refresh from server when online
+        if (online && token) {
+          try {
+            await syncExtraCostsForAnchor({
+              token,
+              ownerId,
+              oilId: isLot ? undefined : anchorId,
+              lotId: isLot ? anchorId : undefined,
+            });
+          } catch (e: any) {
+            console.warn('syncExtraCostsForAnchor failed', e?.message || e);
+          }
+        }
+
+        // always read local snapshot
+        const localItems = await getExtraCostsLocal({
+          ownerId,
+          oilId: isLot ? undefined : anchorId,
+          lotId: isLot ? anchorId : undefined,
+        });
+        setItems(localItems);
+      } catch (e: any) {
+        setError(String(e?.message || 'Failed to load extra costs.'));
+      } finally {
+        if (withSpinner) setLoading(false);
+        fetchingRef.current = false;
       }
-    } catch (e: any) {
-      setError(e?.response?.data?.detail || 'Failed to load extra costs.');
-    } finally {
-      setLoading(false);
+    },
+    [ownerId, anchorId, isLot, online, token]
+  );
+
+  const handleAddExtraClosed = async () => {
+    setAddExtraOpen(false);
+    await fetchList(false);
+  };
+
+  const onAddExtraTop = () => {
+    if (!anchorId) {
+      Alert.alert('Missing ID', 'Cannot add extra cost: invalid or missing identifier.');
+      return;
     }
-  }, [token, anchorId, isLot]);
+    setAddExtraOpen(true);
+  };
 
   useEffect(() => {
-    fetchList();
+    fetchList(true);
   }, [fetchList]);
 
   const onRefresh = useCallback(async () => {
-    if (!token || !anchorId) return;
+    if (!ownerId || !anchorId) return;
     setRefreshing(true);
     try {
-      await fetchList();
+      await fetchList(false);
     } finally {
       setRefreshing(false);
     }
-  }, [token, anchorId, fetchList]);
+  }, [ownerId, anchorId, fetchList]);
 
   // Actions
-  const openActions = (item: ExtraCostItem) => setOpenActionFor(item);
+  const openActions = (item: ExtraCostRead) => setOpenActionFor(item);
   const closeActions = () => setOpenActionFor(null);
 
   // Start editing
-  const beginEdit = (item: ExtraCostItem) => {
+  const beginEdit = (item: ExtraCostRead) => {
     closeActions();
     setEditingId(item.id);
     setEditCategory(item.category || '');
@@ -257,6 +229,10 @@ const onAddExtraTop = () => {
       Alert.alert('Invalid amount', 'Please enter a valid non-negative number.');
       return;
     }
+
+    const existing = items.find((it) => it.id === editingId);
+    const prevPaid = Number(existing?.total_paid ?? 0);
+
     try {
       setEditBusy(true);
       const payload: Record<string, any> = {
@@ -268,22 +244,57 @@ const onAddExtraTop = () => {
         headers: { Authorization: `Bearer ${token}` },
       });
 
-      // Update local + recompute due (prefer backend if it returns it)
+      const data = res?.data ?? {};
+      const nextAmount = Number(data.amount ?? amt);
+      const nextPaid = Number(data.total_paid ?? prevPaid);
+      const nextDue =
+        data.due != null
+          ? Number(data.due)
+          : Math.max(Number(data.amount ?? amt) - Number(data.total_paid ?? prevPaid), 0);
+      const nextCategory =
+        typeof data.category === 'string' ? data.category : payload.category ?? null;
+      const nextDescription =
+        typeof data.description === 'string' ? data.description : payload.description ?? null;
+      const nextCurrency = data.currency ?? existing?.currency ?? null;
+
+      // Update local state
       setItems((prev) =>
         prev.map((it) =>
           it.id === editingId
             ? {
                 ...it,
-                ...res.data,
-                total_paid: Number(res.data?.total_paid ?? it.total_paid ?? 0),
-                due: Number(
-                  res.data?.due ??
-                    Math.max(Number(res.data?.amount ?? amt) - Number(res.data?.total_paid ?? it.total_paid ?? 0), 0)
-                ),
+                ...data,
+                category: nextCategory,
+                description: nextDescription,
+                amount: nextAmount,
+                total_paid: nextPaid,
+                due: nextDue,
+                currency: nextCurrency ?? undefined,
               }
             : it
         )
       );
+
+      // Update offline cache
+      if (ownerId) {
+        upsertExtraCostsFromServer(ownerId, [
+          {
+            id: Number(data.id ?? editingId),
+            oil_id: data.oil_id ?? existing?.oil_id ?? (isLot ? null : anchorId),
+            lot_id: data.lot_id ?? existing?.lot_id ?? (isLot ? anchorId : null),
+            category: nextCategory ?? undefined,
+            description: nextDescription ?? undefined,
+            amount: nextAmount,
+            total_paid: nextPaid,
+            due: nextDue,
+            currency: nextCurrency ?? undefined,
+            updated_at: data.updated_at ?? undefined,
+          },
+        ]).catch((e) =>
+          console.warn('upsertExtraCostsFromServer after PATCH failed', e?.message || e)
+        );
+      }
+
       cancelEdit();
     } catch (e: any) {
       Alert.alert(
@@ -296,7 +307,7 @@ const onAddExtraTop = () => {
   };
 
   // Delete (DELETE /diiwaanoil/extra-costs/{id})
-  const confirmDelete = (item: ExtraCostItem) => {
+  const confirmDelete = (item: ExtraCostRead) => {
     closeActions();
     Alert.alert(
       'Delete extra cost?',
@@ -319,8 +330,15 @@ const onAddExtraTop = () => {
       await api.delete(`/diiwaanoil/extra-costs/${id}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
+
       setItems((prev) => prev.filter((it) => it.id !== id));
       if (editingId === id) cancelEdit();
+
+      if (ownerId) {
+        removeExtraCostLocal(ownerId, id).catch((e) =>
+          console.warn('removeExtraCostLocal failed', e?.message || e)
+        );
+      }
     } catch (e: any) {
       Alert.alert(
         'Delete failed',
@@ -332,17 +350,17 @@ const onAddExtraTop = () => {
   };
 
   // Pay actions — open VendorPaymentCreateSheet
-  const payForExtra = (ex: ExtraCostItem) => {
+  const payForExtra = (ex: ExtraCostRead) => {
     if (payingRef.current) return;
     payingRef.current = true;
     try {
       setPayExtraId(ex.id);
       setPayCurrentDue(Number(ex.due || 0));
       if (isLot) {
-        setPayLotId(anchorId);
+        setPayLotId(anchorId ?? undefined);
         setPayOilId(undefined);
       } else {
-        setPayOilId(anchorId);
+        setPayOilId(anchorId ?? undefined);
         setPayLotId(undefined);
       }
       setPayOpen(true);
@@ -352,7 +370,7 @@ const onAddExtraTop = () => {
   };
 
   const onPaymentCreated = async () => {
-    await fetchList();
+    await fetchList(false);
     setPayOpen(false);
     setPayOilId(undefined);
     setPayLotId(undefined);
@@ -363,7 +381,7 @@ const onAddExtraTop = () => {
 
   const onPaymentClosed = async () => {
     setPayOpen(false);
-    await fetchList();
+    await fetchList(false);
     setPayOilId(undefined);
     setPayLotId(undefined);
     setPayExtraId(undefined);
@@ -384,23 +402,27 @@ const onAddExtraTop = () => {
     <View style={styles.container}>
       {/* Header (pushed down) */}
       <View style={[styles.headerRow, { marginTop: insets.top + 12 }]}>
-        <TouchableOpacity onPress={() => router.back()} style={styles.backBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+        <TouchableOpacity
+          onPress={() => router.back()}
+          style={styles.backBtn}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+        >
           <Feather name="arrow-left" size={18} color="#0B1221" />
         </TouchableOpacity>
 
-        <Text style={styles.headerTitle} numberOfLines={1}>{headerTitle}</Text>
+        <Text style={styles.headerTitle} numberOfLines={1}>
+          {headerTitle}
+        </Text>
 
         <TouchableOpacity
-        onPress={onAddExtraTop}
-        style={[styles.addTopBtn, !anchorId && { opacity: 0.5 }]}
-        activeOpacity={0.9}
-        disabled={!anchorId}
-      >
-
+          onPress={onAddExtraTop}
+          style={[styles.addTopBtn, (!anchorId || !online) && { opacity: 0.5 }]}
+          activeOpacity={0.9}
+          disabled={!anchorId}
+        >
           <Feather name="plus" size={12} color="#0B2447" />
           <Text style={styles.addTopBtnTxt}>Ku Dar Qarash</Text>
         </TouchableOpacity>
-
       </View>
 
       {/* Search */}
@@ -426,7 +448,11 @@ const onAddExtraTop = () => {
       </View>
 
       {/* Content */}
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.select({ ios: 'padding', android: undefined })} keyboardVerticalOffset={Platform.select({ ios: 0, android: 0 })}>
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.select({ ios: 'padding', android: undefined })}
+        keyboardVerticalOffset={Platform.select({ ios: 0, android: 0 })}
+      >
         <ScrollView
           style={{ flex: 1 }}
           contentContainerStyle={{ padding: 12, paddingBottom: Math.max(insets.bottom, 16) }}
@@ -453,7 +479,9 @@ const onAddExtraTop = () => {
             filteredItems.map((ex) => {
               const isEditing = editingId === ex.id;
               const paid = Number(ex.total_paid ?? 0);
-              const due = Number(ex.due ?? Math.max(Number(ex.amount ?? 0) - paid, 0));
+              const due = Number(
+                ex.due ?? Math.max(Number(ex.amount ?? 0) - Number(ex.total_paid ?? 0), 0)
+              );
 
               return (
                 <View key={`ex_${ex.id}`} style={styles.cardRow}>
@@ -461,17 +489,34 @@ const onAddExtraTop = () => {
                   <View style={{ flex: 1, minWidth: 0 }}>
                     {!isEditing ? (
                       <>
-                        <Text style={styles.cardTitle} numberOfLines={1}>{ex.category || 'Extra'}</Text>
-                        {!!ex.description && <Text style={styles.cardDesc} numberOfLines={2}>{ex.description}</Text>}
+                        <Text style={styles.cardTitle} numberOfLines={1}>
+                          {ex.category || 'Extra'}
+                        </Text>
+                        {!!ex.description && (
+                          <Text style={styles.cardDesc} numberOfLines={2}>
+                            {ex.description}
+                          </Text>
+                        )}
 
-                        <View style={{ flexDirection: 'row', gap: 8, marginTop: 6, alignItems: 'center' }}>
+                        <View
+                          style={{
+                            flexDirection: 'row',
+                            gap: 8,
+                            marginTop: 6,
+                            alignItems: 'center',
+                          }}
+                        >
                           {due <= 0 ? (
                             <View style={styles.paidPill}>
                               <Feather name="check-circle" size={12} color="#065F46" />
                               <Text style={styles.paidPillText}>Fully Paid</Text>
                             </View>
                           ) : (
-                            <TouchableOpacity style={styles.payBtn} onPress={() => payForExtra(ex)} activeOpacity={0.9}>
+                            <TouchableOpacity
+                              style={styles.payBtn}
+                              onPress={() => payForExtra(ex)}
+                              activeOpacity={0.9}
+                            >
                               <Feather name="dollar-sign" size={12} color="#fff" />
                               <Text style={styles.payBtnTxt}>Pay</Text>
                             </TouchableOpacity>
@@ -519,11 +564,29 @@ const onAddExtraTop = () => {
                         />
 
                         <View style={styles.editActions}>
-                          <TouchableOpacity onPress={cancelEdit} style={[styles.editBtn, styles.editCancel]} activeOpacity={0.9} disabled={editBusy}>
+                          <TouchableOpacity
+                            onPress={cancelEdit}
+                            style={[styles.editBtn, styles.editCancel]}
+                            activeOpacity={0.9}
+                            disabled={editBusy}
+                          >
                             <Text style={styles.editCancelTxt}>Cancel</Text>
                           </TouchableOpacity>
-                          <TouchableOpacity onPress={saveEdit} style={[styles.editBtn, styles.editSave, editBusy && { opacity: 0.6 }]} activeOpacity={0.9} disabled={editBusy}>
-                            {editBusy ? <ActivityIndicator color="#fff" /> : <Text style={styles.editSaveTxt}>Save</Text>}
+                          <TouchableOpacity
+                            onPress={saveEdit}
+                            style={[
+                              styles.editBtn,
+                              styles.editSave,
+                              editBusy && { opacity: 0.6 },
+                            ]}
+                            activeOpacity={0.9}
+                            disabled={editBusy}
+                          >
+                            {editBusy ? (
+                              <ActivityIndicator color="#fff" />
+                            ) : (
+                              <Text style={styles.editSaveTxt}>Save</Text>
+                            )}
                           </TouchableOpacity>
                         </View>
                       </View>
@@ -533,16 +596,26 @@ const onAddExtraTop = () => {
                   {/* RIGHT: Amount/Paid/Due + actions trigger */}
                   <View style={{ alignItems: 'flex-end', marginLeft: 4 }}>
                     {!isEditing && (
-                      <TouchableOpacity onPress={() => openActions(ex)} style={styles.actionsBtn} activeOpacity={0.9}>
+                      <TouchableOpacity
+                        onPress={() => openActions(ex)}
+                        style={styles.actionsBtn}
+                        activeOpacity={0.9}
+                      >
                         <Feather name="more-horizontal" size={16} color="#0B1221" />
                       </TouchableOpacity>
                     )}
 
-                    <Text style={styles.amountLine}>Amount: {formatCurrency(ex.amount, ex.currency)}</Text>
-                    <Text style={[styles.amountLine, { color: '#059669', fontWeight: '800' }]}>
+                    <Text style={styles.amountLine}>
+                      Amount: {formatCurrency(ex.amount, ex.currency)}
+                    </Text>
+                    <Text
+                      style={[styles.amountLine, { color: '#059669', fontWeight: '800' }]}
+                    >
                       Paid: {formatCurrency(paid, ex.currency)}
                     </Text>
-                    <Text style={[styles.amountLine, { color: '#DC2626', fontWeight: '900' }]}>
+                    <Text
+                      style={[styles.amountLine, { color: '#DC2626', fontWeight: '900' }]}
+                    >
                       Due: {formatCurrency(due, ex.currency)}
                     </Text>
                   </View>
@@ -554,15 +627,22 @@ const onAddExtraTop = () => {
       </KeyboardAvoidingView>
 
       {/* Centered Actions Modal */}
-      <Modal visible={!!openActionFor} transparent animationType="fade" onRequestClose={closeActions}>
+      <Modal
+        visible={!!openActionFor}
+        transparent
+        animationType="fade"
+        onRequestClose={closeActions}
+      >
         <TouchableWithoutFeedback onPress={closeActions}>
           <View style={styles.centerBackdrop}>
             <TouchableWithoutFeedback onPress={() => {}}>
               <View style={styles.centerCard}>
-                <Text style={styles.centerTitle}>{openActionFor?.category || 'Extra'} — Actions</Text>
+                <Text style={styles.centerTitle}>
+                  {openActionFor?.category || 'Extra'} — Actions
+                </Text>
 
                 <View style={styles.centerList}>
-                  {openActionFor && openActionFor.due > 0 && (
+                  {openActionFor && (openActionFor.due ?? 0) > 0 && (
                     <TouchableOpacity
                       style={styles.centerItem}
                       onPress={() => {
@@ -601,7 +681,11 @@ const onAddExtraTop = () => {
                   </TouchableOpacity>
                 </View>
 
-                <TouchableOpacity style={styles.centerCancel} onPress={closeActions} activeOpacity={0.9}>
+                <TouchableOpacity
+                  style={styles.centerCancel}
+                  onPress={closeActions}
+                  activeOpacity={0.9}
+                >
                   <Text style={styles.centerCancelTxt}>Close</Text>
                 </TouchableOpacity>
               </View>
@@ -610,8 +694,6 @@ const onAddExtraTop = () => {
         </TouchableWithoutFeedback>
       </Modal>
 
-
-      {/* Add Extra Cost (Oil) */}
       {/* Add Extra Cost (Oil or Lot) */}
       {anchorId && (
         <OilExtraCostModal
@@ -621,9 +703,6 @@ const onAddExtraTop = () => {
           lotId={isLot ? anchorId : undefined}
         />
       )}
-
-
-
 
       {/* Vendor Payment Modal */}
       <VendorPaymentCreateSheet

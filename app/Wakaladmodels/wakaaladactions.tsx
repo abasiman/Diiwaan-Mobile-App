@@ -3,6 +3,7 @@ import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 import { Feather } from '@expo/vector-icons';
 import DateTimePicker from '@react-native-community/datetimepicker';
+import NetInfo from '@react-native-community/netinfo';
 import dayjs from 'dayjs';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -22,8 +23,16 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
 import OilExtraCostModal from '../Shidaal/oilExtraCostModal';
-import type { WakaaladRead } from '../Wakaalad/wakaalad_dashboard';
+import { queueWakaaladActionForSync } from '../wakaaladActionsOffline/wakaaladActionsOfflineRepo';
+
+import type { WakaaladRead } from '../WakaaladOffline/wakaaladRepo';
+import {
+  applyLocalWakaaladDelete,
+  applyLocalWakaaladEdit,
+  applyLocalWakaaladRestock,
+} from '../WakaaladOffline/wakaaladRepo';
 
 export type WakaaladActionMode = 'edit' | 'delete' | 'restock';
 
@@ -32,11 +41,11 @@ type Props = {
   mode: WakaaladActionMode;
   wakaalad: WakaaladRead | null;
   onClose: () => void;
-  onSuccess: () => void; // called after successful action
+  onSuccess: () => void; // called after successful action (online or queued offline)
 };
 
 type OilSellOption = {
-  id: number; // source oil/lot id used by backend in /sell-options
+  id: number;
   oil_type: string;
   truck_plate?: string | null;
   in_stock_l: number;
@@ -60,14 +69,13 @@ const COLOR_ACCENT = '#0F172A';
 const DARK_BORDER = '#334155';
 const COLOR_WARN = '#B91C1C';
 
-const FUUSTO_PHYSICAL_L = 240; // physical capacity for stock/movements
-const FUUSTO_BILLABLE_PETROL_L = 230; // billable used only in RESTOCK allocation, per your UI rule
+const FUUSTO_PHYSICAL_L = 240;
+const FUUSTO_BILLABLE_PETROL_L = 230;
 const CAAG_L = 20;
 
-// -- capacities --
+// capacities
 const fuustoCapPhysical = (oilType?: string) =>
   (oilType || '').toLowerCase() === 'petrol' ? FUUSTO_PHYSICAL_L : FUUSTO_PHYSICAL_L;
-// NOTE: kept your previous behavior for restock math (petrol=230L)
 const fuustoCapRestock = (oilType?: string) =>
   (oilType || '').toLowerCase() === 'petrol' ? FUUSTO_BILLABLE_PETROL_L : FUUSTO_PHYSICAL_L;
 
@@ -169,14 +177,19 @@ function PickerField({
           disabled && { opacity: 0.6 },
         ]}
       >
-        <Text style={[styles.floatLabel, (hasValue ? true : false) && styles.floatLabelActive]}>{label}</Text>
+        <Text style={[styles.floatLabel, (hasValue ? true : false) && styles.floatLabelActive]}>
+          {label}
+        </Text>
         <TouchableOpacity
           activeOpacity={0.9}
           onPress={onPress}
           disabled={disabled}
           style={[styles.inputBase, styles.inputPadded]}
         >
-          <Text numberOfLines={1} style={[styles.inputText, { color: hasValue ? COLOR_TEXT : COLOR_PLACEHOLDER }]}>
+          <Text
+            numberOfLines={1}
+            style={[styles.inputText, { color: hasValue ? COLOR_TEXT : COLOR_PLACEHOLDER }]}
+          >
             {hasValue ? value : 'Select'}
           </Text>
           <Feather name="chevron-down" size={18} color={COLOR_TEXT} />
@@ -186,7 +199,7 @@ function PickerField({
   );
 }
 
-/** Clean popup to choose an oil lot (centered) */
+/** Oil picker modal */
 function OilPickerModal({
   open,
   onClose,
@@ -240,11 +253,18 @@ function OilPickerModal({
           ) : (
             <ScrollView style={styles.popupScroll}>
               {options.map((o) => (
-                <TouchableOpacity key={o.id} style={styles.optionRowSm} onPress={() => onSelect(o)} activeOpacity={0.9}>
+                <TouchableOpacity
+                  key={o.id}
+                  style={styles.optionRowSm}
+                  onPress={() => onSelect(o)}
+                  activeOpacity={0.9}
+                >
                   <Text style={styles.pickerMain}>
                     {(o.oil_type || '').toUpperCase()} • {o.truck_plate || '—'}
                   </Text>
-                  <Text style={styles.pickerSub}>Stock: {Number(o.in_stock_l || 0).toFixed(2)} L</Text>
+                  <Text style={styles.pickerSub}>
+                    Stock: {Number(o.in_stock_l || 0).toFixed(2)} L
+                  </Text>
                 </TouchableOpacity>
               ))}
             </ScrollView>
@@ -259,10 +279,23 @@ function OilPickerModal({
 const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClose, onSuccess }) => {
   const isOpen = visible && !!wakaalad;
 
-  const { token } = useAuth();
-  const headers = useMemo(() => (token ? { Authorization: `Bearer ${token}` } : undefined), [token]);
+  const { token, user } = useAuth();
+  const headers = useMemo(
+    () => (token ? { Authorization: `Bearer ${token}` } : undefined),
+    [token]
+  );
 
-  // bottom-sheet geometry (bigger & closer to top)
+  // connectivity
+  const [online, setOnline] = useState(true);
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
+
+  // bottom-sheet geometry
   const insets = useSafeAreaInsets();
   const bottomSafe = insets.bottom || 0;
   const SCREEN_H = Dimensions.get('window').height;
@@ -280,11 +313,10 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
     } else {
       slideY.setValue(SHEET_H);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen]);
+  }, [isOpen, SHEET_H, slideY]);
 
-  // Somali titles/labels for restock
-  const title = mode === 'edit' ? 'Edit Wakaalad' : mode === 'restock' ? 'Dib u Buuxi Wakaalad' : 'Delete Wakaalad';
+  const title =
+    mode === 'edit' ? 'Edit Wakaalad' : mode === 'restock' ? 'Dib u Buuxi Wakaalad' : 'Delete Wakaalad';
 
   // tabs
   const [tab, setTab] = useState<WakaaladActionMode>(mode);
@@ -296,31 +328,30 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
 
   // edit
   const [name, setName] = useState<string>(wakaalad?.wakaalad_name ?? '');
-  const [editDate, setEditDate] = useState<Date>(wakaalad?.date ? new Date(wakaalad.date) : new Date());
+  const [editDate, setEditDate] = useState<Date>(
+    wakaalad?.date ? new Date(wakaalad.date) : new Date()
+  );
   const [showEditDate, setShowEditDate] = useState(false);
 
-  // NEW: edit quantity controls
   const currentTotalLiters = useMemo(
     () => Number(wakaalad ? (wakaalad.wakaal_stock || 0) + (wakaalad.wakaal_sold || 0) : 0),
     [wakaalad]
   );
   const currentSoldLiters = Number(wakaalad?.wakaal_sold || 0);
-  const editFuustoCap = useMemo(() => fuustoCapPhysical(wakaalad?.oil_type), [wakaalad?.oil_type]);
+  const editFuustoCap = useMemo(
+    () => fuustoCapPhysical(wakaalad?.oil_type),
+    [wakaalad?.oil_type]
+  );
 
   const [editQtyUnit, setEditQtyUnit] = useState<Unit>('fuusto');
-  const [editQtyAmount, setEditQtyAmount] = useState<string>(''); // number in chosen unit
+  const [editQtyAmount, setEditQtyAmount] = useState<string>('');
   const [editUnitPickerOpen, setEditUnitPickerOpen] = useState(false);
 
-  // Prefill edit amount when opening or when wakaalad changes
   useEffect(() => {
     if (!isOpen || !wakaalad) return;
-    // default to fuusto approximation
     const asFuusto = currentTotalLiters / editFuustoCap;
     setEditQtyUnit('fuusto');
-    setEditQtyAmount(
-      // keep 3 dp for fractional fuusto editing; allows precise liters internally
-      isFinite(asFuusto) ? String(Number(asFuusto.toFixed(3))) : ''
-    );
+    setEditQtyAmount(isFinite(asFuusto) ? String(Number(asFuusto.toFixed(3))) : '');
   }, [isOpen, wakaalad, currentTotalLiters, editFuustoCap]);
 
   // delete
@@ -332,21 +363,24 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
   const [options, setOptions] = useState<OilSellOption[]>([]);
   const [oilQuery, setOilQuery] = useState('');
   const [selectedId, setSelectedId] = useState<number | null>(null);
-  const selected = useMemo(() => options.find((o) => o.id === selectedId) || null, [options, selectedId]);
+  const selected = useMemo(
+    () => options.find((o) => o.id === selectedId) || null,
+    [options, selectedId]
+  );
 
   const [unitPickerOpen, setUnitPickerOpen] = useState(false);
   const [unit, setUnit] = useState<Unit>('fuusto');
-  const [amount, setAmount] = useState<string>(''); // number in chosen unit
+  const [amount, setAmount] = useState<string>('');
   const [restockDate, setRestockDate] = useState<Date>(new Date());
   const [showRestockDate, setShowRestockDate] = useState(false);
 
-  // Extra-cost modal state (for RESTOCK)
+  // Extra-cost modal state (RESTOCK online happy path)
   const [showExtraCosts, setShowExtraCosts] = useState(false);
   const [extraOilId, setExtraOilId] = useState<number | undefined>(undefined);
   const [extraPrefillName, setExtraPrefillName] = useState<string | null>(null);
   const [extraPrefillQty, setExtraPrefillQty] = useState<number | null>(null);
 
-  // reset when opening or wakaalad changes
+  // reset when opening / wakaalad change
   useEffect(() => {
     setErr(null);
     setLoading(false);
@@ -369,6 +403,8 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
   useEffect(() => {
     if (!isOpen) return;
     if (tab !== 'restock') return;
+    if (!headers) return;
+
     let mounted = true;
     (async () => {
       try {
@@ -394,19 +430,22 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
     const q = oilQuery.trim().toLowerCase();
     if (!q) return options;
     return options.filter(
-      (o) => (o.oil_type || '').toLowerCase().includes(q) || (o.truck_plate || '').toLowerCase().includes(q)
+      (o) =>
+        (o.oil_type || '').toLowerCase().includes(q) ||
+        (o.truck_plate || '').toLowerCase().includes(q)
     );
   }, [oilQuery, options]);
 
-  // conversions
   const toDecimal = (s: string) => {
     let out = s.replace(/[^0-9.]/g, '');
     const firstDot = out.indexOf('.');
-    if (firstDot !== -1) out = out.slice(0, firstDot + 1) + out.slice(firstDot + 1).replace(/\./g, '');
+    if (firstDot !== -1) {
+      out = out.slice(0, firstDot + 1) + out.slice(firstDot + 1).replace(/\./g, '');
+    }
     return out;
   };
 
-  // ----- RESTOCK maths (keep petrol fuusto=230L per your UI rule) -----
+  // RESTOCK maths
   const allocLiters = useMemo(() => {
     const v = parseFloat((amount || '').replace(',', '.'));
     if (!Number.isFinite(v)) return 0;
@@ -430,7 +469,6 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
 
   const canRestock = !!selected && allocLiters > 0 && !exceeds;
 
-  // Calculate barrels count for defaultQtyBarrel prefill in extras modal (RESTOCK)
   const qtyBarrels = useMemo(() => {
     const count = parseFloat((amount || '').replace(',', '.')) || 0;
     const fCap = fuustoCapRestock(selected?.oil_type);
@@ -439,10 +477,10 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
     return Math.floor((count * CAAG_L) / fCap);
   }, [amount, unit, selected?.oil_type, allocLiters]);
 
-  // ----- EDIT maths (use PHYSICAL fuusto=240L for petrol to match stock/movements) -----
+  // EDIT maths
   const newEditTotalLiters = useMemo(() => {
     const v = parseFloat((editQtyAmount || '').replace(',', '.'));
-    if (!Number.isFinite(v)) return currentTotalLiters; // treat empty/invalid as unchanged
+    if (!Number.isFinite(v)) return currentTotalLiters;
     if (editQtyUnit === 'liters') return v;
     if (editQtyUnit === 'fuusto') return v * editFuustoCap;
     return v * CAAG_L;
@@ -452,67 +490,116 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
 
   const editHasAnyChange =
     (name && name.trim() !== '' && name.trim() !== (wakaalad?.wakaalad_name ?? '')) ||
-    (editDate && wakaalad && dayjs(editDate).toISOString() !== dayjs(wakaalad.date).toISOString()) ||
+    (editDate &&
+      wakaalad &&
+      dayjs(editDate).toISOString() !== dayjs(wakaalad.date).toISOString()) ||
     Math.abs(newEditTotalLiters - currentTotalLiters) > 1e-6;
 
-  /** ---------- EDIT ---------- */
+  /** ---------- EDIT (online + offline queue + local apply) ---------- */
   async function doEdit() {
-    if (!headers || !wakaalad) return;
+    if (!wakaalad) return;
 
     const body: any = {};
     const trimmed = (name || '').trim();
     if (trimmed && trimmed !== wakaalad.wakaalad_name) body.wakaalad_name = trimmed;
     if (editDate) body.date = editDate.toISOString();
 
-    // quantity change
     if (Math.abs(newEditTotalLiters - currentTotalLiters) > 1e-6) {
       if (editQtyBelowSold) {
-        setErr(`Wadarta cusub (${newEditTotalLiters.toFixed(2)} L) ka yar ${currentSoldLiters.toFixed(2)} L oo horey loo iibiyay.`);
+        setErr(
+          `Wadarta cusub (${newEditTotalLiters.toFixed(
+            2
+          )} L) ka yar ${currentSoldLiters.toFixed(2)} L oo horey loo iibiyay.`
+        );
         return;
       }
       body.set_total_liters = newEditTotalLiters;
     }
 
     if (Object.keys(body).length === 0) {
-      // nothing to do
       handleCloseAll();
       return;
     }
 
+    const ownerId = user?.id ?? 0;
+    const wakaaladId = wakaalad.id;
+
     try {
       setLoading(true);
       setErr(null);
-      await api.patch(`/wakaalad_diiwaan/${wakaalad.id}`, body, { headers });
+
+      // OFFLINE or no token: apply locally + queue
+      if (!token || !online) {
+        if (ownerId) {
+          await applyLocalWakaaladEdit(ownerId, wakaalad, body);
+          queueWakaaladActionForSync(ownerId, wakaaladId, 'edit', body);
+        }
+        onSuccess();
+        return;
+      }
+
+      // ONLINE happy path
+      await api.patch(`/wakaalad_diiwaan/${wakaaladId}`, body, { headers });
       onSuccess();
     } catch (e: any) {
+      const isNetworkErr = !e?.response;
+      if (isNetworkErr && ownerId) {
+        // network died mid-request → treat as offline
+        await applyLocalWakaaladEdit(ownerId, wakaalad, body);
+        queueWakaaladActionForSync(ownerId, wakaaladId, 'edit', body);
+        onSuccess();
+        return;
+      }
       setErr(e?.response?.data?.detail || 'Failed to update.');
     } finally {
       setLoading(false);
     }
   }
 
-  /** ---------- DELETE ---------- */
+  /** ---------- DELETE (online + offline queue + local apply) ---------- */
   async function doDelete() {
-    if (!headers || !wakaalad) return;
+    if (!wakaalad) return;
     if (confirmTxt.trim().toLowerCase() !== 'delete') {
       setErr('Type "delete" to confirm.');
       return;
     }
+
+    const ownerId = user?.id ?? 0;
+    const wakaaladId = wakaalad.id;
+
     try {
       setLoading(true);
       setErr(null);
-      await api.delete(`/wakaalad_diiwaan/${wakaalad.id}`, { headers });
+
+      // OFFLINE or no token: local soft delete + queue
+      if (!token || !online) {
+        if (ownerId) {
+          await applyLocalWakaaladDelete(ownerId, wakaalad);
+          queueWakaaladActionForSync(ownerId, wakaaladId, 'delete', {});
+        }
+        onSuccess();
+        return;
+      }
+
+      await api.delete(`/wakaalad_diiwaan/${wakaaladId}`, { headers });
       onSuccess();
     } catch (e: any) {
+      const isNetworkErr = !e?.response;
+      if (isNetworkErr && ownerId) {
+        await applyLocalWakaaladDelete(ownerId, wakaalad);
+        queueWakaaladActionForSync(ownerId, wakaaladId, 'delete', {});
+        onSuccess();
+        return;
+      }
       setErr(e?.response?.data?.detail || 'Failed to delete.');
     } finally {
       setLoading(false);
     }
   }
 
-  /** ---------- RESTOCK ---------- */
+  /** ---------- RESTOCK (online + offline queue + local apply) ---------- */
   async function doRestock() {
-    if (!headers || !wakaalad) return;
+    if (!wakaalad) return;
     if (!selected) {
       setErr('Select an oil lot.');
       return;
@@ -524,30 +611,50 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
 
     const body = {
       from_oil_id: selected.id,
-      liters: allocLiters, // always send liters to backend
+      liters: allocLiters,
       date: restockDate?.toISOString(),
     };
+
+    const ownerId = user?.id ?? 0;
+    const wakaaladId = wakaalad.id;
 
     try {
       setLoading(true);
       setErr(null);
-      await api.post(`/wakaalad_diiwaan/${wakaalad.id}/restock`, body, { headers });
 
-      // Trigger OilExtraCostModal immediately (decoupled values)
+      // OFFLINE / no token: local apply + queue, no extra-cost modal
+      if (!token || !online) {
+        if (ownerId) {
+          await applyLocalWakaaladRestock(ownerId, wakaalad, allocLiters);
+          queueWakaaladActionForSync(ownerId, wakaaladId, 'restock', body);
+        }
+        onSuccess();
+        return;
+      }
+
+      // ONLINE happy path
+      await api.post(`/wakaalad_diiwaan/${wakaaladId}/restock`, body, { headers });
+
+      // Extra-cost modal only on online success
       setExtraOilId(selected.id);
       setExtraPrefillName(`${wakaalad.wakaalad_name} - dib u buuxin`);
       setExtraPrefillQty(qtyBarrels);
       setShowExtraCosts(true);
 
-      // Reset the form so user can do another restock if needed
       setSelectedId(null);
       setAmount('');
       setUnit('fuusto');
       setRestockDate(new Date());
 
-      // Notify parent list to refresh
       onSuccess();
     } catch (e: any) {
+      const isNetworkErr = !e?.response;
+      if (isNetworkErr && ownerId) {
+        await applyLocalWakaaladRestock(ownerId, wakaalad, allocLiters);
+        queueWakaaladActionForSync(ownerId, wakaaladId, 'restock', body);
+        onSuccess();
+        return;
+      }
       setErr(e?.response?.data?.detail || 'Failed to restock.');
     } finally {
       setLoading(false);
@@ -555,7 +662,7 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
   }
 
   const handleCloseAll = () => {
-    if (showExtraCosts) return; // prevent closing while extras modal is open
+    if (showExtraCosts) return;
     setOilPickerOpen(false);
     setUnitPickerOpen(false);
     setEditUnitPickerOpen(false);
@@ -564,6 +671,8 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
 
   if (!isOpen) return null;
 
+  const onlineLabelSuffix = !online || !token ? ' (offline)' : '';
+
   return (
     <>
       <Modal visible={isOpen} animationType="none" onRequestClose={handleCloseAll} transparent>
@@ -571,7 +680,9 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
           <View style={styles.backdropOverlay} />
         </TouchableWithoutFeedback>
 
-        <Animated.View style={[styles.sheetWrapAbs, { height: SHEET_H, transform: [{ translateY: slideY }] }]}>
+        <Animated.View
+          style={[styles.sheetWrapAbs, { height: SHEET_H, transform: [{ translateY: slideY }] }]}
+        >
           <KeyboardAvoidingView
             behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
             keyboardVerticalOffset={Platform.OS === 'ios' ? 40 : 0}
@@ -580,7 +691,6 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
             <View style={[styles.sheetCard, { paddingBottom: Math.max(18, bottomSafe) }]}>
               <View style={styles.sheetHandle} />
 
-              {/* Header */}
               <View style={styles.headerRow}>
                 <Text style={styles.titleCenter}>{title}</Text>
                 <TouchableOpacity
@@ -595,14 +705,27 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                 {wakaalad!.wakaalad_name} • #{wakaalad!.id}
               </Text>
 
-              {/* Tabs */}
               <View style={[styles.tabsRow, { marginTop: 12, marginBottom: 6 }]}>
-                <TabButton active={tab === 'edit'} label="Edit" icon="edit-2" onPress={() => setTab('edit')} />
-                <TabButton active={tab === 'restock'} label="Dib u Buuxin" icon="refresh-ccw" onPress={() => setTab('restock')} />
-                <TabButton active={tab === 'delete'} label="Delete" icon="trash-2" onPress={() => setTab('delete')} />
+                <TabButton
+                  active={tab === 'edit'}
+                  label="Edit"
+                  icon="edit-2"
+                  onPress={() => setTab('edit')}
+                />
+                <TabButton
+                  active={tab === 'restock'}
+                  label="Dib u Buuxin"
+                  icon="refresh-ccw"
+                  onPress={() => setTab('restock')}
+                />
+                <TabButton
+                  active={tab === 'delete'}
+                  label="Delete"
+                  icon="trash-2"
+                  onPress={() => setTab('delete')}
+                />
               </View>
 
-              {/* Content + Buttons */}
               <ScrollView
                 keyboardShouldPersistTaps="handled"
                 contentContainerStyle={{ paddingTop: 12, paddingBottom: 18 }}
@@ -617,7 +740,6 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                       placeholder="magaca wakaalada"
                     />
 
-                    {/* Total quantity editor */}
                     <View style={{ flexDirection: 'row', gap: 16, marginBottom: 4 }}>
                       <View style={{ flex: 1 }}>
                         <View
@@ -626,14 +748,20 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                             { borderColor: DARK_BORDER, backgroundColor: COLOR_INPUT_BG },
                           ]}
                         >
-                          <Text style={[styles.floatLabel, styles.floatLabelActive]}>Unugga (Unit)</Text>
+                          <Text style={[styles.floatLabel, styles.floatLabelActive]}>
+                            Unugga (Unit)
+                          </Text>
                           <TouchableOpacity
                             style={[styles.inputBase, styles.inputPadded]}
                             onPress={() => setEditUnitPickerOpen(true)}
                             activeOpacity={0.9}
                           >
                             <Text style={styles.inputText}>
-                              {editQtyUnit === 'fuusto' ? 'Fuusto' : editQtyUnit === 'caag' ? 'Caag' : 'Litir'}
+                              {editQtyUnit === 'fuusto'
+                                ? 'Fuusto'
+                                : editQtyUnit === 'caag'
+                                ? 'Caag'
+                                : 'Litir'}
                             </Text>
                             <Feather name="chevron-down" size={18} color={COLOR_TEXT} />
                           </TouchableOpacity>
@@ -650,9 +778,10 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                       />
                     </View>
 
-                    {/* Helper line: show computed liters + current */}
                     <Text style={{ color: COLOR_SUB, fontSize: 12, marginBottom: 12 }}>
-                      Cusub: {newEditTotalLiters.toFixed(2)} L • Hadda: {currentTotalLiters.toFixed(2)} L • Iibay: {currentSoldLiters.toFixed(2)} L
+                      Cusub: {newEditTotalLiters.toFixed(2)} L • Hadda:{' '}
+                      {currentTotalLiters.toFixed(2)} L • Iibay:{' '}
+                      {currentSoldLiters.toFixed(2)} L
                     </Text>
 
                     <PickerField
@@ -677,41 +806,63 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                         <Feather name="info" size={12} color="#991B1B" />
                         <Text style={styles.errorTxt}>
                           {editQtyBelowSold
-                            ? `Wadarta cusub kama yaraan karto ${currentSoldLiters.toFixed(2)} L oo horey loo iibiyay.`
+                            ? `Wadarta cusub kama yaraan karto ${currentSoldLiters.toFixed(
+                                2
+                              )} L oo horey loo iibiyay.`
                             : err}
                         </Text>
                       </View>
                     )}
 
                     <View style={styles.actionBar}>
-                      <TouchableOpacity style={styles.secondaryBtn} onPress={handleCloseAll} disabled={loading}>
+                      <TouchableOpacity
+                        style={styles.secondaryBtn}
+                        onPress={handleCloseAll}
+                        disabled={loading}
+                      >
                         <Text style={styles.secondaryTxt}>Cancel</Text>
                       </TouchableOpacity>
                       <TouchableOpacity
-                        style={[styles.primaryBtn, (!editHasAnyChange || editQtyBelowSold) && { opacity: 0.6 }]}
+                        style={[
+                          styles.primaryBtn,
+                          (!editHasAnyChange || editQtyBelowSold) && { opacity: 0.6 },
+                        ]}
                         onPress={doEdit}
                         disabled={loading || !editHasAnyChange || editQtyBelowSold}
                       >
                         {loading ? (
                           <ActivityIndicator />
                         ) : (
-                          <Feather name="save" size={16} color="#fff" style={{ marginRight: 6 }} />
+                          <Feather
+                            name="save"
+                            size={16}
+                            color="#fff"
+                            style={{ marginRight: 6 }}
+                          />
                         )}
-                        <Text style={styles.primaryTxt}>Save Changes</Text>
+                        <Text style={styles.primaryTxt}>Save Changes{onlineLabelSuffix}</Text>
                       </TouchableOpacity>
                     </View>
                   </>
-                )}
+                )
+
+                }
 
                 {tab === 'delete' && (
                   <>
                     <View style={styles.inlineWarning}>
                       <Feather name="alert-triangle" size={14} color={COLOR_WARN} />
                       <Text style={styles.inlineWarningText}>
-                        This will soft-delete the wakaalad. Type <Text style={{ fontWeight: '900' }}>&quot;delete&quot;</Text> to confirm.
+                        This will soft-delete the wakaalad. Type{' '}
+                        <Text style={{ fontWeight: '900' }}>&quot;delete&quot;</Text> to
+                        confirm.
                       </Text>
                     </View>
-                    <FloatingInput label='Type "delete" to confirm' value={confirmTxt} onChangeText={setConfirmTxt} />
+                    <FloatingInput
+                      label='Type "delete" to confirm'
+                      value={confirmTxt}
+                      onChangeText={setConfirmTxt}
+                    />
 
                     {!!err && (
                       <View style={styles.errorBox}>
@@ -721,7 +872,11 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                     )}
 
                     <View style={styles.actionBar}>
-                      <TouchableOpacity style={styles.secondaryBtn} onPress={handleCloseAll} disabled={loading}>
+                      <TouchableOpacity
+                        style={styles.secondaryBtn}
+                        onPress={handleCloseAll}
+                        disabled={loading}
+                      >
                         <Text style={styles.secondaryTxt}>Cancel</Text>
                       </TouchableOpacity>
                       <TouchableOpacity
@@ -732,9 +887,14 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                         {loading ? (
                           <ActivityIndicator />
                         ) : (
-                          <Feather name="trash-2" size={16} color="#fff" style={{ marginRight: 6 }} />
+                          <Feather
+                            name="trash-2"
+                            size={16}
+                            color="#fff"
+                            style={{ marginRight: 6 }}
+                          />
                         )}
-                        <Text style={styles.primaryTxt}>Delete</Text>
+                        <Text style={styles.primaryTxt}>Delete{onlineLabelSuffix}</Text>
                       </TouchableOpacity>
                     </View>
                   </>
@@ -742,11 +902,14 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
 
                 {tab === 'restock' && (
                   <>
-                    {/* Oil lot */}
                     <PickerField
                       label="Ka Yimid Oil Lot"
                       value={
-                        selected ? `${(selected.oil_type || '').toUpperCase()} • ${selected.truck_plate || '—'}` : undefined
+                        selected
+                          ? `${(selected.oil_type || '').toUpperCase()} • ${
+                              selected.truck_plate || '—'
+                            }`
+                          : undefined
                       }
                       onPress={() => {
                         setOilQuery('');
@@ -755,7 +918,6 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                       style={{ marginTop: 2 }}
                     />
 
-                    {/* Row: Qoondo + Amount */}
                     <View style={{ flexDirection: 'row', gap: 16, marginBottom: 20 }}>
                       <View style={{ flex: 1 }}>
                         <View
@@ -764,14 +926,20 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                             { borderColor: DARK_BORDER, backgroundColor: COLOR_INPUT_BG },
                           ]}
                         >
-                          <Text style={[styles.floatLabel, styles.floatLabelActive]}>Qoondo</Text>
+                          <Text style={[styles.floatLabel, styles.floatLabelActive]}>
+                            Qoondo
+                          </Text>
                           <TouchableOpacity
                             style={[styles.inputBase, styles.inputPadded]}
                             onPress={() => setUnitPickerOpen(true)}
                             activeOpacity={0.9}
                           >
                             <Text style={styles.inputText}>
-                              {unit === 'fuusto' ? 'Fuusto' : unit === 'caag' ? 'Caag' : 'Litir'}
+                              {unit === 'fuusto'
+                                ? 'Fuusto'
+                                : unit === 'caag'
+                                ? 'Caag'
+                                : 'Litir'}
                             </Text>
                             <Feather name="chevron-down" size={18} color={COLOR_TEXT} />
                           </TouchableOpacity>
@@ -786,9 +954,7 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                         style={{ flex: 1, marginBottom: 0 }}
                         placeholder=""
                         onPressIn={() => {
-                          if (!selected) {
-                            setOilPickerOpen(true);
-                          }
+                          if (!selected) setOilPickerOpen(true);
                         }}
                       />
                     </View>
@@ -798,7 +964,9 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                         <Feather name="alert-triangle" size={14} color="#92400E" />
                         <Text style={styles.inlineWarningText}>
                           {`Requested ${
-                            unit === 'liters' ? allocLiters.toFixed(2) + ' L' : `${Number(amount || 0)} ${unit}`
+                            unit === 'liters'
+                              ? allocLiters.toFixed(2) + ' L'
+                              : `${Number(amount || 0)} ${unit}`
                           } exceeds available ${
                             unit === 'liters'
                               ? Number(selected.in_stock_l || 0).toFixed(2) + ' L'
@@ -808,7 +976,6 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                       </View>
                     )}
 
-                    {/* Date */}
                     <PickerField
                       label="Taariikhda Dib u Buuxinta"
                       value={dayjs(restockDate).format('MMM D, YYYY')}
@@ -835,7 +1002,11 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                     )}
 
                     <View style={styles.actionBar}>
-                      <TouchableOpacity style={styles.secondaryBtn} onPress={handleCloseAll} disabled={loading}>
+                      <TouchableOpacity
+                        style={styles.secondaryBtn}
+                        onPress={handleCloseAll}
+                        disabled={loading}
+                      >
                         <Text style={styles.secondaryTxt}>Cancel</Text>
                       </TouchableOpacity>
                       <TouchableOpacity
@@ -846,9 +1017,14 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                         {loading ? (
                           <ActivityIndicator />
                         ) : (
-                          <Feather name="refresh-ccw" size={16} color="#fff" style={{ marginRight: 6 }} />
+                          <Feather
+                            name="refresh-ccw"
+                            size={16}
+                            color="#fff"
+                            style={{ marginRight: 6 }}
+                          />
                         )}
-                        <Text style={styles.primaryTxt}>Kaydi</Text>
+                        <Text style={styles.primaryTxt}>Kaydi{onlineLabelSuffix}</Text>
                       </TouchableOpacity>
                     </View>
                   </>
@@ -873,8 +1049,13 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
         }}
       />
 
-      {/* Unit popup — centered (RESTOCK) */}
-      <Modal visible={unitPickerOpen} transparent animationType="fade" onRequestClose={() => setUnitPickerOpen(false)}>
+      {/* Unit popup — RESTOCK */}
+      <Modal
+        visible={unitPickerOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setUnitPickerOpen(false)}
+      >
         <TouchableWithoutFeedback onPress={() => setUnitPickerOpen(false)}>
           <View style={styles.backdrop} />
         </TouchableWithoutFeedback>
@@ -897,10 +1078,16 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
                 setUnitPickerOpen(false);
               }}
             >
-              <Text style={styles.pickerMain}>Fuusto (×{fuustoCapRestock(selected?.oil_type)} L)</Text>
+              <Text style={styles.pickerMain}>
+                Fuusto (×{fuustoCapRestock(selected?.oil_type)} L)
+              </Text>
               {selected ? (
                 <Text style={styles.pickerSub}>
-                  Available: {Math.floor(Number(selected?.in_stock_l || 0) / fuustoCapRestock(selected?.oil_type))} fuusto
+                  Available:{' '}
+                  {Math.floor(
+                    Number(selected?.in_stock_l || 0) / fuustoCapRestock(selected?.oil_type)
+                  )}{' '}
+                  fuusto
                 </Text>
               ) : null}
             </TouchableOpacity>
@@ -913,7 +1100,11 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
               }}
             >
               <Text style={styles.pickerMain}>Caag (×{CAAG_L} L)</Text>
-              {selected ? <Text style={styles.pickerSub}>Available: {Math.floor(Number(selected.in_stock_l || 0) / CAAG_L)} caag</Text> : null}
+              {selected ? (
+                <Text style={styles.pickerSub}>
+                  Available: {Math.floor(Number(selected.in_stock_l || 0) / CAAG_L)} caag
+                </Text>
+              ) : null}
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -924,13 +1115,17 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
               }}
             >
               <Text style={styles.pickerMain}>Litir</Text>
-              {selected ? <Text style={styles.pickerSub}>Available: {Number(selected.in_stock_l || 0).toFixed(2)} L</Text> : null}
+              {selected ? (
+                <Text style={styles.pickerSub}>
+                  Available: {Number(selected.in_stock_l || 0).toFixed(2)} L
+                </Text>
+              ) : null}
             </TouchableOpacity>
           </View>
         </View>
       </Modal>
 
-      {/* Unit popup — centered (EDIT total) */}
+      {/* Unit popup — EDIT total */}
       <Modal
         visible={editUnitPickerOpen}
         transparent
@@ -955,7 +1150,6 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
             <TouchableOpacity
               style={styles.optionRowSm}
               onPress={() => {
-                // convert current liters to fuusto amount for display
                 const asFuusto = currentTotalLiters / editFuustoCap;
                 setEditQtyUnit('fuusto');
                 setEditQtyAmount(String(Number(asFuusto.toFixed(3))));
@@ -978,7 +1172,9 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
               }}
             >
               <Text style={styles.pickerMain}>Caag (×{CAAG_L} L)</Text>
-              <Text style={styles.pickerSub}>Hadda: {(currentTotalLiters / CAAG_L).toFixed(2)} caag</Text>
+              <Text style={styles.pickerSub}>
+                Hadda: {(currentTotalLiters / CAAG_L).toFixed(2)} caag
+              </Text>
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -996,12 +1192,14 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
         </View>
       </Modal>
 
-      {/* Extra Costs Modal (triggered right after RESTOCK save) */}
+      {/* Extra Costs Modal (online restock only) */}
       <OilExtraCostModal
         visible={showExtraCosts}
         onClose={() => setShowExtraCosts(false)}
         oilId={extraOilId}
-        defaultCategoryName={extraPrefillName ?? `${wakaalad?.wakaalad_name ?? ''} - dib u buuxin`}
+        defaultCategoryName={
+          extraPrefillName ?? `${wakaalad?.wakaalad_name ?? ''} - dib u buuxin`
+        }
         defaultQtyBarrel={extraPrefillQty ?? 0}
       />
     </>
@@ -1011,10 +1209,10 @@ const WakaaladActionsModal: React.FC<Props> = ({ visible, mode, wakaalad, onClos
 export default WakaaladActionsModal;
 
 const styles = StyleSheet.create({
-  // overlay behind sheet
-  backdropOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.45)' },
-
-  // bottom sheet
+  backdropOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
   sheetWrapAbs: { position: 'absolute', left: 0, right: 0, bottom: 0 },
   sheetCard: {
     flex: 1,
@@ -1033,17 +1231,43 @@ const styles = StyleSheet.create({
     shadowRadius: 16,
     elevation: 20,
   },
-  sheetHandle: { alignSelf: 'center', width: 46, height: 5, borderRadius: 3, backgroundColor: '#E5E7EB', marginBottom: 8 },
-  headerRow: { minHeight: 34, justifyContent: 'center', alignItems: 'center', marginBottom: 2 },
-  titleCenter: { fontSize: 18, fontWeight: '800', color: COLOR_TEXT, textAlign: 'center' },
-  subtitleCenter: { color: COLOR_SUB, fontSize: 11.5, textAlign: 'center', marginTop: 2 },
-
-  closeBtn: {
-    position: 'absolute', right: 4, top: -2, width: 36, height: 36, borderRadius: 10,
-    backgroundColor: '#F3F4F6', alignItems: 'center', justifyContent: 'center',
+  sheetHandle: {
+    alignSelf: 'center',
+    width: 46,
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: '#E5E7EB',
+    marginBottom: 8,
   },
-
-  // tabs
+  headerRow: {
+    minHeight: 34,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 2,
+  },
+  titleCenter: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: COLOR_TEXT,
+    textAlign: 'center',
+  },
+  subtitleCenter: {
+    color: COLOR_SUB,
+    fontSize: 11.5,
+    textAlign: 'center',
+    marginTop: 2,
+  },
+  closeBtn: {
+    position: 'absolute',
+    right: 4,
+    top: -2,
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    backgroundColor: '#F3F4F6',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   tabsRow: { flexDirection: 'row', gap: 6 },
   tabBtn: {
     flexDirection: 'row',
@@ -1058,16 +1282,33 @@ const styles = StyleSheet.create({
   },
   tabTxt: { fontSize: 11, fontWeight: '900', color: '#334155' },
 
-  // floating input styles
-  floatWrap: { borderWidth: 1.2, borderColor: COLOR_BORDER, borderRadius: 12, backgroundColor: COLOR_INPUT_BG, position: 'relative' },
-  floatLabel: { position: 'absolute', left: 10, top: -10, paddingHorizontal: 6, backgroundColor: COLOR_BG, fontSize: 11, color: COLOR_PLACEHOLDER },
+  floatWrap: {
+    borderWidth: 1.2,
+    borderColor: COLOR_BORDER,
+    borderRadius: 12,
+    backgroundColor: COLOR_INPUT_BG,
+    position: 'relative',
+  },
+  floatLabel: {
+    position: 'absolute',
+    left: 10,
+    top: -10,
+    paddingHorizontal: 6,
+    backgroundColor: COLOR_BG,
+    fontSize: 11,
+    color: COLOR_PLACEHOLDER,
+  },
   floatLabelActive: { color: COLOR_BORDER_FOCUS, fontWeight: '800' },
-  inputBase: { minHeight: 48, alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between' },
+  inputBase: {
+    minHeight: 48,
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
   inputPadded: { paddingHorizontal: 12, paddingVertical: 10 },
   inputText: { fontSize: 15, color: COLOR_TEXT },
   inputDisabled: { backgroundColor: '#F3F4F6' },
 
-  // warnings / errors
   inlineWarning: {
     marginTop: -2,
     marginBottom: 16,
@@ -1095,7 +1336,6 @@ const styles = StyleSheet.create({
   },
   errorTxt: { color: '#991B1B', fontSize: 12, fontWeight: '700' },
 
-  // action bar
   actionBar: {
     marginTop: 12,
     paddingTop: 10,
@@ -1124,7 +1364,6 @@ const styles = StyleSheet.create({
   },
   primaryTxt: { color: '#FFFFFF', fontWeight: '900', fontSize: 12, marginLeft: 6 },
 
-  // generic popup (oil + unit)
   backdrop: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: 'rgba(2,6,23,0.55)',
@@ -1157,7 +1396,12 @@ const styles = StyleSheet.create({
     backgroundColor: '#F8FAFC',
   },
   popupTitle: { fontWeight: '800', color: COLOR_TEXT, fontSize: 14 },
-  popupSearch: { borderRadius: 10, borderWidth: 1.2, borderColor: DARK_BORDER, backgroundColor: '#FFFFFF' },
+  popupSearch: {
+    borderRadius: 10,
+    borderWidth: 1.2,
+    borderColor: DARK_BORDER,
+    backgroundColor: '#FFFFFF',
+  },
   popupScroll: { maxHeight: 420 },
 
   optionRowSm: {

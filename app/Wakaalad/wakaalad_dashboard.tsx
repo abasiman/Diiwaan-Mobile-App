@@ -1,6 +1,7 @@
 // app/Wakaalad/wakaalad_dashboard.tsx
 import { Feather, Ionicons } from '@expo/vector-icons';
 import DateTimePicker from '@react-native-community/datetimepicker';
+import NetInfo from '@react-native-community/netinfo';
 import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 import dayjs from 'dayjs';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -23,54 +24,24 @@ import {
   View,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+
 import CreateWakaaladModal from '../Wakaladmodels/createwakaladmodal';
 import WakaaladActionsModal, { WakaaladActionMode } from '../Wakaladmodels/wakaaladactions';
 
-import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 
+// OFFLINE: repo + sync
+import type { WakaaladRead } from '../WakaaladOffline/wakaaladRepo';
+import { getWakaaladLocal } from '../WakaaladOffline/wakaaladRepo';
+import { syncWakaaladFromServer } from '../WakaaladOffline/wakaaladSync';
+
 const { width } = Dimensions.get('window');
-
-type OilType = 'diesel' | 'petrol' | 'kerosene' | 'jet' | 'hfo' | 'crude' | 'lube';
-
-export type WakaaladRead = {
-  id: number;
-  oil_id: number;
-  wakaalad_name: string;
-  oil_type: OilType | string;
-  original_qty: number;
-  wakaal_stock: number; // TOTAL liters in stock
-  wakaal_sold: number;  // TOTAL liters sold
-  date: string;
-  is_deleted: boolean;
-
-  // server breakdowns (remainders after splitting)
-  stock_fuusto: number;
-  stock_caag: number;
-  stock_liters: number;
-  stock_breakdown: string;
-
-  sold_fuusto: number;
-  sold_caag: number;
-  sold_liters: number;
-  sold_breakdown: string;
-};
-
-type WakaaladListResponse = {
-  items: WakaaladRead[];
-  totals: { count: number; total_stock: number; total_sold: number };
-  offset: number;
-  limit: number;
-  returned: number;
-  has_more: boolean;
-};
 
 type UnitMode = 'fuusto' | 'caag' | 'liters';
 
 const COLOR_BG = '#FFFFFF';
 const COLOR_TEXT = '#0B1221';
 const COLOR_MUTED = '#64748B';
-const COLOR_DIV = '#E5E7EB';
 const COLOR_CARD = '#F8FAFC';
 const COLOR_ACCENT = '#0B2447'; // dark blue for accents
 const COLOR_SUCCESS = '#16A34A';
@@ -90,7 +61,11 @@ function formatDateLocal(iso?: string | null) {
   if (!iso) return '—';
   const d = new Date(iso);
   if (isNaN(d.getTime())) return '—';
-  return new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: 'numeric' }).format(d);
+  return new Intl.DateTimeFormat(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  }).format(d);
 }
 function percentSold(it: WakaaladRead) {
   const total = Number(it.wakaal_stock || 0) + Number(it.wakaal_sold || 0);
@@ -127,7 +102,10 @@ export default function WakaaladDashboard() {
   const tabBarHeight = useBottomTabBarHeight?.() ?? 0;
   const fabBottom = Math.max(16, tabBarHeight + insets.bottom + 12);
 
-  const { token } = useAuth();
+  const { token, user } = useAuth();
+  const ownerId = user?.id;
+
+  const [online, setOnline] = useState(true);
 
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -151,47 +129,18 @@ export default function WakaaladDashboard() {
   const [actionMode, setActionMode] = useState<WakaaladActionMode>('edit');
   const [selectedWk, setSelectedWk] = useState<WakaaladRead | null>(null);
 
-  const headers = useMemo(
-    () => (token ? { Authorization: `Bearer ${token}` } : undefined),
-    [token]
-  );
-
   const fetchingRef = useRef(false);
 
-  const fetchWakaalads = useCallback(async () => {
-    if (!headers) return;
-    const params = {
-      start: dayjs(dateRange.startDate).toISOString(),
-      end: dayjs(dateRange.endDate).toISOString(),
-      _ts: Date.now(),
-    };
-    const res = await api.get<WakaaladListResponse>('/wakaalad_diiwaan', {
-      headers: {
-        ...headers,
-        'Cache-Control': 'no-cache',
-        Pragma: 'no-cache',
-      },
-      params,
-    });
-    setItems(res?.data?.items ?? []);
-  }, [headers, dateRange]);
-
-  const fetchAll = useCallback(async () => {
-    if (fetchingRef.current) return;
-    fetchingRef.current = true;
-    try {
-      setLoading(true);
-      await fetchWakaalads();
-    } finally {
-      setLoading(false);
-      fetchingRef.current = false;
-    }
-  }, [fetchWakaalads]);
-
+  // Connectivity watcher
   useEffect(() => {
-    fetchAll();
-  }, [fetchAll]);
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
 
+  // Hardware back → menu
   useEffect(() => {
     const onHardwareBackPress = () => {
       router.replace('/menu');
@@ -201,11 +150,56 @@ export default function WakaaladDashboard() {
     return () => sub.remove();
   }, [router]);
 
+  // OFFLINE-FIRST loader: sync from server (if online) → read from local DB
+  const loadAndMaybeSync = useCallback(
+    async (withSpinner: boolean = true) => {
+      if (!ownerId) return;
+      if (fetchingRef.current) return;
+      fetchingRef.current = true;
+
+      if (withSpinner) setLoading(true);
+      try {
+        if (online && token) {
+          try {
+            await syncWakaaladFromServer({
+              token,
+              ownerId,
+              startDate: dateRange.startDate,
+              endDate: dateRange.endDate,
+            });
+          } catch (e: any) {
+            console.warn('syncWakaaladFromServer failed', e?.message || e);
+          }
+        }
+
+        try {
+          const localItems = await getWakaaladLocal({
+            ownerId,
+            startDate: dateRange.startDate,
+            endDate: dateRange.endDate,
+          });
+          setItems(localItems);
+        } catch (e: any) {
+          console.warn('getWakaaladLocal failed', e?.message || e);
+        }
+      } finally {
+        if (withSpinner) setLoading(false);
+        fetchingRef.current = false;
+      }
+    },
+    [ownerId, online, token, dateRange.startDate, dateRange.endDate]
+  );
+
+  // Initial load and re-load when owner/date-range/online changes
+  useEffect(() => {
+    loadAndMaybeSync(true);
+  }, [loadAndMaybeSync]);
+
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await fetchAll();
+    await loadAndMaybeSync(false);
     setRefreshing(false);
-  }, [fetchAll]);
+  }, [loadAndMaybeSync]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -235,7 +229,7 @@ export default function WakaaladDashboard() {
 
   // Always derive from TOTAL liters (wakaal_stock / wakaal_sold)
   const totalLitersStock = (it: WakaaladRead) => Number(it.wakaal_stock || 0);
-  const totalLitersSold  = (it: WakaaladRead) => Number(it.wakaal_sold || 0);
+  const totalLitersSold = (it: WakaaladRead) => Number(it.wakaal_sold || 0);
 
   function stockValue(it: WakaaladRead): number {
     const liters = totalLitersStock(it);
@@ -274,7 +268,6 @@ export default function WakaaladDashboard() {
           start={{ x: 0, y: 0 }}
           end={{ x: 1, y: 0 }}
           style={[styles.header, { paddingTop: 6, overflow: 'hidden' }]}
-
         >
           <View style={styles.headerRowTop}>
             {/* Back */}
@@ -291,10 +284,10 @@ export default function WakaaladDashboard() {
             <View style={{ flex: 1, alignItems: 'center' }}>
               <Text style={styles.headerTitle}>Wakaalad</Text>
               <Text style={styles.headerDate}>
-                {dayjs(dateRange.startDate).format('MMM D, YYYY')} – {dayjs(dateRange.endDate).format('MMM D, YYYY')}
+                {dayjs(dateRange.startDate).format('MMM D, YYYY')} –{' '}
+                {dayjs(dateRange.endDate).format('MMM D, YYYY')}
               </Text>
             </View>
-
           </View>
         </LinearGradient>
       </SafeAreaView>
@@ -319,7 +312,10 @@ export default function WakaaladDashboard() {
             </TouchableOpacity>
           )}
 
-          <TouchableOpacity onPress={() => setShowFilters(true)} style={styles.headerFilterBtnSmall}>
+          <TouchableOpacity
+            onPress={() => setShowFilters(true)}
+            style={styles.headerFilterBtnSmall}
+          >
             <Feather name="filter" size={12} color={COLOR_ACCENT} />
             <Text style={styles.headerFilterTxtSmall}>DATE</Text>
           </TouchableOpacity>
@@ -341,7 +337,9 @@ export default function WakaaladDashboard() {
                 style={[styles.unitChip, active && styles.unitChipActive]}
               >
                 <Feather name="layers" size={12} color={active ? '#fff' : COLOR_ACCENT} />
-                <Text style={[styles.unitChipTxt, active && styles.unitChipTxtActive]}>{label}</Text>
+                <Text style={[styles.unitChipTxt, active && styles.unitChipTxtActive]}>
+                  {label}
+                </Text>
               </TouchableOpacity>
             );
           })}
@@ -352,7 +350,7 @@ export default function WakaaladDashboard() {
       <ScrollView
         contentContainerStyle={[
           styles.scrollContent,
-          { paddingBottom: 24 + tabBarHeight + insets.bottom + 80 }, // keep content above tabs & FAB
+          { paddingBottom: 24 + tabBarHeight + insets.bottom + 80 },
         ]}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
         keyboardShouldPersistTaps="handled"
@@ -369,7 +367,7 @@ export default function WakaaladDashboard() {
           </View>
         ) : (
           filtered.map((wk) => {
-            const pctSold  = percentSold(wk);
+            const pctSold = percentSold(wk);
             const pctStock = percentStock(wk);
             const totalLiters = (wk.wakaal_stock || 0) + (wk.wakaal_sold || 0);
 
@@ -401,7 +399,9 @@ export default function WakaaladDashboard() {
                   <View style={styles.metaRow}>
                     <View style={styles.metaPill}>
                       <Feather name="droplet" size={10} color={COLOR_TEXT} />
-                      <Text style={styles.metaText}>{String(wk.oil_type || '—').toUpperCase()}</Text>
+                      <Text style={styles.metaText}>
+                        {String(wk.oil_type || '—').toUpperCase()}
+                      </Text>
                     </View>
                     <View style={styles.metaPill}>
                       <Feather name="calendar" size={10} color={COLOR_TEXT} />
@@ -409,7 +409,9 @@ export default function WakaaladDashboard() {
                     </View>
                     <View style={styles.metaPill}>
                       <Feather name="database" size={10} color={COLOR_TEXT} />
-                      <Text style={styles.metaText}>Total {formatNumber(totalLiters)} L</Text>
+                      <Text style={styles.metaText}>
+                        Total {formatNumber(totalLiters)} L
+                      </Text>
                     </View>
                   </View>
 
@@ -464,7 +466,6 @@ export default function WakaaladDashboard() {
       </ScrollView>
 
       {/* ===== FAB (above bottom tabs) ===== */}
-      {/* ===== FAB (above bottom tabs) ===== */}
       <TouchableOpacity
         style={[styles.fab, { bottom: fabBottom }]}
         onPress={() => setCreateOpen(true)}
@@ -484,9 +485,13 @@ export default function WakaaladDashboard() {
         </LinearGradient>
       </TouchableOpacity>
 
-
       {/* Filters (DATE) Modal */}
-      <Modal visible={showFilters} transparent animationType="fade" onRequestClose={() => setShowFilters(false)}>
+      <Modal
+        visible={showFilters}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowFilters(false)}
+      >
         <TouchableWithoutFeedback onPress={() => setShowFilters(false)}>
           <View style={styles.modalBackdrop}>
             <TouchableWithoutFeedback onPress={() => {}}>
@@ -506,27 +511,42 @@ export default function WakaaladDashboard() {
                   <View style={styles.filterSection}>
                     <Text style={styles.filterLabel}>Date Range</Text>
                     <View style={styles.dateRangeContainer}>
-                      <TouchableOpacity style={styles.dateBtn} onPress={() => setShowDatePicker('start')}>
-                        <Text style={styles.dateBtnText}>{dayjs(dateRange.startDate).format('MMM D, YYYY')}</Text>
+                      <TouchableOpacity
+                        style={styles.dateBtn}
+                        onPress={() => setShowDatePicker('start')}
+                      >
+                        <Text style={styles.dateBtnText}>
+                          {dayjs(dateRange.startDate).format('MMM D, YYYY')}
+                        </Text>
                         <Feather name="calendar" size={12} color={COLOR_ACCENT} />
                       </TouchableOpacity>
                       <Text style={styles.rangeSep}>to</Text>
-                      <TouchableOpacity style={styles.dateBtn} onPress={() => setShowDatePicker('end')}>
-                        <Text style={styles.dateBtnText}>{dayjs(dateRange.endDate).format('MMM D, YYYY')}</Text>
+                      <TouchableOpacity
+                        style={styles.dateBtn}
+                        onPress={() => setShowDatePicker('end')}
+                      >
+                        <Text style={styles.dateBtnText}>
+                          {dayjs(dateRange.endDate).format('MMM D, YYYY')}
+                        </Text>
                         <Feather name="calendar" size={12} color={COLOR_ACCENT} />
                       </TouchableOpacity>
                     </View>
 
                     {showDatePicker && (
                       <DateTimePicker
-                        value={showDatePicker === 'start' ? dateRange.startDate : dateRange.endDate}
+                        value={
+                          showDatePicker === 'start'
+                            ? dateRange.startDate
+                            : dateRange.endDate
+                        }
                         mode="date"
                         display={Platform.OS === 'ios' ? 'spinner' : 'default'}
                         onChange={(_, sel) => {
+                          const mode = showDatePicker; // capture before clearing
                           setShowDatePicker(null);
-                          if (!sel) return;
+                          if (!sel || !mode) return;
                           setDateRange((prev) =>
-                            showDatePicker === 'start'
+                            mode === 'start'
                               ? { ...prev, startDate: dayjs(sel).startOf('day').toDate() }
                               : { ...prev, endDate: dayjs(sel).endOf('day').toDate() }
                           );
@@ -548,7 +568,13 @@ export default function WakaaladDashboard() {
                   >
                     <Text style={styles.resetTxt}>Reset</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity style={styles.applyBtn} onPress={() => setShowFilters(false)}>
+                  <TouchableOpacity
+                    style={styles.applyBtn}
+                    onPress={() => {
+                      setShowFilters(false);
+                      loadAndMaybeSync(true);
+                    }}
+                  >
                     <Text style={styles.applyTxt}>Apply</Text>
                   </TouchableOpacity>
                 </View>
@@ -564,7 +590,7 @@ export default function WakaaladDashboard() {
         onClose={() => setCreateOpen(false)}
         onCreated={() => {
           setCreateOpen(false);
-          fetchAll();
+          loadAndMaybeSync(false);
         }}
       />
 
@@ -576,7 +602,7 @@ export default function WakaaladDashboard() {
         onClose={() => setActionModalOpen(false)}
         onSuccess={() => {
           setActionModalOpen(false);
-          fetchAll();
+          loadAndMaybeSync(false);
         }}
       />
     </View>
@@ -589,16 +615,16 @@ const styles = StyleSheet.create({
   page: { flex: 1, backgroundColor: COLOR_BG },
 
   header: {
-  paddingBottom: 18,
-  paddingHorizontal: 16,
-  borderBottomLeftRadius: 22,
-  borderBottomRightRadius: 22,
-  shadowColor: '#000',
-  shadowOffset: { width: 0, height: 4 },
-  shadowOpacity: 0.1,
-  shadowRadius: 12,
-  elevation: 4,
-},
+    paddingBottom: 18,
+    paddingHorizontal: 16,
+    borderBottomLeftRadius: 22,
+    borderBottomRightRadius: 22,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.1,
+    shadowRadius: 12,
+    elevation: 4,
+  },
 
   headerRowTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   backBtn: {
@@ -633,8 +659,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 6,
     borderRadius: 10,
-    borderWidth: 1.5,              // thicker border
-    borderColor: COLOR_ACCENT,     // <- dark blue border
+    borderWidth: 1.5, // thicker border
+    borderColor: COLOR_ACCENT, // dark blue border
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
@@ -804,32 +830,31 @@ const styles = StyleSheet.create({
   fab: {
     position: 'absolute',
     right: 20,
-    // bottom set dynamically
-    zIndex: 999,          // iOS stacking
-    elevation: 12,        // Android stacking
+    zIndex: 999, // iOS stacking
+    elevation: 12, // Android stacking
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 3 },
     shadowOpacity: 0.25,
     shadowRadius: 7,
   },
- fabGradient: {
-  // was: width: 52,
-  minWidth: 52,
-  height: 52,
-  paddingHorizontal: 14,      // room for label
-  borderRadius: 26,
-  justifyContent: 'center',
-  alignItems: 'center',
-  flexDirection: 'row',       // icon + text inline
-  gap: 8,                     // space between icon and text
-},
+  fabGradient: {
+    minWidth: 52,
+    height: 52,
+    paddingHorizontal: 14,
+    borderRadius: 26,
+    justifyContent: 'center',
+    alignItems: 'center',
+    flexDirection: 'row', // icon + text inline
+    gap: 8,
+  },
 
-fabText: {
-  color: '#FFFFFF',
-  fontSize: 12,
-  fontWeight: '800',
-  letterSpacing: 0.2,
-},
+  fabText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 0.2,
+  },
+
   // Modal
   modalBackdrop: {
     flex: 1,
@@ -885,6 +910,12 @@ fabText: {
     backgroundColor: 'white',
   },
   resetTxt: { fontSize: 11, fontWeight: '800', color: '#1F2937' },
-  applyBtn: { flex: 1, padding: 9, borderRadius: 8, backgroundColor: COLOR_ACCENT, alignItems: 'center' },
+  applyBtn: {
+    flex: 1,
+    padding: 9,
+    borderRadius: 8,
+    backgroundColor: COLOR_ACCENT,
+    alignItems: 'center',
+  },
   applyTxt: { fontSize: 11, fontWeight: '800', color: 'white' },
 });

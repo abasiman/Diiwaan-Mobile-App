@@ -1,3 +1,4 @@
+// paymentcreatesheet.tsx
 import api from '@/services/api';
 import { Feather, FontAwesome } from '@expo/vector-icons';
 import * as Sharing from 'expo-sharing';
@@ -20,8 +21,10 @@ import {
   TouchableWithoutFeedback,
   View,
 } from 'react-native';
+
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { captureRef } from 'react-native-view-shot';
+import { queuePaymentForSync } from './paymentOfflineRepo';
 
 type Props = {
   visible: boolean;
@@ -38,6 +41,10 @@ type Props = {
 
   /** 👇 shown at the top of the sheet + used to prefill */
   currentDue?: number; // USD
+
+  /** offline queue */
+  ownerId?: number | null;
+  online?: boolean;
 };
 
 type Method = 'cash' | 'custom';
@@ -61,6 +68,8 @@ export default function PaymentCreateSheet({
   companyName,
   companyContact,
   currentDue = 0,
+  ownerId,
+  online = true,
 }: Props) {
   const insets = useSafeAreaInsets();
   const bottomSafe = insets.bottom || 0;
@@ -174,11 +183,16 @@ export default function PaymentCreateSheet({
       const webLink = `https://wa.me/${digits}?text=${msg}`;
       const canDeep = await Linking.canOpenURL('whatsapp://send');
       if (canDeep) {
-        try { await Linking.openURL(deepLink); break theMsg; } catch {}
+        try {
+          await Linking.openURL(deepLink);
+          break theMsg;
+        } catch {}
       }
       const canWeb = await Linking.canOpenURL(webLink);
       if (canWeb) {
-        try { await Linking.openURL(webLink); } catch {}
+        try {
+          await Linking.openURL(webLink);
+        } catch {}
       } else {
         Alert.alert('WhatsApp unavailable', 'Could not open WhatsApp on this device.');
       }
@@ -230,66 +244,109 @@ export default function PaymentCreateSheet({
         }
       }, 180);
     }
-    return () => { if (t) clearTimeout(t); };
+    return () => {
+      if (t) clearTimeout(t);
+    };
   }, [showReceipt, newDue, paidAmt]);
 
-  const onSave = async () => {
-    if (!customerId) return Alert.alert('Fadlan', 'Macmiilka lama helin.');
-    const amtNum = sanitizeAmountToNumber(amount);
-    if (!(amtNum > 0)) return Alert.alert('Fadlan', 'Geli lacag sax ah (ka weyn 0).');
+ const onSave = async () => {
+  if (!customerId) return Alert.alert('Fadlan', 'Macmiilka lama helin.');
+  const amtNum = sanitizeAmountToNumber(amount);
+  if (!(amtNum > 0)) return Alert.alert('Fadlan', 'Geli lacag sax ah (ka weyn 0).');
 
-    // Clamp overpay to due (never create negative balances)
-    const dueNow = Math.max(0, currentDue || 0);
-    const payAmount = Math.min(amtNum, dueNow);
+  // Clamp overpay to due (never create negative balances)
+  const dueNow = Math.max(0, currentDue || 0);
+  const payAmount = Math.min(amtNum, dueNow);
 
-    if (amtNum > dueNow && dueNow > 0) {
-      Alert.alert(
-        'Overpayment adjusted',
-        `Waxaad gelisay ${fmtMoney(amtNum)}, balse kugu dhiman waa ${fmtMoney(dueNow)}. Waxaan kuu qaadanay ${fmtMoney(payAmount)}.`
-      );
-    }
-    if (dueNow === 0) {
-      Alert.alert('No amount due', 'Macmiilkan lama laha wax deyn ah.');
-      return;
-    }
+  if (amtNum > dueNow && dueNow > 0) {
+    Alert.alert(
+      'Overpayment adjusted',
+      `Waxaad gelisay ${fmtMoney(amtNum)}, balse kugu dhiman waa ${fmtMoney(
+        dueNow
+      )}. Waxaan kuu qaadanay ${fmtMoney(payAmount)}.`
+    );
+  }
+  if (dueNow === 0) {
+    Alert.alert('No amount due', 'Macmiilkan lama laha wax deyn ah.');
+    return;
+  }
 
-    // Resolve payment method string (either "cash" or custom text)
-    const paymentMethod =
-      method === 'cash' ? 'cash' : (customMethod.trim() || 'custom');
+  const paymentMethod =
+    method === 'cash' ? 'cash' : (customMethod.trim() || 'custom');
 
-    setSubmitting(true);
-    try {
-      await api.post(
-        '/diiwaanpayments',
-        {
-          amount: payAmount,
-          customer_id: customerId,
-          payment_method: paymentMethod,
-        },
-        { headers: authHeader }
-      );
-
-      // update local receipt values
-      const remain = Math.max(0, dueNow - payAmount);
-      setPaidAmt(payAmount);
-      setPrevDue(dueNow);
-      setNewDue(remain);
-      setSavedAt(new Date());
-
-      onCreated?.();
-
-      // reset inputs
-      setAmount('');
-      setMethod('cash');
-
-      onClose();            // close form
-      setShowReceipt(true); // open receipt
-    } catch (e: any) {
-      Alert.alert('Error', String(e?.response?.data?.detail || e?.message || 'Save failed.'));
-    } finally {
-      setSubmitting(false);
-    }
+  const payload = {
+    amount: payAmount,
+    customer_id: customerId,
+    payment_method: paymentMethod,
   };
+
+  setSubmitting(true);
+  try {
+    let handledOffline = false;
+
+    // 1) If we *believe* we are online and have token → try API
+    if (online && token) {
+      try {
+        await api.post('/diiwaanpayments', payload, { headers: authHeader });
+      } catch (e: any) {
+        const isNetworkError = !e?.response; // no HTTP response → likely offline / network
+        if (ownerId && isNetworkError) {
+          // ✅ fallback to offline queue instead of showing network error popup
+          queuePaymentForSync(ownerId, payload);
+          handledOffline = true;
+          Alert.alert(
+            'Offline mode',
+            'Internet ma jiro. Bixinta waxaa lagu kaydiyay offline, waxaana lala sync-gareyn doonaa marka aad online noqoto.'
+          );
+        } else {
+          // real server error – rethrow so catch below handles it
+          throw e;
+        }
+      }
+    } else {
+      // 2) Clearly offline (or no token) → queue directly
+      if (!ownerId) {
+        Alert.alert(
+          'Offline payment',
+          'Owner ID lama helin, lama kaydin karo bixinta offline.'
+        );
+        return;
+      }
+      queuePaymentForSync(ownerId, payload);
+      handledOffline = true;
+      Alert.alert(
+        'Offline mode',
+        'Bixinta ayaa offline loogu kaydiyay. Waxaa lala sync-gareyn doonaa marka aad online noqoto.'
+      );
+    }
+
+    // If we reached here, either:
+    // - online API succeeded, OR
+    // - we queued offline successfully.
+    const remain = Math.max(0, dueNow - payAmount);
+    setPaidAmt(payAmount);
+    setPrevDue(dueNow);
+    setNewDue(remain);
+    setSavedAt(new Date());
+
+    onCreated?.();
+
+    // reset inputs
+    setAmount('');
+    setMethod('cash');
+
+    onClose();            // close form
+    setShowReceipt(true); // open receipt
+  } catch (e: any) {
+    // Only show this for *real* failures (not network fallback)
+    Alert.alert(
+      'Error',
+      String(e?.response?.data?.detail || e?.message || 'Save failed.')
+    );
+  } finally {
+    setSubmitting(false);
+  }
+};
 
   const shareImage = async () => {
     if (!receiptUri) return;
@@ -343,28 +400,47 @@ export default function PaymentCreateSheet({
             keyboardVerticalOffset={Platform.OS === 'ios' ? 18 : 0}
             style={{ flex: 1 }}
           >
-            <View style={[styles.sheetCard, { paddingBottom: Math.max(16, bottomSafe) }]}>
+            <View
+              style={[
+                styles.sheetCard,
+                { paddingBottom: Math.max(16, bottomSafe) },
+              ]}
+            >
               <View style={styles.sheetHandle} />
               <Text style={styles.title}>Bixi deyn</Text>
 
               {/* 👉 DUE banner */}
               <View style={dueStyles.banner}>
-                <Text style={dueStyles.left}>
-                  Amount due
-                </Text>
+                <Text style={dueStyles.left}>Amount due</Text>
                 <Text style={dueStyles.right}>
                   {fmtMoney(Math.max(0, currentDue || 0))}
                 </Text>
               </View>
 
-              <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: 18 }}>
-
+              <ScrollView
+                keyboardShouldPersistTaps="handled"
+                contentContainerStyle={{ paddingBottom: 18 }}
+              >
                 {/* Amount to receive */}
                 <View style={styles.row}>
-                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <View
+                    style={{
+                      flexDirection: 'row',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                    }}
+                  >
                     <Text style={styles.label}>Amount to receive</Text>
                     <TouchableOpacity
-                      onPress={() => setAmount((Math.round(Math.max(0, currentDue || 0) * 100) / 100).toFixed(2))}
+                      onPress={() =>
+                        setAmount(
+                          (
+                            Math.round(
+                              Math.max(0, currentDue || 0) * 100
+                            ) / 100
+                          ).toFixed(2)
+                        )
+                      }
                       style={dueStyles.quickFill}
                       activeOpacity={0.8}
                     >
@@ -384,7 +460,10 @@ export default function PaymentCreateSheet({
                     placeholderTextColor="#9CA3AF"
                     style={[
                       styles.input,
-                      isOverpay && { borderColor: '#FCA5A5', backgroundColor: '#FFF7F7' },
+                      isOverpay && {
+                        borderColor: '#FCA5A5',
+                        backgroundColor: '#FFF7F7',
+                      },
                     ]}
                     maxLength={18}
                   />
@@ -398,8 +477,12 @@ export default function PaymentCreateSheet({
                     }}
                   >
                     {isOverpay
-                      ? `Over by ${fmtMoney(typedAmt - Math.max(0, currentDue || 0))} (will be adjusted)`
-                      : `Remaining after receive: ${fmtMoney(remainingPreview)}`}
+                      ? `Over by ${fmtMoney(
+                          typedAmt - Math.max(0, currentDue || 0)
+                        )} (will be adjusted)`
+                      : `Remaining after receive: ${fmtMoney(
+                          remainingPreview
+                        )}`}
                   </Text>
                 </View>
 
@@ -408,7 +491,14 @@ export default function PaymentCreateSheet({
                   <Text style={styles.label}>Method</Text>
 
                   {/* Cash pill */}
-                  <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+                  <View
+                    style={{
+                      flexDirection: 'row',
+                      gap: 8,
+                      alignItems: 'center',
+                      marginBottom: 8,
+                    }}
+                  >
                     <TouchableOpacity
                       activeOpacity={0.8}
                       onPress={() => setMethod('cash')}
@@ -417,7 +507,11 @@ export default function PaymentCreateSheet({
                         method === 'cash' ? methodPillStyles.pillActive : null,
                       ]}
                     >
-                      <Feather name="dollar-sign" size={16} color={method === 'cash' ? '#fff' : TEXT} />
+                      <Feather
+                        name="dollar-sign"
+                        size={16}
+                        color={method === 'cash' ? '#fff' : TEXT}
+                      />
                       <Text
                         style={[
                           methodPillStyles.pillTxt,
@@ -441,7 +535,13 @@ export default function PaymentCreateSheet({
                         placeholderTextColor="#9CA3AF"
                         style={styles.input}
                       />
-                      <Text style={{ color: MUTED, fontSize: 11, marginTop: 4 }}>
+                      <Text
+                        style={{
+                          color: MUTED,
+                          fontSize: 11,
+                          marginTop: 4,
+                        }}
+                      >
                         If filled, this will be used instead of Cash.
                       </Text>
                     </View>
@@ -450,7 +550,11 @@ export default function PaymentCreateSheet({
 
                 {/* Actions */}
                 <View style={[styles.actions, { marginTop: 0 }]}>
-                  <TouchableOpacity style={[styles.btn, styles.btnGhost]} onPress={close} disabled={submitting}>
+                  <TouchableOpacity
+                    style={[styles.btn, styles.btnGhost]}
+                    onPress={close}
+                    disabled={submitting}
+                  >
                     <Text style={styles.btnGhostText}>Cancel</Text>
                   </TouchableOpacity>
                   <TouchableOpacity
@@ -475,7 +579,12 @@ export default function PaymentCreateSheet({
       </Modal>
 
       {/* IMAGE-ONLY Receipt Popup */}
-      <Modal visible={showReceipt} transparent animationType="fade" onRequestClose={() => setShowReceipt(false)}>
+      <Modal
+        visible={showReceipt}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowReceipt(false)}
+      >
         <TouchableWithoutFeedback onPress={() => setShowReceipt(false)}>
           <View style={styles.backdrop} />
         </TouchableWithoutFeedback>
@@ -536,58 +645,102 @@ export default function PaymentCreateSheet({
 
             <Text style={styles.footerThanks}>Mahadsanid!</Text>
             <Text style={styles.footerFine}>
-              Rasiidkan waa caddeyn bixinta lacagta. Fadlan la xiriir haddii aad qabtid su’aal.
+              Rasiidkan waa caddeyn bixinta lacagta. Fadlan la xiriir haddii aad
+              qabtid su’aal.
             </Text>
           </View>
         </View>
       </Modal>
 
       {/* Modern Share Chooser */}
-      <Modal visible={shareOpen} transparent animationType="slide" onRequestClose={closeShareAndReceipt}>
+      <Modal
+        visible={shareOpen}
+        transparent
+        animationType="slide"
+        onRequestClose={closeShareAndReceipt}
+      >
         <TouchableWithoutFeedback onPress={closeShareAndReceipt}>
           <View style={styles.sheetBackdrop} />
         </TouchableWithoutFeedback>
-        <View style={[styles.shareSheetContainer, { paddingBottom: Math.max(20, bottomSafe + 6) }]}>
+        <View
+          style={[
+            styles.shareSheetContainer,
+            { paddingBottom: Math.max(20, bottomSafe + 6) },
+          ]}
+        >
           <View style={styles.sheetHandle} />
           <Text style={styles.sheetTitle}>Udir rasiidka</Text>
-          <Text style={styles.sheetDesc}>Dooro meesha aad ku wadaagi doonto rasiidka sawirka (PNG) iyo fariinta.</Text>
+          <Text style={styles.sheetDesc}>
+            Dooro meesha aad ku wadaagi doonto rasiidka sawirka (PNG) iyo
+            fariinta.
+          </Text>
 
           <View style={styles.sheetList}>
-            <TouchableOpacity style={styles.sheetItem} onPress={shareViaWhatsApp} activeOpacity={0.9}>
-              <View style={[styles.sheetIcon, { backgroundColor: '#E7F9EF' }]}>
+            <TouchableOpacity
+              style={styles.sheetItem}
+              onPress={shareViaWhatsApp}
+              activeOpacity={0.9}
+            >
+              <View
+                style={[styles.sheetIcon, { backgroundColor: '#E7F9EF' }]}
+              >
                 <FontAwesome name="whatsapp" size={18} color="#25D366" />
               </View>
               <View style={{ flex: 1 }}>
                 <Text style={styles.sheetItemTitle}>WhatsApp</Text>
-                <Text style={styles.sheetItemSub}>Share image then open chat with text</Text>
+                <Text style={styles.sheetItemSub}>
+                  Share image then open chat with text
+                </Text>
               </View>
               <Feather name="chevron-right" size={18} color="#6B7280" />
             </TouchableOpacity>
 
-            <TouchableOpacity style={styles.sheetItem} onPress={shareViaSms} activeOpacity={0.9}>
-              <View style={[styles.sheetIcon, { backgroundColor: '#EEF2FF' }]}>
+            <TouchableOpacity
+              style={styles.sheetItem}
+              onPress={shareViaSms}
+              activeOpacity={0.9}
+            >
+              <View
+                style={[styles.sheetIcon, { backgroundColor: '#EEF2FF' }]}
+              >
                 <Feather name="message-circle" size={18} color="#4F46E5" />
               </View>
               <View style={{ flex: 1 }}>
                 <Text style={styles.sheetItemTitle}>SMS</Text>
-                <Text style={styles.sheetItemSub}>Share image via sheet, then prefill SMS</Text>
+                <Text style={styles.sheetItemSub}>
+                  Share image via sheet, then prefill SMS
+                </Text>
               </View>
               <Feather name="chevron-right" size={18} color="#6B7280" />
             </TouchableOpacity>
 
-            <TouchableOpacity style={styles.sheetItem} onPress={async () => { await shareImage(); closeShareAndReceipt(); }} activeOpacity={0.9}>
-              <View style={[styles.sheetIcon, { backgroundColor: '#F5F7FB' }]}>
+            <TouchableOpacity
+              style={styles.sheetItem}
+              onPress={async () => {
+                await shareImage();
+                closeShareAndReceipt();
+              }}
+              activeOpacity={0.9}
+            >
+              <View
+                style={[styles.sheetIcon, { backgroundColor: '#F5F7FB' }]}
+              >
                 <Feather name="share-2" size={18} color="#0B2447" />
               </View>
               <View style={{ flex: 1 }}>
                 <Text style={styles.sheetItemTitle}>System Share</Text>
-                <Text style={styles.sheetItemSub}>Let the device choose an app</Text>
+                <Text style={styles.sheetItemSub}>
+                  Let the device choose an app
+                </Text>
               </View>
               <Feather name="chevron-right" size={18} color="#6B7280" />
             </TouchableOpacity>
           </View>
 
-          <TouchableOpacity style={styles.sheetCancel} onPress={closeShareAndReceipt}>
+          <TouchableOpacity
+            style={styles.sheetCancel}
+            onPress={closeShareAndReceipt}
+          >
             <Text style={styles.sheetCancelTxt}>Close</Text>
           </TouchableOpacity>
         </View>
@@ -649,78 +802,260 @@ const methodPillStyles = StyleSheet.create({
 /* keep your existing styles below (unchanged) */
 const styles = StyleSheet.create({
   // --- Shared Backdrop ---
-  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.45)' },
+  backdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
   sheetWrap: { position: 'absolute', left: 0, right: 0, bottom: 0 },
   sheetCard: {
-    flex: 1, backgroundColor: BG, borderTopLeftRadius: 22, borderTopRightRadius: 22,
-    paddingHorizontal: 16, paddingTop: 10, borderTopWidth: 1, borderLeftWidth: 1, borderRightWidth: 1,
-    borderColor: BORDER, shadowColor: '#000', shadowOpacity: 0.18, shadowOffset: { width: 0, height: -8 },
-    shadowRadius: 16, elevation: 20,
+    flex: 1,
+    backgroundColor: BG,
+    borderTopLeftRadius: 22,
+    borderTopRightRadius: 22,
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderLeftWidth: 1,
+    borderRightWidth: 1,
+    borderColor: BORDER,
+    shadowColor: '#000',
+    shadowOpacity: 0.18,
+    shadowOffset: { width: 0, height: -8 },
+    shadowRadius: 16,
+    elevation: 20,
   },
-  sheetHandle: { alignSelf: 'center', width: 46, height: 5, borderRadius: 3, backgroundColor: '#E5E7EB', marginBottom: 8 },
-  title: { fontSize: 18, fontWeight: '800', marginBottom: 10, color: TEXT, textAlign: 'center' },
+  sheetHandle: {
+    alignSelf: 'center',
+    width: 46,
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: '#E5E7EB',
+    marginBottom: 8,
+  },
+  title: {
+    fontSize: 18,
+    fontWeight: '800',
+    marginBottom: 10,
+    color: TEXT,
+    textAlign: 'center',
+  },
   row: { marginBottom: 14 },
   label: { fontWeight: '700', color: TEXT, marginBottom: 6 },
-  input: { backgroundColor: '#fff', borderWidth: 1, borderColor: BORDER, borderRadius: 12, paddingHorizontal: 12, height: 48, color: TEXT },
-  select: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  input: {
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    height: 48,
+    color: TEXT,
+  },
+  select: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
   selectText: { color: TEXT, fontWeight: '600' },
   menu: {
-    position: 'absolute', top: 52, left: 0, right: 0, backgroundColor: BG, borderWidth: 1, borderColor: BORDER,
-    borderRadius: 12, overflow: 'hidden', elevation: 16, shadowColor: '#000', shadowOpacity: 0.18,
-    shadowOffset: { width: 0, height: 8 }, shadowRadius: 12, zIndex: 50,
+    position: 'absolute',
+    top: 52,
+    left: 0,
+    right: 0,
+    backgroundColor: BG,
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 12,
+    overflow: 'hidden',
+    elevation: 16,
+    shadowColor: '#000',
+    shadowOpacity: 0.18,
+    shadowOffset: { width: 0, height: 8 },
+    shadowRadius: 12,
+    zIndex: 50,
   },
   menuItem: { paddingVertical: 12, paddingHorizontal: 12 },
   menuItemText: { color: TEXT, fontWeight: '600' },
   actions: { flexDirection: 'row', gap: 10 },
   btn: {
-    flex: 1, height: 48, borderRadius: 12, backgroundColor: ACCENT,
-    alignItems: 'center', justifyContent: 'center', flexDirection: 'row', gap: 8,
+    flex: 1,
+    height: 48,
+    borderRadius: 12,
+    backgroundColor: ACCENT,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    gap: 8,
   },
   btnTxt: { color: '#fff', fontWeight: '800' },
   btnGhost: { backgroundColor: '#fff', borderWidth: 1, borderColor: BORDER },
   btnGhostText: { color: TEXT, fontWeight: '800' },
 
-  // receipt popup & share styles (unchanged from your version)...
-  paperCenter: { ...StyleSheet.absoluteFillObject, padding: 18, justifyContent: 'center', alignItems: 'center' },
-  paperNotchLeft: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: 'rgba(0,0,0,0.05)', left: '50%', marginLeft: -(PAPER_W / 2) - 7, top: '20%' },
-  paperNotchRight: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: 'rgba(0,0,0,0.05)', right: '50%', marginRight: -(PAPER_W / 2) - 7, bottom: '22%' },
-  paper: {
-    width: PAPER_W, backgroundColor: '#FFFEFC', borderRadius: 12, borderWidth: 1, borderColor: '#E9EDF5',
-    paddingVertical: 14, paddingHorizontal: 14, shadowColor: '#000', shadowOpacity: 0.06,
-    shadowOffset: { width: 0, height: 8 }, shadowRadius: 12, elevation: 4,
+  // receipt popup & share styles
+  paperCenter: {
+    ...StyleSheet.absoluteFillObject,
+    padding: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
   },
-  paperCompany: { textAlign: 'center', fontSize: 14, fontWeight: '900', color: TEXT },
-  paperCompanySub: { textAlign: 'center', fontSize: 11, color: MUTED, marginTop: 2 },
-  paperTitle: { textAlign: 'center', fontSize: 13, color: '#475569', fontWeight: '800', marginTop: 2 },
-  paperMeta: { textAlign: 'center', fontSize: 11, color: MUTED, marginTop: 2 },
-  dots: { borderBottomWidth: 1, borderStyle: 'dotted', borderColor: '#C7D2FE', marginVertical: 10 },
-  rowKV: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
+  paperNotchLeft: {
+    position: 'absolute',
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: 'rgba(0,0,0,0.05)',
+    left: '50%',
+    marginLeft: -(PAPER_W / 2) - 7,
+    top: '20%',
+  },
+  paperNotchRight: {
+    position: 'absolute',
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: 'rgba(0,0,0,0.05)',
+    right: '50%',
+    marginRight: -(PAPER_W / 2) - 7,
+    bottom: '22%',
+  },
+  paper: {
+    width: PAPER_W,
+    backgroundColor: '#FFFEFC',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#E9EDF5',
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    shadowColor: '#000',
+    shadowOpacity: 0.06,
+    shadowOffset: { width: 0, height: 8 },
+    shadowRadius: 12,
+    elevation: 4,
+  },
+  paperCompany: {
+    textAlign: 'center',
+    fontSize: 14,
+    fontWeight: '900',
+    color: TEXT,
+  },
+  paperCompanySub: {
+    textAlign: 'center',
+    fontSize: 11,
+    color: MUTED,
+    marginTop: 2,
+  },
+  paperTitle: {
+    textAlign: 'center',
+    fontSize: 13,
+    color: '#475569',
+    fontWeight: '800',
+    marginTop: 2,
+  },
+  paperMeta: {
+    textAlign: 'center',
+    fontSize: 11,
+    color: MUTED,
+    marginTop: 2,
+  },
+  dots: {
+    borderBottomWidth: 1,
+    borderStyle: 'dotted',
+    borderColor: '#C7D2FE',
+    marginVertical: 10,
+  },
+  rowKV: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
   k: { color: '#475569', fontSize: 12, fontWeight: '700' },
   v: { color: TEXT, fontSize: 12, fontWeight: '800' },
   vDanger: { color: '#DC2626' },
   vOk: { color: '#059669' },
   amountBlock: { alignItems: 'center', marginVertical: 4 },
-  amountLabel: { fontSize: 11, color: '#64748B', fontWeight: '700', marginBottom: 2 },
-  amountValue: { fontSize: 20, fontWeight: '900', color: '#059669' },
-  noteLabel: { color: '#64748B', fontSize: 11, fontWeight: '700', marginBottom: 4 },
-  noteText: { color: TEXT, fontSize: 12, lineHeight: 16 },
-  footerThanks: { textAlign: 'center', fontSize: 12, fontWeight: '900', color: TEXT, marginTop: 8 },
-  footerFine: { textAlign: 'center', fontSize: 11, color: MUTED, marginTop: 4 },
-  sheetBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.35)' },
-  shareSheetContainer: {
-    position: 'absolute', left: 0, right: 0, bottom: 0, backgroundColor: '#fff', borderTopLeftRadius: 22,
-    borderTopRightRadius: 22, paddingHorizontal: 16, paddingTop: 10, borderWidth: 1, borderColor: '#EEF1F6',
+  amountLabel: {
+    fontSize: 11,
+    color: '#64748B',
+    fontWeight: '700',
+    marginBottom: 2,
   },
-  sheetTitle: { fontSize: 16, fontWeight: '900', color: '#111827', textAlign: 'center' },
-  sheetDesc: { fontSize: 12, color: '#6B7280', textAlign: 'center', marginTop: 4, marginBottom: 10 },
+  amountValue: { fontSize: 20, fontWeight: '900', color: '#059669' },
+  noteLabel: {
+    color: '#64748B',
+    fontSize: 11,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  noteText: { color: TEXT, fontSize: 12, lineHeight: 16 },
+  footerThanks: {
+    textAlign: 'center',
+    fontSize: 12,
+    fontWeight: '900',
+    color: TEXT,
+    marginTop: 8,
+  },
+  footerFine: {
+    textAlign: 'center',
+    fontSize: 11,
+    color: MUTED,
+    marginTop: 4,
+  },
+
+  sheetBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+  },
+  shareSheetContainer: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: '#fff',
+    borderTopLeftRadius: 22,
+    borderTopRightRadius: 22,
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    borderWidth: 1,
+    borderColor: '#EEF1F6',
+  },
+  sheetTitle: {
+    fontSize: 16,
+    fontWeight: '900',
+    color: '#111827',
+    textAlign: 'center',
+  },
+  sheetDesc: {
+    fontSize: 12,
+    color: '#6B7280',
+    textAlign: 'center',
+    marginTop: 4,
+    marginBottom: 10,
+  },
   sheetList: { gap: 10 },
   sheetItem: {
-    flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 12, paddingHorizontal: 10,
-    borderRadius: 14, backgroundColor: '#FAFBFF', borderWidth: 1, borderColor: '#EEF1F6',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 10,
+    borderRadius: 14,
+    backgroundColor: '#FAFBFF',
+    borderWidth: 1,
+    borderColor: '#EEF1F6',
   },
-  sheetIcon: { width: 36, height: 36, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
+  sheetIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   sheetItemTitle: { fontSize: 14, fontWeight: '800', color: '#0B1220' },
   sheetItemSub: { fontSize: 11, color: '#6B7280' },
-  sheetCancel: { marginTop: 12, alignSelf: 'center', paddingVertical: 10, paddingHorizontal: 16 },
+  sheetCancel: {
+    marginTop: 12,
+    alignSelf: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+  },
   sheetCancelTxt: { fontWeight: '800', color: '#6B7280' },
 });

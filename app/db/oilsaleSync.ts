@@ -1,7 +1,7 @@
-// app/db/oilsaleSync.ts
+// app/db/customerinvoiceoilsaleSync.ts
 import {
-    upsertCustomerInvoicesFromServer,
-    type OilSaleCustomerReport,
+  upsertCustomerInvoicesFromServer,
+  type OilSaleCustomerReport,
 } from '@/app/db/CustomerInvoicesPagerepo';
 import api from '@/services/api';
 

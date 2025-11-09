@@ -1,7 +1,17 @@
-// app/Shidaal/VendorPaymentCreateSheet.tsx
+//create vendorpayment
+
 import api from '@/services/api';
+import { useAuth } from '@/src/context/AuthContext';
 import { Feather, FontAwesome } from '@expo/vector-icons';
+import NetInfo from '@react-native-community/netinfo';
 import * as Sharing from 'expo-sharing';
+
+import { insertOfflineVendorPayment } from '../offlinecreatevendorpayment/vendorPaymentCreateRepo';
+import {
+  addLocalVendorPayment,
+  VendorPaymentWithContext,
+} from '../vendorPaymentTransactionsOffline/vendorPaymentsScreenRepo';
+
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -43,7 +53,7 @@ type Props = {
   token: string | null;
   allocation?: Allocation;
   extraCostIds?: number[];
-  oilId: number;
+  oilId?: number;
   lotId?: number;
   extraCostId?: number;
   vendorNameOverride?: string | null;
@@ -53,6 +63,8 @@ type Props = {
   companyName?: string | null;
   companyContact?: string | null;
   extraCosts?: ExtraCosts;
+  // 🔹 link back to offline oil form
+  localOilFormId?: number;
 };
 
 const ACCENT = '#576CBC';
@@ -78,9 +90,21 @@ export default function VendorPaymentCreateSheet({
   companyContact,
   extraCosts,
   prefillAmountUSD,
+  localOilFormId,
 }: Props) {
   const insets = useSafeAreaInsets();
   const bottomSafe = insets.bottom || 0;
+  const { user } = useAuth();
+
+  const [online, setOnline] = useState(true);
+
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
 
   const [amount, setAmount] = useState<string>('');
   const [method, setMethod] = useState<Method>('cash'); // UI-only; API uses 'equity'
@@ -136,7 +160,9 @@ export default function VendorPaymentCreateSheet({
     onClose();
   };
 
-  // Fetch vendor/oil meta (unchanged)
+  const normalizeAmount = (n: number) => Math.round(n * 100) / 100;
+
+  // Fetch vendor/oil meta (unchanged logic, but respects offline via try/catch)
   useEffect(() => {
     let isMounted = true;
     (async () => {
@@ -173,28 +199,34 @@ export default function VendorPaymentCreateSheet({
         setOilType(null);
       }
     })();
-    return () => { isMounted = false; };
+    return () => {
+      isMounted = false;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, oilId, lotId, vendorNameOverride, token]);
 
-  // Prefill amounts/method (unchanged logic)
+  // Prefill amounts/method
   useEffect(() => {
     let cancel = false;
     if (visible && allocation && !isBatchExtras && !isSingleExtra) {
       const due = Number(allocation.total || 0);
-      setSnapshotDue(due);
-      setPrevDue(due);
-      setNewDue(due);
-      setAmount(due > 0 ? (Math.round(due * 100) / 100).toFixed(2) : '');
+      const norm = normalizeAmount(due);
+      setSnapshotDue(norm);
+      setPrevDue(norm);
+      setNewDue(norm);
+      setAmount(norm > 0 ? norm.toFixed(2) : '');
       setMethod('cash');
-      return () => { cancel = true; };
+      return () => {
+        cancel = true;
+      };
     }
     const primeFromProps = () => {
       const due = Number.isFinite(currentPayable) ? currentPayable : 0;
-      setSnapshotDue(due);
-      setPrevDue(due);
-      setNewDue(due);
-      setAmount(due > 0 ? (Math.round(due * 100) / 100).toFixed(2) : '');
+      const norm = normalizeAmount(due);
+      setSnapshotDue(norm);
+      setPrevDue(norm);
+      setNewDue(norm);
+      setAmount(norm > 0 ? norm.toFixed(2) : '');
       setMethod('cash');
     };
     const primeFromBackendForLot = async () => {
@@ -205,10 +237,11 @@ export default function VendorPaymentCreateSheet({
         });
         const lotDue = r?.data?.items?.[0]?.amount_due ?? 0;
         if (cancel) return;
-        setSnapshotDue(lotDue);
-        setPrevDue(lotDue);
-        setNewDue(lotDue);
-        setAmount(lotDue > 0 ? (Math.round(lotDue * 100) / 100).toFixed(2) : '');
+        const norm = normalizeAmount(lotDue);
+        setSnapshotDue(norm);
+        setPrevDue(norm);
+        setNewDue(norm);
+        setAmount(norm > 0 ? norm.toFixed(2) : '');
         setMethod('cash');
       } catch {
         if (cancel) return;
@@ -219,7 +252,9 @@ export default function VendorPaymentCreateSheet({
       if (lotId) primeFromBackendForLot();
       else primeFromProps();
     }
-    return () => { cancel = true; };
+    return () => {
+      cancel = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, lotId, currentPayable, token, allocation, isBatchExtras, isSingleExtra]);
 
@@ -241,8 +276,8 @@ export default function VendorPaymentCreateSheet({
     return Number.isFinite(num) ? num : 0;
   };
 
-  const typedAmt = sanitizeAmountToNumber(amount);
-  const remainingPreview = Math.max(0, (prevDue || 0) - typedAmt);
+  const typedAmt = normalizeAmount(sanitizeAmountToNumber(amount));
+  const remainingPreview = Math.max(0, normalizeAmount((prevDue || 0) - typedAmt));
   const isOverpay = typedAmt > (prevDue || 0);
 
   // Extras (for receipt only)
@@ -272,16 +307,19 @@ export default function VendorPaymentCreateSheet({
   }, [allocation, allocationHasExtras, allocationExtras, extraTotal]);
 
   const uiOilCostTotal = useMemo(() => {
-    if (allocation && typeof allocation.oilCost === 'number') return Number(allocation.oilCost || 0);
+    if (allocation && typeof allocation.oilCost === 'number')
+      return Number(allocation.oilCost || 0);
     return 0;
   }, [allocation]);
 
   const uiGrandTotal = useMemo(() => {
-    if (allocation && typeof allocation.total === 'number') return Number(allocation.total || 0);
+    if (allocation && typeof allocation.total === 'number')
+      return Number(allocation.total || 0);
     return Number(uiOilCostTotal + uiExtrasTotal);
   }, [allocation, uiOilCostTotal, uiExtrasTotal]);
 
-  const totalsCurrency = allocation?.currency || extraCosts?.currency || resolvedCurrency || 'USD';
+  const totalsCurrency =
+    allocation?.currency || extraCosts?.currency || resolvedCurrency || 'USD';
   const fmtTotals = (n: number) =>
     new Intl.NumberFormat('en-US', {
       style: 'currency',
@@ -289,7 +327,7 @@ export default function VendorPaymentCreateSheet({
       maximumFractionDigits: 2,
     }).format(n || 0);
 
-  // Fetch dues for batch/single extra modes (unchanged)
+  // Fetch dues for batch/single extra modes
   useEffect(() => {
     let cancel = false;
     const fetchDuesFor = async (ids: number[]) => {
@@ -306,7 +344,10 @@ export default function VendorPaymentCreateSheet({
           : items.find((it: any) => it.lot_id === lotId);
         const ecList = (target?.extra_costs || []) as Array<{ id: number; due: number }>;
         const map = new Map(ecList.map((x) => [x.id, Number(x.due || 0)]));
-        const dues: ExtraDue[] = ids.map((id) => ({ id, due: map.get(id) ?? 0 }));
+        const dues: ExtraDue[] = ids.map((id) => ({
+          id,
+          due: normalizeAmount(map.get(id) ?? 0),
+        }));
         return dues;
       } catch {
         return ids.map((id) => ({ id, due: 0 }));
@@ -314,15 +355,19 @@ export default function VendorPaymentCreateSheet({
     };
     const prefillFromExtras = async () => {
       if (prefilled || (!isBatchExtras && !isSingleExtra)) return;
-      const ids = isBatchExtras ? (extraCostIds as number[]) : isSingleExtra ? [extraCostId as number] : [];
+      const ids = isBatchExtras
+        ? (extraCostIds as number[])
+        : isSingleExtra
+        ? [extraCostId as number]
+        : [];
       if (!ids.length) return;
 
       if (isBatchExtras && (prefillAmountUSD ?? 0) > 0) {
-        const due = Number(prefillAmountUSD);
+        const due = normalizeAmount(Number(prefillAmountUSD));
         setSnapshotDue(due);
         setPrevDue(due);
         setNewDue(due);
-        setAmount(due > 0 ? (Math.round(due * 100) / 100).toFixed(2) : '');
+        setAmount(due > 0 ? due.toFixed(2) : '');
         setMethod('cash');
       }
 
@@ -330,13 +375,14 @@ export default function VendorPaymentCreateSheet({
       if (cancel) return;
 
       setBatchDues(dues);
-      const total = dues.reduce((s, x) => s + x.due, 0);
+      const totalRaw = dues.reduce((s, x) => s + x.due, 0);
+      const total = normalizeAmount(totalRaw);
 
       if (total > 0) {
         setSnapshotDue(total);
         setPrevDue(total);
         setNewDue(total);
-        setAmount((Math.round(total * 100) / 100).toFixed(2));
+        setAmount(total.toFixed(2));
       } else if (!prefillAmountUSD) {
         setSnapshotDue(0);
         setPrevDue(0);
@@ -352,9 +398,22 @@ export default function VendorPaymentCreateSheet({
       setBatchDues(null);
       setPrefilled(false);
     }
-    return () => { cancel = true; };
+    return () => {
+      cancel = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, token, oilId, lotId, extraCostId, extraCostIds, isBatchExtras, isSingleExtra, prefillAmountUSD, prefilled]);
+  }, [
+    visible,
+    token,
+    oilId,
+    lotId,
+    extraCostId,
+    extraCostIds,
+    isBatchExtras,
+    isSingleExtra,
+    prefillAmountUSD,
+    prefilled,
+  ]);
 
   const buildShareMessage = (paid: number, remain: number) => {
     const paidStr = fmtMoney(paid);
@@ -381,11 +440,16 @@ export default function VendorPaymentCreateSheet({
       const webLink = `https://wa.me/${digits}?text=${msg}`;
       const canDeep = await Linking.canOpenURL('whatsapp://send');
       if (canDeep) {
-        try { await Linking.openURL(deepLink); break theMsg; } catch {}
+        try {
+          await Linking.openURL(deepLink);
+          break theMsg;
+        } catch {}
       }
       const canWeb = await Linking.canOpenURL(webLink);
       if (canWeb) {
-        try { await Linking.openURL(webLink); } catch {}
+        try {
+          await Linking.openURL(webLink);
+        } catch {}
       } else {
         Alert.alert('WhatsApp unavailable', 'Could not open WhatsApp on this device.');
       }
@@ -419,7 +483,7 @@ export default function VendorPaymentCreateSheet({
   };
 
   useEffect(() => {
-    let t: NodeJS.Timeout | null = null;
+    let t: ReturnType<typeof setTimeout> | null = null;
     if (showReceipt) {
       t = setTimeout(async () => {
         try {
@@ -435,37 +499,76 @@ export default function VendorPaymentCreateSheet({
         }
       }, 180);
     }
-    return () => { if (t) clearTimeout(t); };
+    return () => {
+      if (t) clearTimeout(t);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showReceipt, newDue, paidAmt, extraItems, extraTotal, allocation?.currency, extraCosts?.currency]);
+  }, [
+    showReceipt,
+    newDue,
+    paidAmt,
+    extraItems,
+    extraTotal,
+    allocation?.currency,
+    extraCosts?.currency,
+  ]);
 
-  // ---------- SAVE (unchanged) ----------
+  // ---------- SAVE (with offline support) ----------
   const onSave = async () => {
-    if (!oilId && !lotId)
+    const nothingToPay = !oilId && !lotId && !localOilFormId;
+    if (nothingToPay)
       return Alert.alert('Fadlan', 'Wax aan bixinno lama helin (oil ama lot).');
 
+    const offlineMode = !token || !online;
+    const ownerId = user?.id ?? 0;
+
+    // BATCH EXTRAS (keep ONLINE-only for now)
     if (isBatchExtras) {
-      if (!batchDues || batchDues.length === 0)
+      if (!batchDues || batchDues.length === 0) {
         return Alert.alert('Fadlan', 'Dues for the selected extras were not found.');
-      const payableItems = batchDues.filter((x) => x.due > 0.000001);
-      if (payableItems.length === 0)
+      }
+      const payableItems = batchDues
+        .map((x) => ({ ...x, due: normalizeAmount(x.due) }))
+        .filter((x) => x.due > 0.000001);
+
+      if (payableItems.length === 0) {
         return Alert.alert('Ok', 'All selected extras are fully paid.');
+      }
+
+      if (offlineMode) {
+        Alert.alert(
+          'Offline',
+          'Batch extra-cost payments currently require internet connection.'
+        );
+        return;
+      }
 
       setSubmitting(true);
       try {
         let paid = 0;
+        const sn =
+          (vendorNameOverride ?? vendorName)?.trim() &&
+          (vendorNameOverride ?? vendorName) !== '-'
+            ? (vendorNameOverride ?? vendorName)!.trim()
+            : '';
+
         for (const item of payableItems) {
           const body = {
             amount: item.due,
-            supplier_name: (vendorName && vendorName !== '-') ? vendorName : '',
+            supplier_name: sn,
             payment_method: 'equity' as const,
-            note: oilType ? `Payment for ${oilType} extra (${item.id})` : `Payment for extra (${item.id})`,
+            note: oilType
+              ? `Payment for ${oilType} extra (${item.id})`
+              : `Payment for extra (${item.id})`,
             extra_cost_id: item.id,
           };
           await api.post('/diiwaanvendorpayments', body, { headers: authHeader });
           paid += item.due;
         }
-        const dueNow = Math.max(0, payableItems.reduce((s, x) => s + x.due, 0));
+
+        const dueNow = normalizeAmount(
+          payableItems.reduce((s, x) => s + x.due, 0)
+        );
         const remain = 0;
         setPaidAmt(dueNow);
         setPrevDue(dueNow);
@@ -477,31 +580,114 @@ export default function VendorPaymentCreateSheet({
         setMethod('cash');
         onClose();
         setShowReceipt(true);
-        return;
       } catch (e: any) {
-        Alert.alert('Error', String(e?.response?.data?.detail || e?.message || 'Batch payment failed.'));
+        Alert.alert(
+          'Error',
+          String(e?.response?.data?.detail || e?.message || 'Batch payment failed.')
+        );
       } finally {
         setSubmitting(false);
       }
       return;
     }
 
+    // SINGLE EXTRA
     if (isSingleExtra) {
-      const targetDue = (batchDues?.[0]?.due ?? sanitizeAmountToNumber(amount));
-      if (!(targetDue > 0)) return Alert.alert('Fadlan', 'Lacag sax ah lama helin.');
+      const rawTarget = batchDues?.[0]?.due ?? sanitizeAmountToNumber(amount);
+      const targetDue = normalizeAmount(rawTarget);
+      if (!(targetDue > 0))
+        return Alert.alert('Fadlan', 'Lacag sax ah lama helin.');
 
       setSubmitting(true);
+      const sn = (vendorNameOverride ?? vendorName)?.trim();
+      const supplierNameClean = sn && sn !== '-' ? sn : null;
+      const note = oilType
+        ? `Payment for ${oilType} extra (${extraCostId})`
+        : `Payment for extra (${extraCostId})`;
+
       try {
+        // OFFLINE QUEUE
+        if (offlineMode) {
+          if (!ownerId) {
+            Alert.alert(
+              'Error',
+              'Cannot record payment offline (owner unknown). Fadlan dib u soo gal app-ka.'
+            );
+            return;
+          }
+
+          await insertOfflineVendorPayment({
+            ownerId,
+            amount: targetDue,
+            amountDueSnapshot: 0, // paying full extra
+            note,
+            paymentMethod: 'equity',
+            supplierName: supplierNameClean ?? null,
+            paymentDateIso: new Date().toISOString(),
+            truckPlate: null,
+            truckType: null,
+            extraCostId: extraCostId ?? null,
+            oilId: oilId ?? null,
+            lotId: lotId ?? null,
+            transactionType: 'vendor_payment_extra',
+            localOilFormId: localOilFormId ?? null, // 🔹 NEW
+          });
+
+          // ✅ ALSO update VendorPaymentsScreen offline snapshot
+          try {
+            const nowIso = new Date().toISOString();
+            const vp: VendorPaymentWithContext = {
+              id: Date.now(), // local-only id for UI
+              amount: targetDue,
+              amount_due: 0,
+              note,
+              payment_method: 'equity',
+              payment_date: nowIso,
+              supplier_name: supplierNameClean ?? null,
+              lot_id: lotId ?? null,
+              oil_id: oilId ?? null,
+              extra_cost_id: extraCostId ?? null,
+              created_at: nowIso,
+              updated_at: nowIso,
+              truck_plate: null,
+              truck_type: null,
+              transaction_type: 'vendor_payment_extra',
+              currency: resolvedCurrency,
+              fx_rate_to_usd: null,
+              supplier_due_context: null,
+              extra_cost_context: null,
+            };
+            await addLocalVendorPayment(ownerId, vp);
+          } catch (err) {
+            console.warn(
+              '[VendorPaymentCreateSheet] failed to add local extra payment to screen cache',
+              err
+            );
+          }
+
+          setPaidAmt(targetDue);
+          setPrevDue(targetDue);
+          setNewDue(0);
+          setSavedAt(new Date());
+          events.emit(EVT_VENDOR_PAYMENT_CREATED, undefined);
+          onCreated?.();
+          setAmount('');
+          setMethod('cash');
+          onClose();
+          setShowReceipt(true);
+          return;
+        }
+
+        // ONLINE
         const body: any = {
           amount: targetDue,
           payment_method: 'equity' as const,
-          note: oilType ? `Payment for ${oilType} extra (${extraCostId})` : `Payment for extra (${extraCostId})`,
+          note,
           extra_cost_id: extraCostId,
           ...(lotId ? { lot_id: lotId } : {}),
           ...(oilId ? { oil_id: oilId } : {}),
         };
-        const sn = (vendorNameOverride ?? vendorName)?.trim();
-        if (sn && sn !== '-') body.supplier_name = sn;
+        if (supplierNameClean) body.supplier_name = supplierNameClean;
 
         await api.post('/diiwaanvendorpayments', body, { headers: authHeader });
 
@@ -516,32 +702,118 @@ export default function VendorPaymentCreateSheet({
         onClose();
         setShowReceipt(true);
       } catch (e: any) {
-        Alert.alert('Error', String(e?.response?.data?.detail || e?.message || 'Save failed.'));
+        Alert.alert(
+          'Error',
+          String(e?.response?.data?.detail || e?.message || 'Save failed.')
+        );
       } finally {
         setSubmitting(false);
       }
       return;
     }
 
-    const amtNum = sanitizeAmountToNumber(amount);
+    // NORMAL PAYMENT (lot / oil total)
+    const amtNumRaw = sanitizeAmountToNumber(amount);
+    const amtNum = normalizeAmount(amtNumRaw);
     if (!(amtNum > 0))
       return Alert.alert('Fadlan', 'Geli lacag sax ah (ka weyn 0).');
 
     setSubmitting(true);
+    const supplierNameClean =
+      vendorName && vendorName !== '-' ? vendorName : null;
+    const note = oilType
+      ? `Payment for ${oilType} lot (funded by owner equity)`
+      : 'Funded by owner equity';
+
+    const dueNow = normalizeAmount(Math.max(0, snapshotDue || 0));
+    const remain = normalizeAmount(Math.max(0, dueNow - amtNum));
+
     try {
+      // OFFLINE QUEUE
+      if (offlineMode) {
+        if (!ownerId) {
+          Alert.alert(
+            'Error',
+            'Cannot record payment offline (owner unknown). Fadlan dib u soo gal app-ka.'
+          );
+          return;
+        }
+
+        const nowIso = new Date().toISOString();
+
+        await insertOfflineVendorPayment({
+          ownerId,
+          amount: amtNum,
+          amountDueSnapshot: remain,
+          note,
+          paymentMethod: 'equity',
+          supplierName: supplierNameClean ?? null,
+          paymentDateIso: nowIso,
+          truckPlate: null,
+          truckType: null,
+          extraCostId: null,
+          oilId: oilId ?? null,
+          lotId: lotId ?? null,
+          transactionType: 'vendor_payment',
+          localOilFormId: localOilFormId ?? null, // 🔹 NEW
+        });
+
+        // ✅ ALSO update VendorPaymentsScreen offline snapshot
+        try {
+          const vp: VendorPaymentWithContext = {
+            id: Date.now(), // local-only id for UI
+            amount: amtNum,
+            amount_due: remain,
+            note,
+            payment_method: 'equity',
+            payment_date: nowIso,
+            supplier_name: supplierNameClean ?? null,
+            lot_id: lotId ?? null,
+            oil_id: oilId ?? null,
+            extra_cost_id: null,
+            created_at: nowIso,
+            updated_at: nowIso,
+            truck_plate: null,
+            truck_type: null,
+            transaction_type: 'vendor_payment',
+            currency: resolvedCurrency,
+            fx_rate_to_usd: null,
+            supplier_due_context: null,
+            extra_cost_context: null,
+          };
+          await addLocalVendorPayment(ownerId, vp);
+        } catch (err) {
+          console.warn(
+            '[VendorPaymentCreateSheet] failed to add local payment to screen cache',
+            err
+          );
+        }
+
+        setPaidAmt(amtNum);
+        setPrevDue(dueNow);
+        setNewDue(remain);
+        setSavedAt(new Date());
+        events.emit(EVT_VENDOR_PAYMENT_CREATED, undefined);
+        onCreated?.();
+        setAmount('');
+        setMethod('cash');
+        onClose();
+        setShowReceipt(true);
+        return;
+      }
+
+      // ONLINE
       const body: any = {
         amount: amtNum,
-        supplier_name: (vendorName && vendorName !== '-') ? vendorName : '',
+        supplier_name: supplierNameClean || '',
         payment_method: 'equity' as const,
-        note: oilType ? `Payment for ${oilType} lot (funded by owner equity)` : 'Funded by owner equity',
+        note,
       };
       if (lotId) body.lot_id = lotId;
       else if (oilId) body.oil_id = oilId;
 
       await api.post('/diiwaanvendorpayments', body, { headers: authHeader });
 
-      const dueNow = Math.max(0, snapshotDue || 0);
-      const remain = Math.max(0, dueNow - amtNum);
       setPaidAmt(amtNum);
       setPrevDue(dueNow);
       setNewDue(remain);
@@ -553,7 +825,10 @@ export default function VendorPaymentCreateSheet({
       onClose();
       setShowReceipt(true);
     } catch (e: any) {
-      Alert.alert('Error', String(e?.response?.data?.detail || e?.message || 'Save failed.'));
+      Alert.alert(
+        'Error',
+        String(e?.response?.data?.detail || e?.message || 'Save failed.')
+      );
     } finally {
       setSubmitting(false);
     }
@@ -576,7 +851,11 @@ export default function VendorPaymentCreateSheet({
   };
 
   const resolvedMethodLabel = 'Equity (Owner capital)';
-  const primaryBtnLabel = isBatchExtras ? 'Pay All Extras' : isSingleExtra ? 'Pay This Extra' : 'Confirm & Save';
+  const primaryBtnLabel = isBatchExtras
+    ? 'Pay All Extras'
+    : isSingleExtra
+    ? 'Pay This Extra'
+    : 'Confirm & Save';
 
   return (
     <>
@@ -599,58 +878,109 @@ export default function VendorPaymentCreateSheet({
             style={{ width: '100%', alignItems: 'center' }}
           >
             {/* FULL-WIDTH, COMPACT CARD */}
-            <View style={[styles.centerCard, { paddingBottom: Math.max(12, bottomSafe) }]}>
+            <View
+              style={[styles.centerCard, { paddingBottom: Math.max(12, bottomSafe) }]}
+            >
               <View style={styles.sheetHandle} />
               <Text style={styles.title}>Record Payment</Text>
 
-              {/* TOP INFO BANNERS (COMPACT) */}
+              {/* TOP INFO BANNERS */}
               <View style={[dueStyles.banner, { marginBottom: 8 }]}>
                 <Text style={dueStyles.left}>Vendor</Text>
-                <Text style={[dueStyles.right, { maxWidth: undefined, flexShrink: 1 }]} numberOfLines={1}>
+                <Text
+                  style={[dueStyles.right, { maxWidth: undefined, flexShrink: 1 }]}
+                  numberOfLines={1}
+                >
                   {vendorName || '-'}
                 </Text>
               </View>
               <View style={dueStyles.banner}>
                 <Text style={dueStyles.left}>Amount payable</Text>
-                <Text style={dueStyles.right}>{fmtMoney(Math.max(0, prevDue || 0))}</Text>
+                <Text style={dueStyles.right}>
+                  {fmtMoney(Math.max(0, prevDue || 0))}
+                </Text>
               </View>
 
               {/* COMPACT TOTALS ONLY */}
               {!isBatchExtras && !isSingleExtra && (
-                <View style={[dueStyles.banner, { backgroundColor: '#F8FAFF' }]}>
+                <View
+                  style={[dueStyles.banner, { backgroundColor: '#F8FAFF' }]}
+                >
                   <View style={{ flex: 1 }}>
                     <Row label="Oil cost" value={fmtTotals(uiOilCostTotal)} />
                     <Row label="Extra costs" value={fmtTotals(uiExtrasTotal)} />
-                    <View style={{ borderBottomWidth: StyleSheet.hairlineWidth, borderColor: BORDER, marginVertical: 6 }} />
-                    <Row label="Grand total" value={fmtTotals(uiGrandTotal)} strong />
+                    <View
+                      style={{
+                        borderBottomWidth: StyleSheet.hairlineWidth,
+                        borderColor: BORDER,
+                        marginVertical: 6,
+                      }}
+                    />
+                    <Row
+                      label="Grand total"
+                      value={fmtTotals(uiGrandTotal)}
+                      strong
+                    />
                   </View>
                 </View>
               )}
 
-              {/* BATCH EXTRAS SUMMARY (NO EXTRA TEXT) */}
+              {/* BATCH EXTRAS SUMMARY */}
               {isBatchExtras && batchDues && (
-                <View style={[dueStyles.banner, { backgroundColor: '#F8FAFF' }]}>
+                <View
+                  style={[dueStyles.banner, { backgroundColor: '#F8FAFF' }]}
+                >
                   <View style={{ flex: 1 }}>
                     {batchDues.map((it) => (
-                      <Row key={it.id} label={`Extra #${it.id}`} value={fmtMoney(it.due)} />
+                      <Row
+                        key={it.id}
+                        label={`Extra #${it.id}`}
+                        value={fmtMoney(it.due)}
+                      />
                     ))}
-                    <View style={{ borderBottomWidth: StyleSheet.hairlineWidth, borderColor: BORDER, marginVertical: 6 }} />
-                    <Row label="Total" value={fmtMoney(batchDues.reduce((s, x) => s + x.due, 0))} strong />
+                    <View
+                      style={{
+                        borderBottomWidth: StyleSheet.hairlineWidth,
+                        borderColor: BORDER,
+                        marginVertical: 6,
+                      }}
+                    />
+                    <Row
+                      label="Total"
+                      value={fmtMoney(
+                        normalizeAmount(
+                          batchDues.reduce((s, x) => s + x.due, 0)
+                        )
+                      )}
+                      strong
+                    />
                   </View>
                 </View>
               )}
 
-              {/* FORM (NO SCROLL; MINIMAL TEXT) */}
+              {/* FORM */}
               <View style={{ marginBottom: 10 }}>
-                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                <View
+                  style={{
+                    flexDirection: 'row',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                  }}
+                >
                   <Text style={styles.label}>
-                    {isBatchExtras ? 'Total to pay'
-                      : isSingleExtra ? 'Amount to pay'
+                    {isBatchExtras
+                      ? 'Total to pay'
+                      : isSingleExtra
+                      ? 'Amount to pay'
                       : 'Amount to pay'}
                   </Text>
                   {!isBatchExtras && !isSingleExtra && (
                     <TouchableOpacity
-                      onPress={() => setAmount((Math.round(Math.max(0, prevDue || 0) * 100) / 100).toFixed(2))}
+                      onPress={() =>
+                        setAmount(
+                          normalizeAmount(Math.max(0, prevDue || 0)).toFixed(2)
+                        )
+                      }
                       style={dueStyles.quickFill}
                       activeOpacity={0.8}
                     >
@@ -672,40 +1002,69 @@ export default function VendorPaymentCreateSheet({
                   editable={!isBatchExtras && !isSingleExtra}
                   style={[
                     styles.input,
-                    (isBatchExtras || isSingleExtra) && { backgroundColor: '#F8FAFC', borderColor: '#E5E7EB' },
-                    (!isBatchExtras && !isSingleExtra && isOverpay && prevDue > 0) && { borderColor: '#FCA5A5', backgroundColor: '#FFF7F7' },
+                    (isBatchExtras || isSingleExtra) && {
+                      backgroundColor: '#F8FAFC',
+                      borderColor: '#E5E7EB',
+                    },
+                    (!isBatchExtras &&
+                      !isSingleExtra &&
+                      isOverpay &&
+                      prevDue > 0 && {
+                        borderColor: '#FCA5A5',
+                        backgroundColor: '#FFF7F7',
+                      }),
                   ]}
                   maxLength={18}
                   keyboardType="decimal-pad"
                 />
 
-                {/* tiny helper only when not batch/single */}
                 {!isBatchExtras && !isSingleExtra && (
                   <Text
                     style={{
                       marginTop: 6,
                       fontSize: 11,
                       fontWeight: '700',
-                      color: isOverpay && prevDue > 0 ? '#DC2626' : '#059669',
+                      color:
+                        isOverpay && prevDue > 0 ? '#DC2626' : '#059669',
                     }}
                   >
                     {isOverpay && prevDue > 0
-                      ? `Over by ${fmtMoney(typedAmt - Math.max(0, prevDue || 0))}`
-                      : `Remaining: ${fmtMoney(Math.max(0, remainingPreview))}`}
+                      ? `Over by ${fmtMoney(
+                          normalizeAmount(
+                            typedAmt - Math.max(0, prevDue || 0)
+                          )
+                        )}`
+                      : `Remaining: ${fmtMoney(
+                          Math.max(0, remainingPreview)
+                        )}`}
                   </Text>
                 )}
               </View>
 
-              {/* METHOD (kept, but minimal; Cash preselected) */}
+              {/* METHOD */}
               <View style={{ marginBottom: 10 }}>
-                <View style={{ flexDirection: 'row', gap: 8, alignItems: 'center' }}>
+                <View
+                  style={{ flexDirection: 'row', gap: 8, alignItems: 'center' }}
+                >
                   <TouchableOpacity
                     activeOpacity={0.8}
                     onPress={() => setMethod('cash')}
-                    style={[methodPillStyles.pill, method === 'cash' && methodPillStyles.pillActive]}
+                    style={[
+                      methodPillStyles.pill,
+                      method === 'cash' && methodPillStyles.pillActive,
+                    ]}
                   >
-                    <Feather name="dollar-sign" size={16} color={method === 'cash' ? '#fff' : TEXT} />
-                    <Text style={[methodPillStyles.pillTxt, method === 'cash' && { color: '#fff' }]}>
+                    <Feather
+                      name="dollar-sign"
+                      size={16}
+                      color={method === 'cash' ? '#fff' : TEXT}
+                    />
+                    <Text
+                      style={[
+                        methodPillStyles.pillTxt,
+                        method === 'cash' && { color: '#fff' },
+                      ]}
+                    >
                       Cash (auto)
                     </Text>
                   </TouchableOpacity>
@@ -714,7 +1073,9 @@ export default function VendorPaymentCreateSheet({
                       value={customMethod}
                       onChangeText={(t) => {
                         setCustomMethod(t);
-                        setMethod(t.trim().length > 0 ? 'custom' : 'cash');
+                        setMethod(
+                          t.trim().length > 0 ? 'custom' : 'cash'
+                        );
                       }}
                       placeholder="Optional note"
                       placeholderTextColor="#9CA3AF"
@@ -724,15 +1085,24 @@ export default function VendorPaymentCreateSheet({
                 </View>
               </View>
 
-              {/* ACTIONS (ALWAYS VISIBLE) */}
-              <View style={[styles.actions, { marginTop: 0 }]}>
-                <TouchableOpacity style={[styles.btn, styles.btnGhost]} onPress={close} disabled={submitting}>
+              {/* ACTIONS */}
+              <View
+                style={[styles.actions, { marginTop: 0 }]}
+              >
+                <TouchableOpacity
+                  style={[styles.btn, styles.btnGhost]}
+                  onPress={close}
+                  disabled={submitting}
+                >
                   <Text style={styles.btnGhostText}>Cancel</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
                   style={[styles.btn, submitting && { opacity: 0.6 }]}
                   onPress={onSave}
-                  disabled={submitting || (!oilId && !lotId)}
+                  disabled={
+                    submitting ||
+                    (!oilId && !lotId && !localOilFormId)
+                  }
                 >
                   {submitting ? (
                     <ActivityIndicator size="small" color="#fff" />
@@ -749,8 +1119,13 @@ export default function VendorPaymentCreateSheet({
         </View>
       </Modal>
 
-      {/* RECEIPT MODAL (unchanged) */}
-      <Modal visible={showReceipt} transparent animationType="fade" onRequestClose={() => setShowReceipt(false)}>
+      {/* RECEIPT MODAL */}
+      <Modal
+        visible={showReceipt}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowReceipt(false)}
+      >
         <TouchableWithoutFeedback onPress={() => setShowReceipt(false)}>
           <View style={styles.backdrop} />
         </TouchableWithoutFeedback>
@@ -759,7 +1134,11 @@ export default function VendorPaymentCreateSheet({
           <View style={styles.paperNotchLeft} />
           <View style={styles.paperNotchRight} />
 
-          <View ref={paperRef} collapsable={false} style={styles.paper}>
+          <View
+            ref={paperRef}
+            collapsable={false}
+            style={styles.paper}
+          >
             <Text style={styles.paperCompany} numberOfLines={1}>
               {(companyName || 'Rasiid Bixin-sameeye').toUpperCase()}
             </Text>
@@ -773,14 +1152,18 @@ export default function VendorPaymentCreateSheet({
 
             <Text style={styles.paperTitle}>Vendor Payment Receipt</Text>
             <Text style={styles.paperMeta}>
-              {savedAt ? savedAt.toLocaleString() : new Date().toLocaleString()}
+              {savedAt
+                ? savedAt.toLocaleString()
+                : new Date().toLocaleString()}
             </Text>
 
             <View style={styles.dots} />
 
             <View style={styles.rowKV}>
               <Text style={styles.k}>Vendor</Text>
-              <Text style={styles.v} numberOfLines={1}>{vendorName || '-'}</Text>
+              <Text style={styles.v} numberOfLines={1}>
+                {vendorName || '-'}
+              </Text>
             </View>
             {oilType ? (
               <View style={styles.rowKV}>
@@ -806,13 +1189,22 @@ export default function VendorPaymentCreateSheet({
             </View>
             <View style={styles.rowKV}>
               <Text style={[styles.k]}>New Payable</Text>
-              <Text style={[styles.v, newDue > 0 ? styles.vDanger : styles.vOk]}>{fmtMoney(newDue)}</Text>
+              <Text
+                style={[
+                  styles.v,
+                  newDue > 0 ? styles.vDanger : styles.vOk,
+                ]}
+              >
+                {fmtMoney(newDue)}
+              </Text>
             </View>
 
             {extraItems.length > 0 && (
               <>
                 <View style={styles.dots} />
-                <Text style={[styles.k, { marginBottom: 4 }]}>Extra costs recorded</Text>
+                <Text style={[styles.k, { marginBottom: 4 }]}>
+                  Extra costs recorded
+                </Text>
                 {extraItems.map((it, idx) => (
                   <View key={`x-${idx}`} style={styles.rowKV}>
                     <Text style={styles.k}>{it.label}</Text>
@@ -820,8 +1212,16 @@ export default function VendorPaymentCreateSheet({
                   </View>
                 ))}
                 <View style={styles.rowKV}>
-                  <Text style={[styles.k, { fontWeight: '900' }]}>Total extras</Text>
-                  <Text style={[styles.v, { fontWeight: '900' }]}>{fmtMoneyExtra(extraTotal)}</Text>
+                  <Text
+                    style={[styles.k, { fontWeight: '900' }]}
+                  >
+                    Total extras
+                  </Text>
+                  <Text
+                    style={[styles.v, { fontWeight: '900' }]}
+                  >
+                    {fmtMoneyExtra(extraTotal)}
+                  </Text>
                 </View>
               </>
             )}
@@ -830,26 +1230,43 @@ export default function VendorPaymentCreateSheet({
 
             <Text style={styles.footerThanks}>Mahadsanid!</Text>
             <Text style={styles.footerFine}>
-              Rasiidkan waa caddeyn bixinta lacagta alaab-qeybiyaha (funded by owner equity).
+              Rasiidkan waa caddeyn bixinta lacagta alaab-qeybiyaha (funded by
+              owner equity).
             </Text>
           </View>
         </View>
       </Modal>
 
-      {/* SHARE SHEET (unchanged) */}
-      <Modal visible={shareOpen} transparent animationType="slide" onRequestClose={closeShareAndReceipt}>
+      {/* SHARE SHEET */}
+      <Modal
+        visible={shareOpen}
+        transparent
+        animationType="slide"
+        onRequestClose={closeShareAndReceipt}
+      >
         <TouchableWithoutFeedback onPress={closeShareAndReceipt}>
           <View style={styles.sheetBackdrop} />
         </TouchableWithoutFeedback>
-        <View style={[styles.shareSheetContainer, { paddingBottom: Math.max(20, bottomSafe + 6) }]}>
+        <View
+          style={[
+            styles.shareSheetContainer,
+            { paddingBottom: Math.max(20, bottomSafe + 6) },
+          ]}
+        >
           <View style={styles.sheetHandle} />
           <Text style={styles.sheetTitle}>Udir rasiidka</Text>
-          <Text style={styles.sheetDesc}>Dooro meesha aad ku wadaagi doonto rasiidka sawirka (PNG) iyo fariinta.</Text>
+          <Text style={styles.sheetDesc}>
+            Dooro meesha aad ku wadaagi doonto rasiidka sawirka (PNG) iyo
+            fariinta.
+          </Text>
 
           <View style={styles.sheetList}>
             <TouchableOpacity
               style={styles.sheetItem}
-              onPress={async () => { await shareImage(); closeShareAndReceipt(); }}
+              onPress={async () => {
+                await shareImage();
+                closeShareAndReceipt();
+              }}
               activeOpacity={0.9}
             >
               <View style={[styles.sheetIcon, { backgroundColor: '#F5F7FB' }]}>
@@ -857,14 +1274,20 @@ export default function VendorPaymentCreateSheet({
               </View>
               <View style={{ flex: 1 }}>
                 <Text style={styles.sheetItemTitle}>System Share</Text>
-                <Text style={styles.sheetItemSub}>Let the device choose an app</Text>
+                <Text style={styles.sheetItemSub}>
+                  Let the device choose an app
+                </Text>
               </View>
               <Feather name="chevron-right" size={18} color="#6B7280" />
             </TouchableOpacity>
 
             <TouchableOpacity
               style={styles.sheetItem}
-              onPress={async () => { await shareImage(); await sendWhatsAppText(undefined, shareMsg); closeShareAndReceipt(); }}
+              onPress={async () => {
+                await shareImage();
+                await sendWhatsAppText(undefined, shareMsg);
+                closeShareAndReceipt();
+              }}
               activeOpacity={0.9}
             >
               <View style={[styles.sheetIcon, { backgroundColor: '#E7F9EF' }]}>
@@ -872,14 +1295,20 @@ export default function VendorPaymentCreateSheet({
               </View>
               <View style={{ flex: 1 }}>
                 <Text style={styles.sheetItemTitle}>WhatsApp</Text>
-                <Text style={styles.sheetItemSub}>Share image then open chat with text</Text>
+                <Text style={styles.sheetItemSub}>
+                  Share image then open chat with text
+                </Text>
               </View>
               <Feather name="chevron-right" size={18} color="#6B7280" />
             </TouchableOpacity>
 
             <TouchableOpacity
               style={styles.sheetItem}
-              onPress={async () => { await shareImage(); await sendSmsText(shareMsg); closeShareAndReceipt(); }}
+              onPress={async () => {
+                await shareImage();
+                await sendSmsText(shareMsg);
+                closeShareAndReceipt();
+              }}
               activeOpacity={0.9}
             >
               <View style={[styles.sheetIcon, { backgroundColor: '#EEF2FF' }]}>
@@ -887,13 +1316,18 @@ export default function VendorPaymentCreateSheet({
               </View>
               <View style={{ flex: 1 }}>
                 <Text style={styles.sheetItemTitle}>SMS</Text>
-                <Text style={styles.sheetItemSub}>Share image via sheet, then prefill SMS</Text>
+                <Text style={styles.sheetItemSub}>
+                  Share image via sheet, then prefill SMS
+                </Text>
               </View>
               <Feather name="chevron-right" size={18} color="#6B7280" />
             </TouchableOpacity>
           </View>
 
-          <TouchableOpacity style={styles.sheetCancel} onPress={closeShareAndReceipt}>
+          <TouchableOpacity
+            style={styles.sheetCancel}
+            onPress={closeShareAndReceipt}
+          >
             <Text style={styles.sheetCancelTxt}>Close</Text>
           </TouchableOpacity>
         </View>
@@ -903,10 +1337,38 @@ export default function VendorPaymentCreateSheet({
 }
 
 /** minimal row */
-const Row = ({ label, value, strong = false }: { label: string; value: string; strong?: boolean }) => (
-  <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
-    <Text style={[{ color: MUTED, fontWeight: '700', fontSize: 14 }, strong && { fontSize: 16 }]}>{label}</Text>
-    <Text style={[{ color: TEXT, fontWeight: '800', fontSize: 14 }, strong && { fontSize: 16 }]}>{value}</Text>
+const Row = ({
+  label,
+  value,
+  strong = false,
+}: {
+  label: string;
+  value: string;
+  strong?: boolean;
+}) => (
+  <View
+    style={{
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      marginBottom: 4,
+    }}
+  >
+    <Text
+      style={[
+        { color: MUTED, fontWeight: '700', fontSize: 14 },
+        strong && { fontSize: 16 },
+      ]}
+    >
+      {label}
+    </Text>
+    <Text
+      style={[
+        { color: TEXT, fontWeight: '800', fontSize: 14 },
+        strong && { fontSize: 16 },
+      ]}
+    >
+      {value}
+    </Text>
   </View>
 );
 
@@ -938,6 +1400,9 @@ const dueStyles = StyleSheet.create({
   quickFillTxt: { color: '#0B2447', fontWeight: '800', fontSize: 12 },
 });
 
+
+
+
 const methodPillStyles = StyleSheet.create({
   pill: {
     flexDirection: 'row',
@@ -962,12 +1427,20 @@ const methodPillStyles = StyleSheet.create({
 
 const styles = StyleSheet.create({
   // Backdrops & centered wrapper
-  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.45)' },
-  centerWrap: { ...StyleSheet.absoluteFillObject, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 8 },
+  backdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
+  centerWrap: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+  },
 
-  // FULL-WIDTH CARD, no scrolling needed
+  // FULL-WIDTH CARD
   centerCard: {
-    width: '98%',            // ⬅️ nearly full width
+    width: '98%',
     backgroundColor: BG,
     borderRadius: 18,
     paddingHorizontal: 14,
@@ -980,11 +1453,32 @@ const styles = StyleSheet.create({
     shadowRadius: 16,
     elevation: 20,
   },
-  sheetHandle: { alignSelf: 'center', width: 46, height: 5, borderRadius: 3, backgroundColor: '#E5E7EB', marginBottom: 8 },
-  title: { fontSize: 18, fontWeight: '800', marginBottom: 10, color: TEXT, textAlign: 'center' },
+  sheetHandle: {
+    alignSelf: 'center',
+    width: 46,
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: '#E5E7EB',
+    marginBottom: 8,
+  },
+  title: {
+    fontSize: 18,
+    fontWeight: '800',
+    marginBottom: 10,
+    color: TEXT,
+    textAlign: 'center',
+  },
 
   label: { fontWeight: '700', color: TEXT, marginBottom: 6 },
-  input: { backgroundColor: '#fff', borderWidth: 1, borderColor: BORDER, borderRadius: 12, paddingHorizontal: 12, height: 48, color: TEXT },
+  input: {
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    height: 48,
+    color: TEXT,
+  },
 
   actions: { flexDirection: 'row', gap: 10, marginTop: 2, marginBottom: 2 },
   btn: {
@@ -1001,10 +1495,33 @@ const styles = StyleSheet.create({
   btnGhost: { backgroundColor: '#fff', borderWidth: 1, borderColor: BORDER },
   btnGhostText: { color: TEXT, fontWeight: '800' },
 
-  // Receipt visuals (unchanged)
-  paperCenter: { ...StyleSheet.absoluteFillObject, padding: 18, justifyContent: 'center', alignItems: 'center' },
-  paperNotchLeft: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: 'rgba(0,0,0,0.05)', left: '50%', marginLeft: -(PAPER_W / 2) - 7, top: '20%' },
-  paperNotchRight: { position: 'absolute', width: 14, height: 14, borderRadius: 7, backgroundColor: 'rgba(0,0,0,0.05)', right: '50%', marginRight: -(PAPER_W / 2) - 7, bottom: '22%' },
+  // Receipt visuals
+  paperCenter: {
+    ...StyleSheet.absoluteFillObject,
+    padding: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  paperNotchLeft: {
+    position: 'absolute',
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: 'rgba(0,0,0,0.05)',
+    left: '50%',
+    marginLeft: -(PAPER_W / 2) - 7,
+    top: '20%',
+  },
+  paperNotchRight: {
+    position: 'absolute',
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: 'rgba(0,0,0,0.05)',
+    right: '50%',
+    marginRight: -(PAPER_W / 2) - 7,
+    bottom: '22%',
+  },
   paper: {
     width: PAPER_W,
     backgroundColor: '#FFFEFC',
@@ -1019,22 +1536,64 @@ const styles = StyleSheet.create({
     shadowRadius: 12,
     elevation: 4,
   },
-  paperCompany: { textAlign: 'center', fontSize: 14, fontWeight: '900', color: TEXT },
-  paperCompanySub: { textAlign: 'center', fontSize: 11, color: MUTED, marginTop: 2 },
-  paperTitle: { textAlign: 'center', fontSize: 13, color: '#475569', fontWeight: '800', marginTop: 2 },
-  paperMeta: { textAlign: 'center', fontSize: 11, color: MUTED, marginTop: 2 },
-  dots: { borderBottomWidth: 1, borderStyle: 'dotted', borderColor: '#C7D2FE', marginVertical: 10 },
-  rowKV: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
+  paperCompany: {
+    textAlign: 'center',
+    fontSize: 14,
+    fontWeight: '900',
+    color: TEXT,
+  },
+  paperCompanySub: {
+    textAlign: 'center',
+    fontSize: 11,
+    color: MUTED,
+    marginTop: 2,
+  },
+  paperTitle: {
+    textAlign: 'center',
+    fontSize: 13,
+    color: '#475569',
+    fontWeight: '800',
+    marginTop: 2,
+  },
+  paperMeta: {
+    textAlign: 'center',
+    fontSize: 11,
+    color: MUTED,
+    marginTop: 2,
+  },
+  dots: {
+    borderBottomWidth: 1,
+    borderStyle: 'dotted',
+    borderColor: '#C7D2FE',
+    marginVertical: 10,
+  },
+  rowKV: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
   k: { color: '#475569', fontSize: 12, fontWeight: '700' },
   v: { color: TEXT, fontSize: 12, fontWeight: '800' },
   vDanger: { color: '#DC2626' },
   vOk: { color: '#059669' },
   amountBlock: { alignItems: 'center', marginVertical: 4 },
-  amountLabel: { fontSize: 11, color: '#64748B', fontWeight: '700', marginBottom: 2 },
-  amountValue: { fontSize: 20, fontWeight: '900', color: '#059669' },
+  amountLabel: {
+    fontSize: 11,
+    color: '#64748B',
+    fontWeight: '700',
+    marginBottom: 2,
+  },
+  amountValue: {
+    fontSize: 20,
+    fontWeight: '900',
+    color: '#059669',
+  },
 
-  // Share sheet (unchanged)
-  sheetBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.35)' },
+  // Share sheet
+  sheetBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+  },
   shareSheetContainer: {
     position: 'absolute',
     left: 0,
@@ -1048,8 +1607,19 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#EEF1F6',
   },
-  sheetTitle: { fontSize: 16, fontWeight: '900', color: '#111827', textAlign: 'center' },
-  sheetDesc: { fontSize: 12, color: '#6B7280', textAlign: 'center', marginTop: 4, marginBottom: 10 },
+  sheetTitle: {
+    fontSize: 16,
+    fontWeight: '900',
+    color: '#111827',
+    textAlign: 'center',
+  },
+  sheetDesc: {
+    fontSize: 12,
+    color: '#6B7280',
+    textAlign: 'center',
+    marginTop: 4,
+    marginBottom: 10,
+  },
   sheetList: { gap: 10 },
   sheetItem: {
     flexDirection: 'row',
@@ -1062,9 +1632,40 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#EEF1F6',
   },
-  sheetIcon: { width: 36, height: 36, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
-  sheetItemTitle: { fontSize: 14, fontWeight: '800', color: '#0B1220' },
-  sheetItemSub: { fontSize: 11, color: '#6B7280' },
-  sheetCancel: { marginTop: 12, alignSelf: 'center', paddingVertical: 10, paddingHorizontal: 16 },
+  sheetIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sheetItemTitle: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#0B1220',
+  },
+  sheetItemSub: {
+    fontSize: 11,
+    color: '#6B7280',
+  },
+  sheetCancel: {
+    marginTop: 12,
+    alignSelf: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+  },
   sheetCancelTxt: { fontWeight: '800', color: '#6B7280' },
+  footerThanks: {
+    textAlign: 'center',
+    fontSize: 13,
+    fontWeight: '900',
+    color: '#0B1220',
+    marginTop: 8,
+  },
+  footerFine: {
+    textAlign: 'center',
+    fontSize: 11,
+    color: '#64748B',
+    marginTop: 4,
+  },
 });

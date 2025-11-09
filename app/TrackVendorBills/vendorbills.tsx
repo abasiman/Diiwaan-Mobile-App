@@ -1,3 +1,5 @@
+//oilpurchasevendorbills
+
 import { AntDesign, Feather } from '@expo/vector-icons';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import { useFocusEffect, useIsFocused } from '@react-navigation/native';
@@ -7,6 +9,20 @@ import { useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BackHandler } from 'react-native';
+
+import { syncPendingOilModalForms } from '../OilModalOffline/oilModalSync';
+
+
+
+import { getVendorBillsForOwner } from '../OilPurchaseOffline/oilpurchasevendorbillsrepo';
+
+
+import NetInfo from '@react-native-community/netinfo';
+
+import { getVendorBillsWithSync } from '../OilPurchaseOffline/oilpurchasevendorbillsync';
+
+
+
 
 import { events, EVT_EXTRA_COST_CREATED, EVT_VENDOR_PAYMENT_CREATED } from '../Shidaal/eventBus';
 
@@ -28,10 +44,17 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
+
 import OilActionsModal from '../Shidaal/OilActionsModal';
 import OilExtraCostModal from '../Shidaal/oilExtraCostModal';
 import VendorPaymentCreateSheet from '../Shidaal/vendorpayment';
 
+import {
+  getOilSummaryCache,
+  getWakaaladStatsCache,
+  saveOilSummaryCache,
+  saveWakaaladStatsCache,
+} from '../OilPurchaseOffline/oilSummaryStatsCache';
 const { width } = Dimensions.get('window');
 
 const ALL_TRUCKS = '__ALL__';
@@ -158,6 +181,8 @@ const COLOR_CARD = '#F8FAFC';
 const COLOR_ACCENT = '#0B2447';
 const COLOR_SHADOW = 'rgba(2, 6, 23, 0.04)';
 
+
+
 function formatNumber(n?: number | null, fractionDigits = 0) {
   if (n === undefined || n === null || isNaN(Number(n))) return '—';
   return new Intl.NumberFormat(undefined, {
@@ -228,8 +253,10 @@ function ChildOilBadge({
 
 export default function VendorBillsScreen() {
   const router = useRouter();
-  const { token } = useAuth();
+  const { token, user } = useAuth();
+
   const insets = useSafeAreaInsets();
+
 
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -283,11 +310,52 @@ export default function VendorBillsScreen() {
     endDate: dayjs().endOf('day').toDate(),
   });
 
+
+  
+
+
+
+  const [online, setOnline] = useState(true);
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      console.log('[VendorBills] NetInfo changed', {
+        isConnected: state.isConnected,
+        isInternetReachable: state.isInternetReachable,
+        online: ok,
+      });
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
+
+
   const closeFilters = () => {
     setShowFilters(false);
     setTruckPickerOpen(false);
     setUnitPickerOpen(false);
   };
+
+
+
+
+
+  const loadVendorBillsLocal = useCallback(async () => {
+  if (!user?.id) {
+    console.log('[VendorBills] loadVendorBillsLocal: no user id');
+    setItems([]);
+    return;
+  }
+
+  try {
+    const local = await getVendorBillsForOwner(user.id);
+    console.log('[VendorBills] loadVendorBillsLocal →', local.length, 'rows');
+    setItems(local);
+  } catch (err) {
+    console.warn('[VendorBills] loadVendorBillsLocal error', err);
+  }
+}, [user?.id]);
+
 
   // Derived effective range with fallback to previous month when "this month" has no data
   const effectiveRange = useMemo(() => {
@@ -344,6 +412,12 @@ export default function VendorBillsScreen() {
     [token]
   );
 
+
+
+
+  
+
+
   function formatCurrency(n: number | undefined | null, currency = 'USD') {
     const v = Number(n ?? 0);
     const formatted = new Intl.NumberFormat('en-US', {
@@ -356,56 +430,126 @@ export default function VendorBillsScreen() {
     return `${currency} ${formatted}`;
   }
 
-  /** Fetch supplier dues */
-  const fetchVendorDues = useCallback(async () => {
-    try {
-      const res = await api.get<SupplierDueResponse>('/diiwaanvendorpayments/supplier-dues', {
-        headers: {
-          ...(headers || {}),
-          'Cache-Control': 'no-cache',
-          Pragma: 'no-cache',
-          params: { _ts: Date.now() },
-        } as any,
-      });
-      setItems(res?.data?.items ?? []);
-    } catch {
-      // ignore toast for now
-    }
-  }, [headers]);
+
+
+const hasRealOilId =
+  !!(selected?.oil_id && selected.oil_id > 0) ||
+  !!(selected?.child_oils?.[0]?.oil_id && selected.child_oils[0].oil_id! > 0);
+
+// allow Actions whenever we have a real oil id, regardless of online state
+const canOpenActions = !!hasRealOilId;
+
+
+
+
+
+const fetchVendorDues = useCallback(async () => {
+  if (!user?.id) {
+    console.log('[VendorBills] fetchVendorDues: no user id');
+    setItems([]);
+    return;
+  }
+
+  // 1) ALWAYS show what’s already in local SQLite (offline-first)
+  await loadVendorBillsLocal();
+
+  // 2) If we’re offline or no token, stop here – rely on local cache only
+  if (!online || !token) {
+    console.log('[VendorBills] offline or no token → using local cache only');
+    return;
+  }
+
+  try {
+    // 🔹 2b) FIRST: flush queued oil-modal forms so vendor bills get real oil_id / lot_id
+    console.log('[VendorBills] syncing pending oil-modal forms…');
+    await syncPendingOilModalForms(user.id, token);
+
+    // 3) Online + token → sync vendor bills from server, then update list
+    console.log('[VendorBills] syncing vendor bills from server…');
+    const fresh = await getVendorBillsWithSync({
+      token,
+      ownerId: user.id,
+      force: true,
+    });
+    console.log('[VendorBills] server sync returned', fresh.length, 'items');
+    setItems(fresh);
+  } catch (err) {
+    console.warn('[VendorBills] sync failed, keeping local bills', err);
+    // items from local are already in state
+  }
+}, [user?.id, token, online, loadVendorBillsLocal]);
+
 
   /** Fetch oil summary */
-  const fetchOilSummary = useCallback(async () => {
-    try {
-      const res = await api.get<SummaryResponse>('/diiwaanoil/summary', {
-        headers: { ...(headers || {}) },
-      });
-      setSummary(res.data);
-    } catch {}
-  }, [headers]);
+ const fetchOilSummary = useCallback(async () => {
+  if (!user?.id) return;
 
-  /** Fetch wakaalad stats summary */
-  const fetchWakaaladStats = useCallback(async () => {
-    try {
-      const res = await api.get<WakaaladStatsResponse>('/wakaalad_diiwaan/stats/summary', {
-        headers: { ...(headers || {}) },
-      });
-      setWakaaladStats(res.data);
-    } catch {
-      // ignore for now
+  // 1) show cached snapshot first (works offline / after restart)
+  try {
+    const cached = await getOilSummaryCache(user.id);
+    if (cached) {
+      setSummary(cached as SummaryResponse);
     }
-  }, [headers]);
+  } catch (e) {
+    console.warn('[VendorBills] failed to load cached oil summary', e);
+  }
 
-  const fetchAll = useCallback(async () => {
-    if (fetchingRef.current) return;
-    fetchingRef.current = true;
-    try {
-      setLoading(true);
-      await Promise.all([fetchVendorDues(), fetchOilSummary(), fetchWakaaladStats()]);
-    } finally {
-      setLoading(false);
-      fetchingRef.current = false;
+  // 2) if offline or no token → keep whatever we have
+  if (!online || !token) return;
+
+  // 3) online: fetch fresh + update cache
+  try {
+    const res = await api.get<SummaryResponse>('/diiwaanoil/summary', {
+      headers: { ...(headers || {}) },
+    });
+    setSummary(res.data);
+    await saveOilSummaryCache(user.id, res.data);
+  } catch (e) {
+    console.warn('[VendorBills] fetchOilSummary failed, keeping cached', e);
+  }
+}, [user?.id, online, token, headers]);
+
+
+
+const fetchWakaaladStats = useCallback(async () => {
+  if (!user?.id) return;
+
+  // 1) cached snapshot
+  try {
+    const cached = await getWakaaladStatsCache(user.id);
+    if (cached) {
+      setWakaaladStats(cached as WakaaladStatsResponse);
     }
-  }, [fetchVendorDues, fetchOilSummary, fetchWakaaladStats]);
+  } catch (e) {
+    console.warn('[VendorBills] failed to load cached wakaalad stats', e);
+  }
+
+  // 2) offline / no token → keep cached
+  if (!online || !token) return;
+
+  // 3) online: refresh + cache
+  try {
+    const res = await api.get<WakaaladStatsResponse>('/wakaalad_diiwaan/stats/summary', {
+      headers: { ...(headers || {}) },
+    });
+    setWakaaladStats(res.data);
+    await saveWakaaladStatsCache(user.id, res.data);
+  } catch (e) {
+    console.warn('[VendorBills] fetchWakaaladStats failed, keeping cached', e);
+  }
+}, [user?.id, online, token, headers]);
+
+const fetchAll = useCallback(async () => {
+  if (fetchingRef.current) return;
+  fetchingRef.current = true;
+  try {
+    setLoading(true);
+    await Promise.all([fetchVendorDues(), fetchOilSummary(), fetchWakaaladStats()]);
+  } finally {
+    setLoading(false);
+    fetchingRef.current = false;
+  }
+}, [fetchVendorDues, fetchOilSummary, fetchWakaaladStats]);
 
   useFocusEffect(
     useCallback(() => {
@@ -603,6 +747,22 @@ export default function VendorBillsScreen() {
     );
   };
 
+
+
+const realLotId =
+  selected?.lot_id && selected.lot_id > 0 ? selected.lot_id : null;
+const realOilId =
+  selected?.oil_id && selected.oil_id > 0
+    ? selected.oil_id
+    : selected?.child_oils?.[0]?.oil_id && selected.child_oils[0].oil_id! > 0
+    ? selected.child_oils[0].oil_id!
+    : null;
+
+// enable as long as we have some real id, regardless of online
+const canOpenExtras = !!(realLotId || realOilId);
+
+
+
   return (
     <View style={styles.page}>
       <SafeAreaView edges={['top']} style={{ backgroundColor: COLOR_BG }}>
@@ -711,89 +871,102 @@ export default function VendorBillsScreen() {
           )}
         </View>
       </View>
+{/* List */}
+<ScrollView
+  contentContainerStyle={styles.scrollContent}
+  refreshControl={
+    <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
+  }
+  keyboardShouldPersistTaps="handled"
+  showsVerticalScrollIndicator
+>
+  {loading ? (
+    <View style={styles.loading}>
+      <ActivityIndicator />
+    </View>
+  ) : filteredItems.length === 0 ? (
+    <View style={styles.empty}>
+      <Feather name="inbox" size={18} color={COLOR_MUTED} />
+      <Text style={styles.emptyText}>No vendor bills found.</Text>
+    </View>
+  ) : (
+    filteredItems.map((it, idx) => {
+      const plateOrSupplier = it.truck_plate?.trim() || it.supplier_name || '—';
+      const titlePieces = [it.truck_type?.trim(), plateOrSupplier].filter(
+        Boolean
+      ) as string[];
+      const title = titlePieces.join(' · ');
 
-      {/* List */}
-      <ScrollView
-        contentContainerStyle={styles.scrollContent}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
-        keyboardShouldPersistTaps="handled"
-        showsVerticalScrollIndicator
-      >
-        {loading ? (
-          <View style={styles.loading}>
-            <ActivityIndicator />
+      const children = it.child_oils || [];
+      let right: OilDueLine[] = [];
+
+      if (children.length > 0) {
+        // normal / lot or offline-both bills (we already have child_oils)
+        right = children.slice(0, 2);
+      } else {
+        // 🔁 Fallback for offline *single* bills (no child_oils, no oil_id yet)
+        const liters = Number(it.liters || 0);
+        const oilType = it.oil_type || null;
+
+        if (liters > 0 || oilType || it.oil_id) {
+          right = [
+            {
+              oil_id: it.oil_id ?? 0, // 0 = local/unknown id
+              oil_type: oilType,
+              liters,
+              sold_l: 0,
+              in_stock_l: liters, // treat all liters as current stock
+              oil_total_landed_cost: Number(it.oil_total_landed_cost || 0),
+              total_extra_cost: Number(it.total_extra_cost || 0),
+              over_all_cost:
+                typeof it.over_all_cost === 'number'
+                  ? Number(it.over_all_cost)
+                  : Number(it.oil_total_landed_cost || 0) +
+                    Number(it.total_extra_cost || 0),
+              total_paid: Number(it.total_paid || 0),
+              amount_due: Number(it.amount_due || 0),
+              extra_costs: it.extra_costs || [],
+            },
+          ];
+        }
+      }
+
+      return (
+        <TouchableOpacity
+          key={billKey(it, idx)}
+          style={styles.card}
+          activeOpacity={0.9}
+          onPress={() => setSelected(it)}
+        >
+          {/* LEFT */}
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={styles.supplier} numberOfLines={1}>
+              {title}
+            </Text>
+            <View style={styles.childRow}>
+              <View style={styles.childPill}>
+                <Feather name="calendar" size={10} color={COLOR_TEXT} />
+                <Text style={styles.childText}>{formatDateLocal(it.date)}</Text>
+              </View>
+            </View>
           </View>
-        ) : filteredItems.length === 0 ? (
-          <View style={styles.empty}>
-            <Feather name="inbox" size={18} color={COLOR_MUTED} />
-            <Text style={styles.emptyText}>No vendor bills found.</Text>
+
+          {/* RIGHT: Child oil(s) compact */}
+          <View style={styles.rightCol}>
+            {right.map((c, ix) => (
+              <ChildOilBadge
+                key={`${c.oil_id}_${ix}`}
+                label={(c.oil_type || '—').toUpperCase()}
+                instock={Number(c.in_stock_l || 0)}
+                displayUnit={displayUnit}
+              />
+            ))}
           </View>
-        ) : (
-          filteredItems.map((it, idx) => {
-            const plateOrSupplier = it.truck_plate?.trim() || it.supplier_name || '—';
-            const titlePieces = [it.truck_type?.trim(), plateOrSupplier].filter(Boolean) as string[];
-            const title = titlePieces.join(' · ');
-
-            const children = it.child_oils || [];
-            let right: OilDueLine[] = [];
-
-            if (children.length > 0) {
-              right = children.slice(0, 2);
-            } else if (it.oil_id) {
-              right = [
-                {
-                  oil_id: it.oil_id,
-                  oil_type: it.oil_type,
-                  liters: it.liters,
-                  sold_l: 0,
-                  in_stock_l: 0,
-                  oil_total_landed_cost: it.oil_total_landed_cost,
-                  total_extra_cost: it.total_extra_cost,
-                  over_all_cost:
-                    it.over_all_cost ?? it.oil_total_landed_cost + it.total_extra_cost,
-                  total_paid: it.total_paid,
-                  amount_due: it.amount_due,
-                  extra_costs: [],
-                },
-              ];
-            }
-
-            return (
-              <TouchableOpacity
-                key={billKey(it, idx)}
-                style={styles.card}
-                activeOpacity={0.9}
-                onPress={() => setSelected(it)}
-              >
-                {/* LEFT */}
-                <View style={{ flex: 1, minWidth: 0 }}>
-                  <Text style={styles.supplier} numberOfLines={1}>
-                    {title}
-                  </Text>
-                  <View style={styles.childRow}>
-                    <View style={styles.childPill}>
-                      <Feather name="calendar" size={10} color={COLOR_TEXT} />
-                      <Text style={styles.childText}>{formatDateLocal(it.date)}</Text>
-                    </View>
-                  </View>
-                </View>
-
-                {/* RIGHT: Child oil(s) compact */}
-                <View style={styles.rightCol}>
-                  {right.map((c, ix) => (
-                    <ChildOilBadge
-                      key={`${c.oil_id}_${ix}`}
-                      label={(c.oil_type || '—').toUpperCase()}
-                      instock={Number(c.in_stock_l || 0)}
-                      displayUnit={displayUnit}
-                    />
-                  ))}
-                </View>
-              </TouchableOpacity>
-            );
-          })
-        )}
-      </ScrollView>
+        </TouchableOpacity>
+      );
+    })
+  )}
+</ScrollView>
 
       {/* Floating "+ Dalab Cusub" button */}
       <TouchableOpacity
@@ -825,14 +998,19 @@ export default function VendorBillsScreen() {
                     {(() => {
                       const hasOil = !!(selected?.oil_id || selected?.child_oils?.[0]?.oil_id);
                       return (
-                        <TouchableOpacity
-                          style={[styles.headerTabBtn, !hasOil && { opacity: 0.5 }]}
-                          disabled={!hasOil}
-                          onPress={() => hasOil && setActionsOpen(true)}
-                        >
-                          <Feather name="settings" size={12} color="#0B2447" />
-                          <Text style={styles.headerTabTxt}>Actions</Text>
-                        </TouchableOpacity>
+                      <TouchableOpacity
+                            style={[styles.headerTabBtn, !canOpenActions && { opacity: 0.5 }]}
+                            disabled={!canOpenActions}
+                            onPress={() => {
+                              if (!canOpenActions) return;
+                              setActionsOpen(true);  // OilActionsModal already gets token, will behave as before
+                            }}
+                          >
+                            <Feather name="settings" size={12} color="#0B2447" />
+                            <Text style={styles.headerTabTxt}>Actions</Text>
+                          </TouchableOpacity>
+
+
                       );
                     })()}
                   </View>
@@ -874,33 +1052,35 @@ export default function VendorBillsScreen() {
                     )}
                   </View>
 
-                  <TouchableOpacity
-                    style={styles.headerTabBtn}
-                    onPress={() => {
-                      const lotId =
-                        (selected?.child_oils?.length ?? 0) > 0 && selected?.lot_id
-                          ? selected.lot_id
-                          : null;
-                      const oilId = selected?.oil_id ?? selected?.child_oils?.[0]?.oil_id ?? null;
-                      const plate = (selected?.truck_plate || '').trim();
 
-                      if (lotId) {
-                        router.push({
-                          pathname: '/Shidaal/extracostspage',
-                          params: { lot_id: String(lotId), plate },
-                        });
-                      } else if (oilId) {
-                        router.push({
-                          pathname: '/Shidaal/extracostspage',
-                          params: { oil_id: String(oilId), plate },
-                        });
-                      }
-                    }}
-                    activeOpacity={0.9}
-                  >
-                    <Feather name="layers" size={12} color="#0B2447" />
-                    <Text style={styles.headerTabTxt}>Qarashaad Dheerad Ah</Text>
-                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                  style={[styles.headerTabBtn, !canOpenExtras && { opacity: 0.5 }]}
+                  activeOpacity={canOpenExtras ? 0.9 : 1}
+                  disabled={!canOpenExtras}
+                  onPress={() => {
+                    if (!canOpenExtras) return;
+                    const plate = (selected?.truck_plate || '').trim();
+
+                    if (realLotId) {
+                      router.push({
+                        pathname: '/Shidaal/extracostspage',
+                        params: { lot_id: String(realLotId), plate },
+                      });
+                    } else if (realOilId) {
+                      router.push({
+                        pathname: '/Shidaal/extracostspage',
+                        params: { oil_id: String(realOilId), plate },
+                      });
+                    }
+                  }}
+                >
+                  <Feather name="layers" size={12} color="#0B2447" />
+                  <Text style={styles.headerTabTxt}>Qarashaad Dheerad Ah</Text>
+                </TouchableOpacity>
+
+
+
                 </View>
                 <View style={styles.listHeaderDivider} />
 

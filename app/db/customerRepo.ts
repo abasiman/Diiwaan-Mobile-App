@@ -1,4 +1,4 @@
-//customerRepots.ts
+// app/db/customerRepo.ts
 
 import type { AxiosInstance } from 'axios';
 import { db } from './db';
@@ -202,6 +202,75 @@ export function createOrUpdateCustomerLocal(
   }
 }
 
+/**
+ * NEW: apply a local *delta* to a customer's balance when we create
+ * an OFFLINE sale (credit). This only changes local numbers so the
+ * CustomersList shows the updated balance immediately.
+ *
+ * - `deltaAmountDueUsd` should be the credit/outstanding portion in USD.
+ * - Look up by owner + customer name (same name you use in sales).
+ * - If the customer doesn't exist yet, we create a temp local row (id < 0)
+ *   with dirty=1 so it will be POSTed on next sync.
+ */
+export function applyLocalCustomerBalanceDeltaByName(
+  ownerId: number,
+  customerName: string | null | undefined,
+  deltaAmountDueUsd: number
+) {
+  const name = (customerName || '').trim();
+  if (!ownerId || !name) return;
+  if (!deltaAmountDueUsd || !isFinite(deltaAmountDueUsd)) return;
+
+  const now = new Date().toISOString();
+
+  db.withTransactionSync(() => {
+    const existing = db.getFirstSync<CustomerRow>(
+      `
+      SELECT *
+      FROM customers
+      WHERE owner_id = ?
+        AND deleted = 0
+        AND name = ?
+      LIMIT 1;
+    `,
+      [ownerId, name]
+    );
+
+    if (existing) {
+      // Just bump the balance locally. We deliberately do NOT touch `dirty`
+      // so we don't send any bogus "amount_due" to the server. Server will
+      // recompute from real sales after sync.
+      db.runSync(
+        `
+        UPDATE customers
+        SET amount_due      = amount_due + ?,
+            amount_due_usd  = COALESCE(amount_due_usd, 0) + ?,
+            updated_at      = ?
+        WHERE id = ?;
+      `,
+        [deltaAmountDueUsd, deltaAmountDueUsd, now, existing.id]
+      );
+    } else {
+      // No customer row yet: create a temporary one with this opening balance.
+      const id = getNextTempId();
+      db.runSync(
+        `
+        INSERT INTO customers (
+          id, owner_id, name, phone, address, status,
+          amount_due, amount_due_usd, amount_due_native, amount_paid,
+          created_at, updated_at, dirty, deleted
+        ) VALUES (
+          ?, ?, ?, NULL, NULL, 'active',
+          ?, ?, 0, 0,
+          ?, ?, 1, 0
+        );
+      `,
+        [id, ownerId, name, deltaAmountDueUsd, deltaAmountDueUsd, now, now]
+      );
+    }
+  });
+}
+
 // ---------- Local delete helpers ----------
 export function markCustomerDeletedLocal(id: number) {
   db.runSync(
@@ -258,7 +327,7 @@ export async function syncCustomersWithServer(api: AxiosInstance) {
         continue;
       }
     } else {
-      // Existing record update
+      // Existing record update (we NEVER send amount_due; server owns that)
       try {
         const res = await api.patch<ApiCustomer>(
           `/diiwaancustomers/${row.id}`,

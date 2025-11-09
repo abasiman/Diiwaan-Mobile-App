@@ -1,20 +1,25 @@
 // app/Shidaal/ReverseOilSaleModal.tsx
 import api from "@/services/api";
 import { Feather } from "@expo/vector-icons";
-import { useMemo, useState } from "react";
+import NetInfo from "@react-native-community/netinfo";
+import { useEffect, useMemo, useState } from "react";
 import {
-    ActivityIndicator,
-    Alert,
-    Keyboard,
-    Modal,
-    Platform,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    TouchableWithoutFeedback,
-    View,
+  ActivityIndicator,
+  Alert,
+  Keyboard,
+  Modal,
+  Platform,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  TouchableWithoutFeedback,
+  View,
 } from "react-native";
+
+
+import { queueOilSaleReverseForSync } from "../dbsalereverse/oilSaleReverseOfflineRepo";
+
 
 type Sale = {
   id: number;
@@ -29,18 +34,30 @@ export default function ReverseOilSaleModal({
   visible,
   onClose,
   token,
+  ownerId,
   sale,
   onSuccess,
 }: {
   visible: boolean;
   onClose: () => void;
   token?: string | null;
+  ownerId?: number;          // 🔹 add this
   sale: Sale | null;
   onSuccess?: (updated?: any) => void;
 }) {
   const [liters, setLiters] = useState<string>("");
   const [note, setNote] = useState<string>("");
   const [loading, setLoading] = useState(false);
+  const [online, setOnline] = useState(true);
+
+  // watch connectivity
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
 
   const authHeader = useMemo(
     () => (token ? { Authorization: `Bearer ${token}` } : {}),
@@ -51,16 +68,46 @@ export default function ReverseOilSaleModal({
   const litersValid =
     liters.trim().length > 0 && !Number.isNaN(parsedLiters) && parsedLiters > 0;
 
+  const reset = () => {
+    setLiters("");
+    setNote("");
+  };
+
   const submit = async () => {
     if (!sale?.id) return;
     if (!litersValid) {
       Alert.alert("Invalid liters", "Please enter a valid number of liters.");
       return;
     }
+
     setLoading(true);
     try {
-      // Adjust URL/body to match your backend contract
-      // Example: POST /oilsale/{id}/reverse  body: { liters, note }
+      // 🔹 OFFLINE (or no token) → queue locally
+      if (!token || !online) {
+        if (!ownerId) {
+          throw new Error("Missing owner id for offline reverse.");
+        }
+
+        await queueOilSaleReverseForSync(
+          ownerId,
+          sale.id,
+          parsedLiters,
+          note?.trim() || undefined
+        );
+
+        setLoading(false);
+        reset();
+        onClose();
+        onSuccess?.(); // let parent refetch local data if it wants
+
+        Alert.alert(
+          "Saved offline",
+          "Reverse will sync automatically when you're back online."
+        );
+        return;
+      }
+
+      // 🔹 ONLINE → normal API call
       await api.post(
         `/oilsale/${sale.id}/reverse`,
         { liters: parsedLiters, note },
@@ -68,8 +115,7 @@ export default function ReverseOilSaleModal({
       );
 
       setLoading(false);
-      setLiters("");
-      setNote("");
+      reset();
       onClose();
       onSuccess?.();
     } catch (e: any) {
@@ -147,7 +193,7 @@ export default function ReverseOilSaleModal({
               <TouchableOpacity
                 style={[
                   styles.primary,
-                  !litersValid && { opacity: 0.6 },
+                  (!litersValid || loading) && { opacity: 0.6 },
                 ]}
                 onPress={submit}
                 disabled={!litersValid || loading}
@@ -157,7 +203,10 @@ export default function ReverseOilSaleModal({
                 ) : (
                   <>
                     <Feather name="rotate-ccw" size={16} color="#fff" />
-                    <Text style={styles.primaryTxt} allowFontScaling={false}>
+                    <Text
+                      style={styles.primaryTxt}
+                      allowFontScaling={false}
+                    >
                       Process Reverse
                     </Text>
                   </>

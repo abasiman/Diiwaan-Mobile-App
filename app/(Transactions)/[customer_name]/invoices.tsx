@@ -7,6 +7,7 @@ import {
   getSaleLocal,
   upsertCustomerInvoicesFromServer,
 } from '@/app/db/CustomerInvoicesPagerepo';
+import { getPendingOilSalesLocalForDisplay } from '@/app/dbform/invocieoilSalesOfflineRepo';
 import PaymentCreateSheet from '@/app/ManageInvoice/PaymentCreateSheet';
 import api from '@/services/api';
 import { Feather, FontAwesome } from '@expo/vector-icons';
@@ -14,7 +15,14 @@ import NetInfo from '@react-native-community/netinfo';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useGlobalSearchParams, useRouter } from 'expo-router';
 import * as Sharing from 'expo-sharing';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -33,6 +41,12 @@ import {
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { captureRef } from 'react-native-view-shot';
+
+// 💳 NEW: pending payments queue helper
+import {
+  CreatePaymentPayload,
+  getPendingPaymentsLocal,
+} from '@/app/ManageInvoice/paymentOfflineRepo';
 
 /* ----------------------------- API Types (match /oilsale/summary/by-customer-name) ----------------------------- */
 type SaleUnitType = 'liters' | 'fuusto' | 'caag' | 'lot';
@@ -81,7 +95,6 @@ type OilSaleTotals = {
   overall_count: number;
   overall_revenue_native: number;
   overall_revenue_usd: number;
-  // (per_currency exists in backend response; we don't use it here)
 };
 
 type OilSaleCustomerReport = {
@@ -117,6 +130,46 @@ type CustomerDetails = {
   updated_at: string;
 };
 
+/* ---------------- apply pending payments to customer KPIs ---------------- */
+
+function applyPendingPaymentsToCustomer(
+  base: CustomerDetails | null,
+  ownerId?: number | null
+): CustomerDetails | null {
+  if (!base || !ownerId || !base.id) return base;
+
+  let extraPaid = 0;
+
+  try {
+    const rows = getPendingPaymentsLocal(ownerId, 500);
+    for (const row of rows) {
+      try {
+        const payload = JSON.parse(
+          row.payload_json
+        ) as CreatePaymentPayload;
+        if (
+          payload.customer_id === base.id &&
+          row.sync_status === 'pending'
+        ) {
+          extraPaid += payload.amount;
+        }
+      } catch {
+        // ignore malformed rows
+      }
+    }
+  } catch {
+    // ignore local DB errors
+  }
+
+  if (!extraPaid) return base;
+
+  return {
+    ...base,
+    amount_paid: (base.amount_paid || 0) + extraPaid,
+    amount_due: Math.max(0, (base.amount_due || 0) - extraPaid),
+  };
+}
+
 /* ----------------------------- Theme ----------------------------- */
 const BRAND_BLUE = '#0B2447';
 const BRAND_BLUE_2 = '#19376D';
@@ -135,9 +188,12 @@ export default function CustomerInvoicesPage() {
   const insets = useSafeAreaInsets();
   const { token, user } = useAuth(); // user.id is your tenant / owner_id
 
-  const { customer_name: raw } = useGlobalSearchParams<{ customer_name?: string | string[] }>();
+  const { customer_name: raw } =
+    useGlobalSearchParams<{ customer_name?: string | string[] }>();
   const customerName = Array.isArray(raw) ? raw[0] : raw;
-  const decodedName = customerName ? decodeURIComponent(customerName) : undefined;
+  const decodedName = customerName
+    ? decodeURIComponent(customerName)
+    : undefined;
 
   const [isPayOpen, setIsPayOpen] = useState(false);
   const [isSaleOpen, setIsSaleOpen] = useState(false);
@@ -184,113 +240,253 @@ export default function CustomerInvoicesPage() {
   const fetchProfile = useCallback(async () => {
     if (!token) return;
     try {
-      const res = await api.get<MeProfile>('/diiwaan/me', { headers: authHeader });
+      const res = await api.get<MeProfile>('/diiwaan/me', {
+        headers: authHeader,
+      });
       setMeProfile(res.data);
     } catch {
       setMeProfile(null);
     }
   }, [token, authHeader]);
 
-// inside CustomerInvoicesPage.tsx
-const fetchReport = useCallback(
-  async (name: string) => {
-    const trimmed = name.trim();
-    if (!trimmed) return;
+  // inside CustomerInvoicesPage.tsx
+  const fetchReport = useCallback(
+    async (name: string) => {
+      const trimmed = name.trim();
+      if (!trimmed) return;
 
-    setError(null);
-    setLoading(true);
+      setError(null);
+      setLoading(true);
 
-    try {
-      // ONLINE → API + cache to sqlite
-      if (online && token && user?.id) {
-        const res = await api.get<OilSaleCustomerReport>(
-          '/oilsale/summary/by-customer-name',
-          {
-            headers: authHeader,
-            params: {
-              customer_name: trimmed,
-              match: 'exact',
-              case_sensitive: false,
-              order: 'created_desc',
-              offset: 0,
-              limit: 200,
-            },
-          }
+      // helper: build report from local DB + pending offline queue
+      const buildLocalReportWithPending = (ownerId: number) => {
+        const baseReport = getCustomerInvoiceReportLocal(ownerId, trimmed);
+        const probe = trimmed.toLowerCase();
+
+        // pending offline invoice sales from queue for this customer
+        const pendingAll = getPendingOilSalesLocalForDisplay(ownerId, {
+          limit: 500,
+        });
+        const pendingForCustomer = pendingAll.filter(
+          (p) =>
+            p.sale_type === 'invoice' &&
+            (p.customer || '').trim().toLowerCase() === probe
         );
 
-        // 1) use server data for current view
-        setReport(res.data);
+        if (!pendingForCustomer.length) {
+          return baseReport;
+        }
 
-        // 2) cache to oilsales so offline works next time
-        upsertCustomerInvoicesFromServer(res.data, user.id);
+        // map PendingOilSaleLocal -> OilSaleRead (shape used here)
+        const pendingMapped: OilSaleRead[] = pendingForCustomer.map((p) => ({
+          id: p.id, // negative id (e.g. -local_id)
+          oil_id: p.oil_id,
+          owner_id: p.owner_id,
+          customer: p.customer,
+          customer_contact: p.customer_contact,
+          oil_type: p.oil_type,
+          unit_type: p.unit_type as SaleUnitType,
+          unit_qty: p.unit_qty,
+          unit_capacity_l: p.unit_capacity_l,
+          liters_sold: p.liters_sold,
+          currency: p.currency,
+          price_per_l: p.price_per_l,
+          subtotal_native: p.subtotal_native,
+          discount_native: p.discount_native,
+          tax_native: p.tax_native,
+          total_native: p.total_native,
+          fx_rate_to_usd: p.fx_rate_to_usd,
+          total_usd: p.total_usd,
+          payment_status: p.payment_status,
+          payment_method: p.payment_method,
+          paid_native: p.paid_native,
+          note: p.note,
+          created_at: p.created_at,
+          updated_at: p.updated_at,
+        }));
 
-        // 3) KPIs: try API, fallback to local customers table
-        if (res.data.customer_id) {
-          try {
-            const c = await api.get<CustomerDetails>(
-              `/diiwaancustomers/${res.data.customer_id}`,
-              { headers: authHeader }
-            );
-            setCustomer(c.data);
-          } catch {
+        const items = [...pendingMapped, ...baseReport.items];
+
+        // recompute totals (same spirit as getCustomerInvoiceReportLocal)
+        const safeNum = (n: number | null | undefined): number =>
+          typeof n === 'number' && isFinite(n) ? n : 0;
+
+        const ensureTotalUsd = (item: OilSaleRead): OilSaleRead => {
+          const cur = (item.currency || 'USD').toUpperCase();
+          if (
+            cur === 'USD' &&
+            item.total_usd == null &&
+            item.total_native != null
+          ) {
+            return { ...item, total_usd: item.total_native };
+          }
+          return item;
+        };
+
+        const perTypeMap = new Map<
+          string,
+          { count: number; native: number; usd: number }
+        >();
+
+        for (const raw of items) {
+          const it = ensureTotalUsd(raw);
+          const key = it.oil_type || 'unknown';
+          const existing = perTypeMap.get(key) || {
+            count: 0,
+            native: 0,
+            usd: 0,
+          };
+          existing.count += 1;
+          existing.native += safeNum(it.total_native);
+          existing.usd += safeNum(it.total_usd);
+          perTypeMap.set(key, existing);
+        }
+
+        const per_type = Array.from(perTypeMap.entries()).map(
+          ([oil_type, v]) => ({
+            oil_type,
+            count: v.count,
+            revenue_native: v.native,
+            revenue_usd: v.usd,
+          })
+        );
+
+        const overall_revenue_native = per_type.reduce(
+          (s, t) => s + t.revenue_native,
+          0
+        );
+        const overall_revenue_usd = per_type.reduce(
+          (s, t) => s + t.revenue_usd,
+          0
+        );
+        const overall_count = items.length;
+
+        return {
+          ...baseReport,
+          items,
+          totals: {
+            per_type,
+            overall_count,
+            overall_revenue_native,
+            overall_revenue_usd,
+          },
+          returned: items.length,
+          has_more: false,
+        };
+      };
+
+      try {
+        // ONLINE → API + cache to sqlite
+        if (online && token && user?.id) {
+          const res = await api.get<OilSaleCustomerReport>(
+            '/oilsale/summary/by-customer-name',
+            {
+              headers: authHeader,
+              params: {
+                customer_name: trimmed,
+                match: 'exact',
+                case_sensitive: false,
+                order: 'created_desc',
+                offset: 0,
+                limit: 200,
+              },
+            }
+          );
+
+          // 1) use server data for current view
+          setReport(res.data);
+
+          // 2) cache to oilsales so offline works next time
+          upsertCustomerInvoicesFromServer(res.data, user.id);
+
+          // 3) KPIs: try API, fallback to local customers table
+          if (res.data.customer_id) {
+            try {
+              const c = await api.get<CustomerDetails>(
+                `/diiwaancustomers/${res.data.customer_id}`,
+                { headers: authHeader }
+              );
+              const withPending = applyPendingPaymentsToCustomer(
+                c.data,
+                user.id
+              );
+              setCustomer(withPending);
+            } catch {
+              const local = getCustomerDetailsLocalByName(
+                user.id,
+                res.data.customer_name
+              );
+              const withPending = applyPendingPaymentsToCustomer(
+                local,
+                user.id
+              );
+              setCustomer(withPending);
+            }
+          } else {
             const local = getCustomerDetailsLocalByName(
               user.id,
               res.data.customer_name
             );
-            setCustomer(local);
+            const withPending = applyPendingPaymentsToCustomer(
+              local,
+              user.id
+            );
+            setCustomer(withPending);
           }
-        } else {
-          const local = getCustomerDetailsLocalByName(
-            user.id,
-            res.data.customer_name
-          );
-          setCustomer(local);
+
+          return;
         }
 
-        return;
-      }
-
-      // OFFLINE (or no token) → local-only
-      if (user?.id) {
-        const localReport = getCustomerInvoiceReportLocal(user.id, trimmed);
-        setReport(localReport);
-
-        const localCustomer = getCustomerDetailsLocalByName(
-          user.id,
-          localReport.customer_name
-        );
-        setCustomer(localCustomer);
-      } else {
-        setReport(null);
-        setCustomer(null);
-      }
-    } catch (e: any) {
-      // If online call fails, fallback to local cache
-      if (user?.id) {
-        try {
-          const localReport = getCustomerInvoiceReportLocal(user.id, trimmed);
+        // OFFLINE (or no token) → local-only + pending offline queue
+        if (user?.id) {
+          const localReport = buildLocalReportWithPending(user.id);
           setReport(localReport);
+
           const localCustomer = getCustomerDetailsLocalByName(
             user.id,
             localReport.customer_name
           );
-          setCustomer(localCustomer);
-          setError(null);
-        } catch {
-          setError('Failed to load customer oil sales from local DB.');
+          const withPending = applyPendingPaymentsToCustomer(
+            localCustomer,
+            user.id
+          );
+          setCustomer(withPending);
+        } else {
+          setReport(null);
+          setCustomer(null);
         }
-      } else {
-        setError(e?.response?.data?.detail || 'Failed to fetch customer oil sales.');
+      } catch (e: any) {
+        // If online call fails, fallback to local cache + pending
+        if (user?.id) {
+          try {
+            const localReport = buildLocalReportWithPending(user.id);
+            setReport(localReport);
+            const localCustomer = getCustomerDetailsLocalByName(
+              user.id,
+              localReport.customer_name
+            );
+            const withPending = applyPendingPaymentsToCustomer(
+              localCustomer,
+              user.id
+            );
+            setCustomer(withPending);
+            setError(null);
+          } catch {
+            setError('Failed to load customer oil sales from local DB.');
+          }
+        } else {
+          setError(
+            e?.response?.data?.detail ||
+              'Failed to fetch customer oil sales.'
+          );
+        }
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
       }
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  },
-  [authHeader, online, token, user]
-);
-
-
+    },
+    [authHeader, online, token, user]
+  );
 
   const refetch = useCallback(() => {
     if (decodedName) fetchReport(decodedName);
@@ -325,7 +521,11 @@ const fetchReport = useCallback(
   const fmtDate = (iso: string) => {
     try {
       const d = new Date(iso);
-      return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+      return d.toLocaleDateString(undefined, {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+      });
     } catch {
       return iso;
     }
@@ -336,7 +536,11 @@ const fetchReport = useCallback(
 
   const fmtUSDMoney = (n?: number | null) =>
     typeof n === 'number' && isFinite(n)
-      ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(n)
+      ? new Intl.NumberFormat('en-US', {
+          style: 'currency',
+          currency: 'USD',
+          maximumFractionDigits: 2,
+        }).format(n)
       : '—';
 
   const fmtCurrencyAmount = (currency: string, amount?: number | null) => {
@@ -347,7 +551,8 @@ const fetchReport = useCallback(
 
   // qty label: show number + unit (e.g., "2 fuusto", "1 caag", "25 L", "1 lot")
   const getQtyLabel = (r: OilSaleRead) => {
-    if (r.unit_type === 'liters') return `${fmtNum(r.liters_sold, 0)} L`;
+    if (r.unit_type === 'liters')
+      return `${fmtNum(r.liters_sold, 0)} L`;
     if (r.unit_type === 'fuusto' || r.unit_type === 'caag') {
       const q = r.unit_qty || 0;
       return `${q} ${r.unit_type}`;
@@ -364,7 +569,6 @@ const fetchReport = useCallback(
     </View>
   );
 
-  // open receipt (online + offline)
   const openReceipt = useCallback(
     async (saleId: number) => {
       if (!user?.id) return;
@@ -375,24 +579,87 @@ const fetchReport = useCallback(
       setActiveSale(null);
 
       try {
-        if (online && token) {
-          const res = await api.get<OilSaleRead>(`/oilsale/${saleId}`, { headers: authHeader });
+        const isPendingLocal = saleId < 0;
+
+        if (!isPendingLocal && online && token) {
+          // Normal remote sale
+          const res = await api.get<OilSaleRead>(
+            `/oilsale/${saleId}`,
+            {
+              headers: authHeader,
+            }
+          );
           setActiveSale(res.data);
+        } else if (isPendingLocal) {
+          // Pending offline sale from queue
+          const pendingAll = getPendingOilSalesLocalForDisplay(
+            user.id,
+            {
+              limit: 500,
+            }
+          );
+          const p = pendingAll.find((row) => row.id === saleId);
+          if (!p) {
+            throw new Error('Offline sale not found in queue.');
+          }
+
+          const mapped: OilSaleRead = {
+            id: p.id,
+            oil_id: p.oil_id,
+            owner_id: p.owner_id,
+            customer: p.customer,
+            customer_contact: p.customer_contact,
+            oil_type: p.oil_type,
+            unit_type: p.unit_type as SaleUnitType,
+            unit_qty: p.unit_qty,
+            unit_capacity_l: p.unit_capacity_l,
+            liters_sold: p.liters_sold,
+            currency: p.currency,
+            price_per_l: p.price_per_l,
+            subtotal_native: p.subtotal_native,
+            discount_native: p.discount_native,
+            tax_native: p.tax_native,
+            total_native: p.total_native,
+            fx_rate_to_usd: p.fx_rate_to_usd,
+            total_usd: p.total_usd,
+            payment_status: p.payment_status,
+            payment_method: p.payment_method,
+            paid_native: p.paid_native,
+            note: p.note,
+            created_at: p.created_at,
+            updated_at: p.updated_at,
+          };
+
+          setActiveSale(mapped);
         } else {
+          // Offline but already-synced sale – use local db
           const localSale = getSaleLocal(user.id, saleId);
-          if (!localSale) throw new Error('Sale not found in local cache.');
+          if (!localSale)
+            throw new Error('Sale not found in local cache.');
           setActiveSale(localSale);
         }
       } catch (e: any) {
-        // fallback to local if API fails
-        try {
-          const localSale = getSaleLocal(user.id, saleId);
-          if (!localSale) throw e;
-          setActiveSale(localSale);
-        } catch (err: any) {
+        // Fallback to local for non-pending ids
+        if (saleId >= 0 && user?.id) {
+          try {
+            const localSale = getSaleLocal(user.id, saleId);
+            if (!localSale) throw e;
+            setActiveSale(localSale);
+          } catch (err: any) {
+            Alert.alert(
+              'Failed to load receipt',
+              err?.response?.data?.detail ||
+                err?.message ||
+                'Please try again.'
+            );
+            setReceiptOpen(false);
+          }
+        } else {
           Alert.alert(
             'Failed to load receipt',
-            err?.response?.data?.detail || err?.message || 'Please try again.'
+            e?.response?.data?.detail ||
+              e?.message ||
+              'Please try again.'
           );
           setReceiptOpen(false);
         }
@@ -407,7 +674,10 @@ const fetchReport = useCallback(
   const renderItem = useCallback(
     ({ item }: { item: OilSaleRead }) => {
       const isUSD = (item.currency || '').toUpperCase() === 'USD';
-      const showUsdChild = !isUSD && typeof item.total_usd === 'number' && isFinite(item.total_usd);
+      const showUsdChild =
+        !isUSD &&
+        typeof item.total_usd === 'number' &&
+        isFinite(item.total_usd);
 
       return (
         <TouchableOpacity
@@ -420,21 +690,30 @@ const fetchReport = useCallback(
             <Text style={styles.cellText} numberOfLines={3}>
               {item.oil_type?.toUpperCase() || '—'}
             </Text>
-            <Text style={styles.itemDate}>{fmtDate(item.created_at)}</Text>
+            <Text style={styles.itemDate}>
+              {fmtDate(item.created_at)}
+            </Text>
           </View>
 
           {/* Qty */}
           <View style={styles.colQtyWrap}>
-            <Text style={styles.qtyNumber}>{getQtyLabel(item)}</Text>
+            <Text style={styles.qtyNumber}>
+              {getQtyLabel(item)}
+            </Text>
           </View>
 
           {/* Total column */}
           <View style={{ flex: 2, alignItems: 'flex-end' }}>
             <Text style={styles.cellText}>
-              {fmtCurrencyAmount(item.currency, item.total_native)}
+              {fmtCurrencyAmount(
+                item.currency,
+                item.total_native
+              )}
             </Text>
             {showUsdChild ? (
-              <Text style={styles.itemDate}>{fmtUSDMoney(item.total_usd)}</Text>
+              <Text style={styles.itemDate}>
+                {fmtUSDMoney(item.total_usd)}
+              </Text>
             ) : null}
           </View>
         </TouchableOpacity>
@@ -469,7 +748,10 @@ const fetchReport = useCallback(
         return await Linking.openURL(webLink);
       } catch {}
     }
-    Alert.alert('WhatsApp unavailable', 'Could not open WhatsApp on this device.');
+    Alert.alert(
+      'WhatsApp unavailable',
+      'Could not open WhatsApp on this device.'
+    );
   };
 
   /**
@@ -490,7 +772,10 @@ const fetchReport = useCallback(
 
     let pixelRatio = Math.max(1.5, Math.min(3, basePR));
     if (measuredHeight > 0) {
-      pixelRatio = Math.min(pixelRatio, Math.max(1.2, safeMaxOutPx / measuredHeight));
+      pixelRatio = Math.min(
+        pixelRatio,
+        Math.max(1.2, safeMaxOutPx / measuredHeight)
+      );
     }
 
     const uri = await captureRef(target, {
@@ -510,7 +795,10 @@ const fetchReport = useCallback(
     try {
       const { uri, canShare } = await buildCapture();
       if (!canShare) {
-        Alert.alert('Sharing unavailable', 'System sharing is not available on this device.');
+        Alert.alert(
+          'Sharing unavailable',
+          'System sharing is not available on this device.'
+        );
         return;
       }
       await Sharing.shareAsync(uri, {
@@ -519,7 +807,10 @@ const fetchReport = useCallback(
         UTI: 'public.png',
       });
     } catch (e: any) {
-      Alert.alert('Share failed', e?.message || 'Unable to generate image.');
+      Alert.alert(
+        'Share failed',
+        e?.message || 'Unable to generate image.'
+      );
     }
   };
 
@@ -530,7 +821,8 @@ const fetchReport = useCallback(
         const canOpen = await Linking.canOpenURL('whatsapp://send');
         if (canOpen) {
           await Linking.openURL(
-            'whatsapp://send?text=' + encodeURIComponent('See attached invoice.')
+            'whatsapp://send?text=' +
+              encodeURIComponent('See attached invoice.')
           );
         } else {
           Alert.alert(
@@ -546,19 +838,30 @@ const fetchReport = useCallback(
         dialogTitle: 'Send to WhatsApp',
       });
     } catch (e: any) {
-      Alert.alert('WhatsApp share failed', e?.message || 'Unable to prepare image for WhatsApp.');
+      Alert.alert(
+        'WhatsApp share failed',
+        e?.message ||
+          'Unable to prepare image for WhatsApp.'
+      );
     }
   };
 
   // Seller header text
   const sellerTitle =
-    meProfile?.company_name?.trim() ? meProfile.company_name.trim() : meProfile?.username ?? '';
+    meProfile?.company_name?.trim()
+      ? meProfile.company_name.trim()
+      : meProfile?.username ?? '';
   const sellerContact =
-    meProfile?.phone_number?.trim() ? meProfile.phone_number!.trim() : meProfile?.email?.trim() ?? '';
+    meProfile?.phone_number?.trim()
+      ? meProfile.phone_number!.trim()
+      : meProfile?.email?.trim() ?? '';
 
   /* --------------------------------- UI --------------------------------- */
   return (
-    <SafeAreaView style={styles.screen} edges={['top', 'bottom', 'left', 'right']}>
+    <SafeAreaView
+      style={styles.screen}
+      edges={['top', 'bottom', 'left', 'right']}
+    >
       {/* HEADER */}
       <LinearGradient
         colors={[BRAND_BLUE, BRAND_BLUE_2]}
@@ -567,7 +870,11 @@ const fetchReport = useCallback(
         style={styles.header}
       >
         <View style={styles.headerInner}>
-          <TouchableOpacity onPress={handleBack} style={styles.backBtn} hitSlop={8}>
+          <TouchableOpacity
+            onPress={handleBack}
+            style={styles.backBtn}
+            hitSlop={8}
+          >
             <Feather name="arrow-left" size={20} color="#fff" />
           </TouchableOpacity>
 
@@ -593,7 +900,11 @@ const fetchReport = useCallback(
           activeOpacity={0.9}
           onPress={() => setIsPayOpen(true)}
         >
-          <Feather name="dollar-sign" size={16} color={BRAND_BLUE} />
+          <Feather
+            name="dollar-sign"
+            size={16}
+            color={BRAND_BLUE}
+          />
           <Text style={styles.pillPrimaryTxt}>Bixi deyn</Text>
         </TouchableOpacity>
 
@@ -605,8 +916,14 @@ const fetchReport = useCallback(
               pathname: '/Shidaal/oilsaleforminvoice',
               params: {
                 customer_name:
-                  report?.customer_name || customer?.name || decodedName || '',
-                customer_contact: customer?.phone || report?.customer_contact || '',
+                  report?.customer_name ||
+                  customer?.name ||
+                  decodedName ||
+                  '',
+                customer_contact:
+                  customer?.phone ||
+                  report?.customer_contact ||
+                  '',
               },
             })
           }
@@ -636,7 +953,9 @@ const fetchReport = useCallback(
       {loading && !report ? (
         <View style={styles.center}>
           <ActivityIndicator size="large" color={ACCENT} />
-          {error ? <Text style={styles.errorText}>{error}</Text> : null}
+          {error ? (
+            <Text style={styles.errorText}>{error}</Text>
+          ) : null}
         </View>
       ) : report ? (
         <>
@@ -658,15 +977,23 @@ const fetchReport = useCallback(
               style={styles.paperWrap}
               ref={sheetRef}
               collapsable={false}
-              onLayout={(e) => setPaperHeight(e.nativeEvent.layout.height)}
+              onLayout={(e) =>
+                setPaperHeight(e.nativeEvent.layout.height)
+              }
             >
               {/* Seller (centered) */}
               <View style={styles.receiptHeaderCenter}>
-                <Text style={styles.receiptTitle} numberOfLines={2}>
+                <Text
+                  style={styles.receiptTitle}
+                  numberOfLines={2}
+                >
                   {sellerTitle || 'Receipt'}
                 </Text>
                 {!!sellerContact && (
-                  <Text style={styles.receiptContact} numberOfLines={1}>
+                  <Text
+                    style={styles.receiptContact}
+                    numberOfLines={1}
+                  >
                     {sellerContact}
                   </Text>
                 )}
@@ -677,12 +1004,22 @@ const fetchReport = useCallback(
 
               {/* Customer header */}
               <View style={styles.customerNameLine}>
-                <Text style={styles.customerNameTxt} numberOfLines={2}>
-                  {report.customer_name || customer?.name || decodedName || '—'}
+                <Text
+                  style={styles.customerNameTxt}
+                  numberOfLines={2}
+                >
+                  {report.customer_name ||
+                    customer?.name ||
+                    decodedName ||
+                    '—'}
                 </Text>
                 {!!(customer?.phone || report.customer_contact) && (
-                  <Text style={styles.customerPhoneTxt} numberOfLines={1}>
-                    {customer?.phone || report.customer_contact}
+                  <Text
+                    style={styles.customerPhoneTxt}
+                    numberOfLines={1}
+                  >
+                    {customer?.phone ||
+                      report.customer_contact}
                   </Text>
                 )}
               </View>
@@ -691,14 +1028,28 @@ const fetchReport = useCallback(
               <View style={styles.kpisInline}>
                 <View style={styles.kpiCardInline}>
                   <Text style={styles.kpiLabel}>Bixisay</Text>
-                  <Text style={[styles.kpiValueInline, { color: SUCCESS }]}>
-                    {fmtUSDMoney(customer?.amount_paid ?? 0)}
+                  <Text
+                    style={[
+                      styles.kpiValueInline,
+                      { color: SUCCESS },
+                    ]}
+                  >
+                    {fmtUSDMoney(
+                      customer?.amount_paid ?? 0
+                    )}
                   </Text>
                 </View>
                 <View style={styles.kpiCardInline}>
                   <Text style={styles.kpiLabel}>kugu dhiman</Text>
-                  <Text style={[styles.kpiValueInline, { color: DANGER }]}>
-                    {fmtUSDMoney(customer?.amount_due ?? 0)}
+                  <Text
+                    style={[
+                      styles.kpiValueInline,
+                      { color: DANGER },
+                    ]}
+                  >
+                    {fmtUSDMoney(
+                      customer?.amount_due ?? 0
+                    )}
                   </Text>
                 </View>
               </View>
@@ -708,16 +1059,24 @@ const fetchReport = useCallback(
                 {renderTableHeader()}
                 <FlatList
                   data={filteredItems}
-                  keyExtractor={(it) => `${it.id}-${it.updated_at}`}
+                  keyExtractor={(it) =>
+                    `${it.id}-${it.updated_at}`
+                  }
                   renderItem={renderItem}
-                  ItemSeparatorComponent={() => <View style={styles.rowSep} />}
+                  ItemSeparatorComponent={() => (
+                    <View style={styles.rowSep} />
+                  )}
                   ListEmptyComponent={
                     <Text style={styles.emptyText}>
-                      {search ? 'No matches.' : 'No oil sales for this customer.'}
+                      {search
+                        ? 'No matches.'
+                        : 'No oil sales for this customer.'}
                     </Text>
                   }
                   scrollEnabled={false}
-                  contentContainerStyle={{ paddingVertical: 2 }}
+                  contentContainerStyle={{
+                    paddingVertical: 2,
+                  }}
                 />
               </View>
             </View>
@@ -725,7 +1084,11 @@ const fetchReport = useCallback(
         </>
       ) : (
         <View style={styles.center}>
-          {error ? <Text style={styles.errorText}>{error}</Text> : <Text>No data.</Text>}
+          {error ? (
+            <Text style={styles.errorText}>{error}</Text>
+          ) : (
+            <Text>No data.</Text>
+          )}
         </View>
       )}
 
@@ -734,13 +1097,27 @@ const fetchReport = useCallback(
         visible={isPayOpen}
         onClose={() => setIsPayOpen(false)}
         token={token}
-        customerId={customer?.id ?? report?.customer_id ?? undefined}
+        customerId={
+          customer?.id ?? report?.customer_id ?? undefined
+        }
         onCreated={refetch}
         customerName={report?.customer_name || customer?.name}
-        customerPhone={customer?.phone || report?.customer_contact || undefined}
-        companyName={meProfile?.company_name || meProfile?.username}
-        companyContact={meProfile?.phone_number || meProfile?.email || undefined}
+        customerPhone={
+          customer?.phone ||
+          report?.customer_contact ||
+          undefined
+        }
+        companyName={
+          meProfile?.company_name || meProfile?.username
+        }
+        companyContact={
+          meProfile?.phone_number ||
+          meProfile?.email ||
+          undefined
+        }
         currentDue={customer?.amount_due ?? 0}
+        ownerId={user?.id ?? null} // ✅ required for offline queue
+        online={online}            // ✅ tells sheet whether to call API or queue
       />
 
       {/* Share popup */}
@@ -751,7 +1128,9 @@ const fetchReport = useCallback(
         onShareWhatsApp={onShareWhatsApp}
         onOpenWhatsAppChat={() =>
           openWhatsAppTo(
-            customer?.phone || report?.customer_contact || '',
+            customer?.phone ||
+              report?.customer_contact ||
+              '',
             `Salaan ${
               report?.customer_name || customer?.name || ''
             }, fadlan eeg rasiidka (sawirka/PNG) ee aan kuu diray.`
@@ -767,8 +1146,17 @@ const fetchReport = useCallback(
         onClose={() => setReceiptOpen(false)}
         sellerTitle={sellerTitle}
         sellerContact={sellerContact}
-        customerName={report?.customer_name || customer?.name || decodedName || ''}
-        customerPhone={customer?.phone || report?.customer_contact || ''}
+        customerName={
+          report?.customer_name ||
+          customer?.name ||
+          decodedName ||
+          ''
+        }
+        customerPhone={
+          customer?.phone ||
+          report?.customer_contact ||
+          ''
+        }
       />
 
       {/* Oil sale create modal (if you later add) */}
@@ -830,31 +1218,62 @@ function ReceiptModal({
   const balanceNative = (totalNative ?? 0) - (paidNative ?? 0);
 
   // USD view (only if sale is non-USD and has total_usd)
-  const usdView = !isUSD && typeof sale?.total_usd === 'number' ? sale?.total_usd : null;
+  const usdView =
+    !isUSD && typeof sale?.total_usd === 'number'
+      ? sale?.total_usd
+      : null;
 
   return (
-    <Modal visible={visible} transparent animationType="fade" statusBarTranslucent onRequestClose={onClose}>
+    <Modal
+      visible={visible}
+      transparent
+      animationType="fade"
+      statusBarTranslucent
+      onRequestClose={onClose}
+    >
       <Pressable style={styles.backdrop} onPress={onClose} />
       <View style={styles.centerWrap}>
         <View style={[styles.centerCard, { maxWidth: 600 }]}>
           <Text style={styles.popupTitle}>Receipt</Text>
 
           {loading ? (
-            <View style={{ paddingVertical: 20, alignItems: 'center' }}>
+            <View
+              style={{
+                paddingVertical: 20,
+                alignItems: 'center',
+              }}
+            >
               <ActivityIndicator size="large" color={ACCENT} />
             </View>
           ) : sale ? (
             <View>
               {/* Seller */}
               <View style={styles.receiptHeaderCenter}>
-                <Text style={styles.receiptTitle}>{sellerTitle || 'Seller'}</Text>
-                {!!sellerContact && <Text style={styles.receiptContact}>{sellerContact}</Text>}
+                <Text style={styles.receiptTitle}>
+                  {sellerTitle || 'Seller'}
+                </Text>
+                {!!sellerContact && (
+                  <Text style={styles.receiptContact}>
+                    {sellerContact}
+                  </Text>
+                )}
               </View>
 
               {/* Customer line */}
-              <View style={[styles.customerNameLine, { marginTop: 8 }]}>
-                <Text style={styles.customerNameTxt}>{customerName || '—'}</Text>
-                {!!customerPhone && <Text style={styles.customerPhoneTxt}>{customerPhone}</Text>}
+              <View
+                style={[
+                  styles.customerNameLine,
+                  { marginTop: 8 },
+                ]}
+              >
+                <Text style={styles.customerNameTxt}>
+                  {customerName || '—'}
+                </Text>
+                {!!customerPhone && (
+                  <Text style={styles.customerPhoneTxt}>
+                    {customerPhone}
+                  </Text>
+                )}
               </View>
 
               <View
@@ -868,12 +1287,24 @@ function ReceiptModal({
               {/* Body */}
               <View style={{ gap: 6 }}>
                 <KV label="Sale ID" value={`#${sale.id}`} />
-                <KV label="Date" value={new Date(sale.created_at).toLocaleString()} />
-                <KV label="Oil type" value={sale.oil_type?.toUpperCase()} />
+                <KV
+                  label="Date"
+                  value={new Date(
+                    sale.created_at
+                  ).toLocaleString()}
+                />
+                <KV
+                  label="Oil type"
+                  value={sale.oil_type?.toUpperCase()}
+                />
                 <KV label="Quantity" value={qtyLabel} />
                 <KV
                   label="Currency"
-                  value={isUSD ? '$ (USD)' : (sale.currency || '').toUpperCase()}
+                  value={
+                    isUSD
+                      ? '$ (USD)'
+                      : (sale.currency || '').toUpperCase()
+                  }
                 />
                 {typeof sale.price_per_l === 'number' ? (
                   <KV
@@ -882,50 +1313,112 @@ function ReceiptModal({
                         ? 'Price per L'
                         : 'Price per L (derived)'
                     }
-                    value={fmtCur(sale.currency, sale.price_per_l)}
+                    value={fmtCur(
+                      sale.currency,
+                      sale.price_per_l
+                    )}
                   />
                 ) : null}
               </View>
 
               {/* Summary */}
               <View style={styles.summaryCard}>
-                <Row label="Subtotal" value={fmtCur(sale.currency, subtotal)} bold={false} />
+                <Row
+                  label="Subtotal"
+                  value={fmtCur(sale.currency, subtotal)}
+                  bold={false}
+                />
                 {discount ? (
                   <Row
                     label="Discount"
-                    value={`- ${fmtCur(sale.currency, discount)}`}
+                    value={`- ${fmtCur(
+                      sale.currency,
+                      discount
+                    )}`}
                     bold={false}
                   />
                 ) : null}
                 {tax ? (
-                  <Row label="Tax" value={fmtCur(sale.currency, tax)} bold={false} />
+                  <Row
+                    label="Tax"
+                    value={fmtCur(sale.currency, tax)}
+                    bold={false}
+                  />
                 ) : null}
-                <Row label="Total" value={fmtCur(sale.currency, totalNative)} bold />
-                {!isUSD && typeof usdView === 'number' ? (
-                  <Row label="USD View" value={fmtUSD(usdView)} />
+                <Row
+                  label="Total"
+                  value={fmtCur(sale.currency, totalNative)}
+                  bold
+                />
+                {!isUSD &&
+                typeof usdView === 'number' ? (
+                  <Row
+                    label="USD View"
+                    value={fmtUSD(usdView)}
+                  />
                 ) : null}
-                {typeof paidNative === 'number' && paidNative > 0 ? (
-                  <Row label="Paid" value={`- ${fmtCur(sale.currency, paidNative)}`} />
+                {typeof paidNative === 'number' &&
+                paidNative > 0 ? (
+                  <Row
+                    label="Paid"
+                    value={`- ${fmtCur(
+                      sale.currency,
+                      paidNative
+                    )}`}
+                  />
                 ) : null}
                 <View style={{ height: 6 }} />
-                <Row label="Balance" value={fmtCur(sale.currency, balanceNative)} bold />
+                <Row
+                  label="Balance"
+                  value={fmtCur(
+                    sale.currency,
+                    balanceNative
+                  )}
+                  bold
+                />
               </View>
 
               {!!sale.note && (
                 <View style={{ marginTop: 8 }}>
-                  <Text style={{ color: MUTED, fontSize: 11 }}>Note</Text>
-                  <Text style={{ color: TEXT, fontSize: 12 }}>{sale.note}</Text>
+                  <Text
+                    style={{ color: MUTED, fontSize: 11 }}
+                  >
+                    Note
+                  </Text>
+                  <Text
+                    style={{
+                      color: TEXT,
+                      fontSize: 12,
+                    }}
+                  >
+                    {sale.note}
+                  </Text>
                 </View>
               )}
 
-              <View style={{ marginTop: 12, alignItems: 'center' }}>
-                <TouchableOpacity style={styles.closeBtn} onPress={onClose}>
+              <View
+                style={{
+                  marginTop: 12,
+                  alignItems: 'center',
+                }}
+              >
+                <TouchableOpacity
+                  style={styles.closeBtn}
+                  onPress={onClose}
+                >
                   <Text style={styles.closeBtnTxt}>Close</Text>
                 </TouchableOpacity>
               </View>
             </View>
           ) : (
-            <Text style={{ textAlign: 'center,', color: MUTED }}>No sale loaded.</Text>
+            <Text
+              style={{
+                textAlign: 'center,',
+                color: MUTED,
+              }}
+            >
+              No sale loaded.
+            </Text>
           )}
         </View>
       </View>
@@ -935,20 +1428,61 @@ function ReceiptModal({
 
 function KV({ label, value }: { label: string; value: string }) {
   return (
-    <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-      <Text style={{ color: MUTED, fontSize: 12 }}>{label}</Text>
-      <Text style={{ color: TEXT, fontSize: 12, fontWeight: '700' }}>{value}</Text>
+    <View
+      style={{
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+      }}
+    >
+      <Text style={{ color: MUTED, fontSize: 12 }}>
+        {label}
+      </Text>
+      <Text
+        style={{
+          color: TEXT,
+          fontSize: 12,
+          fontWeight: '700',
+        }}
+      >
+        {value}
+      </Text>
     </View>
   );
 }
 
-function Row({ label, value, bold }: { label: string; value: string; bold?: boolean }) {
+function Row({
+  label,
+  value,
+  bold,
+}: {
+  label: string;
+  value: string;
+  bold?: boolean;
+}) {
   return (
-    <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 }}>
-      <Text style={{ color: TEXT, fontSize: 13, fontWeight: bold ? '800' : '600' }}>
+    <View
+      style={{
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        marginTop: 4,
+      }}
+    >
+      <Text
+        style={{
+          color: TEXT,
+          fontSize: 13,
+          fontWeight: bold ? '800' : '600',
+        }}
+      >
         {label}
       </Text>
-      <Text style={{ color: TEXT, fontSize: 13, fontWeight: bold ? '900' : '700' }}>
+      <Text
+        style={{
+          color: TEXT,
+          fontSize: 13,
+          fontWeight: bold ? '900' : '700',
+        }}
+      >
         {value}
       </Text>
     </View>
@@ -980,7 +1514,9 @@ function SharePopup({
         }}
       >
         <Feather name="image" size={16} color={TEXT} />
-        <Text style={styles.popupBtnTxt}>Share Image (PNG)</Text>
+        <Text style={styles.popupBtnTxt}>
+          Share Image (PNG)
+        </Text>
       </TouchableOpacity>
       <TouchableOpacity
         style={styles.popupBtn}
@@ -989,7 +1525,11 @@ function SharePopup({
           onClose();
         }}
       >
-        <FontAwesome name="whatsapp" size={16} color="#25D366" />
+        <FontAwesome
+          name="whatsapp"
+          size={16}
+          color="#25D366"
+        />
         <Text style={styles.popupBtnTxt}>WhatsApp</Text>
       </TouchableOpacity>
       <TouchableOpacity
@@ -999,11 +1539,27 @@ function SharePopup({
           onClose();
         }}
       >
-        <FontAwesome name="whatsapp" size={16} color="#25D366" />
-        <Text style={styles.popupBtnTxt}>Open WhatsApp Chat</Text>
+        <FontAwesome
+          name="whatsapp"
+          size={16}
+          color="#25D366"
+        />
+        <Text style={styles.popupBtnTxt}>
+          Open WhatsApp Chat
+        </Text>
       </TouchableOpacity>
-      <TouchableOpacity style={[styles.popupBtn, styles.popupBtnGhost]} onPress={onClose}>
-        <Text style={[styles.popupBtnTxt, { color: MUTED }]}>Close</Text>
+      <TouchableOpacity
+        style={[styles.popupBtn, styles.popupBtnGhost]}
+        onPress={onClose}
+      >
+        <Text
+          style={[
+            styles.popupBtnTxt,
+            { color: MUTED },
+          ]}
+        >
+          Close
+        </Text>
       </TouchableOpacity>
     </CenterModal>
   );
@@ -1080,7 +1636,11 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.25)',
   },
-  headerShareTxt: { color: BRAND_BLUE, fontWeight: '800', fontSize: 12 },
+  headerShareTxt: {
+    color: BRAND_BLUE,
+    fontWeight: '800',
+    fontSize: 12,
+  },
 
   headerBar: {
     flexDirection: 'row',
@@ -1100,10 +1660,22 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     borderWidth: 1.5,
   },
-  pillPrimary: { backgroundColor: '#fff', borderColor: BRAND_BLUE },
-  pillPrimaryTxt: { color: BRAND_BLUE, fontWeight: '800' },
-  pillAlt: { backgroundColor: '#EEF2FF', borderColor: BRAND_BLUE },
-  pillAltTxt: { color: BRAND_BLUE, fontWeight: '800' },
+  pillPrimary: {
+    backgroundColor: '#fff',
+    borderColor: BRAND_BLUE,
+  },
+  pillPrimaryTxt: {
+    color: BRAND_BLUE,
+    fontWeight: '800',
+  },
+  pillAlt: {
+    backgroundColor: '#EEF2FF',
+    borderColor: BRAND_BLUE,
+  },
+  pillAltTxt: {
+    color: BRAND_BLUE,
+    fontWeight: '800',
+  },
 
   searchRow: {
     marginTop: 6,
@@ -1132,9 +1704,18 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
   },
 
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 10 },
+  center: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
   errorText: { color: DANGER, marginTop: 8 },
-  emptyText: { textAlign: 'center', color: MUTED, marginTop: 12 },
+  emptyText: {
+    textAlign: 'center',
+    color: MUTED,
+    marginTop: 12,
+  },
 
   paperWrap: {
     marginTop: 12,
@@ -1212,8 +1793,16 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     minWidth: 110,
   },
-  kpiLabel: { color: MUTED, fontSize: 11, marginBottom: 2 },
-  kpiValueInline: { fontSize: 14, fontWeight: '900', color: TEXT },
+  kpiLabel: {
+    color: MUTED,
+    fontSize: 11,
+    marginBottom: 2,
+  },
+  kpiValueInline: {
+    fontSize: 14,
+    fontWeight: '900',
+    color: TEXT,
+  },
 
   tableCard: {
     marginTop: 6,
@@ -1235,7 +1824,11 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 10,
     paddingHorizontal: 4,
   },
-  headerText: { fontSize: 12, fontWeight: '700', color: '#4B5563' },
+  headerText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#4B5563',
+  },
 
   tableRow: {
     flexDirection: 'row',
@@ -1248,18 +1841,38 @@ const styles = StyleSheet.create({
 
   colItemWrap: { flex: 2, paddingRight: 2 },
   colItem: { flex: 2, paddingRight: 2 },
-  colQty: { flex: 2, textAlign: 'center' as const },
-  colTotal: { flex: 2, textAlign: 'right' as const, paddingRight: 6 },
+  colQty: {
+    flex: 2,
+    textAlign: 'center' as const,
+  },
+  colTotal: {
+    flex: 2,
+    textAlign: 'right' as const,
+    paddingRight: 6,
+  },
 
   colQtyWrap: {
     flex: 2,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  qtyNumber: { fontSize: 13, fontWeight: '800', color: TEXT, lineHeight: 16 },
+  qtyNumber: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: TEXT,
+    lineHeight: 16,
+  },
 
-  cellText: { fontSize: 12, color: TEXT, lineHeight: 16 },
-  itemDate: { marginTop: 2, fontSize: 11, color: MUTED },
+  cellText: {
+    fontSize: 12,
+    color: TEXT,
+    lineHeight: 16,
+  },
+  itemDate: {
+    marginTop: 2,
+    fontSize: 11,
+    color: MUTED,
+  },
 
   /* ----- Center/Modal styles ----- */
   backdrop: {

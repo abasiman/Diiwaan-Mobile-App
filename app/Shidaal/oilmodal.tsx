@@ -2,8 +2,10 @@
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 import { Feather } from '@expo/vector-icons';
+import NetInfo from '@react-native-community/netinfo';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+
 import {
   ActivityIndicator,
   Animated,
@@ -19,8 +21,25 @@ import {
   TouchableWithoutFeedback,
   View,
 } from 'react-native';
+import {
+  getVendorBillsForOwner,
+  saveVendorBillsForOwner,
+  SupplierDueItem,
+} from '../OilPurchaseOffline/oilpurchasevendorbillsrepo';
 import VendorPaymentMultiSheet from './VendorPaymentMultiSheet';
+
+
+import {
+  addLocalVendorPayment,
+  VendorPaymentWithContext,
+} from '../vendorPaymentTransactionsOffline/vendorPaymentsScreenRepo';
+
+
+import { queueOilModalForSync } from '../OilModalOffline/oilModalRepo';
 import VendorPaymentCreateSheet from './vendorpayment';
+
+
+
 
 /* ──────────────────────────────────────────────────────────
    Layout & Colors
@@ -314,10 +333,27 @@ type RowAlloc = {
    Page (Two-step Tabs)
 ────────────────────────────────────────────────────────── */
 export default function OilCreatePage() {
-  const { token } = useAuth();
+  const { token, user } = useAuth();    
   const router = useRouter();
 
   const [submitting, setSubmitting] = useState(false);
+  const [online, setOnline] = useState(true); // <— NEW
+
+
+
+    // 👇 ADD THIS
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state) => {
+      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      console.log('[OilCreatePage] NetInfo changed', {
+        isConnected: state.isConnected,
+        isInternetReachable: state.isInternetReachable,
+        online: ok,
+      });
+      setOnline(ok);
+    });
+    return () => sub();
+  }, []);
 
   // Step tabs: 0 = Truck & Oil Info, 1 = Extras & Costs
   const [step, setStep] = useState<0 | 1>(0);
@@ -471,185 +507,417 @@ export default function OilCreatePage() {
     }
   };
 
+
   const handleSubmit = async () => {
-    try {
-      setSubmitting(true);
+  try {
+    setSubmitting(true);
 
-      const commonHeader = {
-        truck_plate: truckPlate || undefined,
-        truck_type: truckType || undefined,
-        supplier_name: supplierName || undefined,
-        from_location: fromLocation || undefined,
-        to_location: toLocation || undefined,
-        currency: currencyCode,
-        status: 'available' as const,
-      };
+    const commonHeader = {
+      truck_plate: truckPlate || undefined,
+      truck_type: truckType || undefined,
+      supplier_name: supplierName || undefined,
+      from_location: fromLocation || undefined,
+      to_location: toLocation || undefined,
+      currency: currencyCode,
+      status: 'available' as const,
+    };
 
-      if (isBoth) {
-        const header: any = {
+    const isBoth = oilType === 'both';
+
+    // Build the exact payload(s) we use online
+    const bothPayload: any = isBoth
+      ? {
           ...commonHeader,
           depot: false,
           depot_name: undefined,
           location_notes: undefined,
           pay_ment_status: undefined,
           lines: [
-          {
-            oil_type: 'diesel',
-            qty: undefined,
-            liters: Number(dLit),
-            landed_cost_per_l: dCost || undefined,
-            oil_well: oilWell || undefined,
-            oil_well_cost: 0,
-          },
-          {
-            oil_type: 'petrol',
-            qty: undefined,
-            liters: Number(pLit),
-            landed_cost_per_l: pCost || undefined,
-            oil_well: oilWell || undefined,
-            oil_well_cost: 0,
-          },
-        ],
+            {
+              oil_type: 'diesel',
+              qty: undefined,
+              liters: Number(dLit),
+              landed_cost_per_l: dCost || undefined,
+              oil_well: oilWell || undefined,
+              oil_well_cost: 0,
+            },
+            {
+              oil_type: 'petrol',
+              qty: undefined,
+              liters: Number(pLit),
+              landed_cost_per_l: pCost || undefined,
+              oil_well: oilWell || undefined,
+              oil_well_cost: 0,
+            },
+          ],
+        }
+      : null;
 
-        };
+    const singlePayload: any = !isBoth
+      ? {
+          oil_type: oilType,
+          qty: undefined,
+          liters: Number(liters),
+          ...commonHeader,
+          landed_cost_per_l: landedCostPerL ? Number(landedCostPerL) : undefined,
+          oil_well: oilWell || undefined,
+        }
+      : null;
 
-        const res = await api.post('/diiwaanoil', header, { headers: { Authorization: `Bearer ${token}` } });
+    const mode: 'single' | 'both' = isBoth ? 'both' : 'single';
+    const payload: any = isBoth ? bothPayload : singlePayload;
 
+    const truckRentVal = Number(truckRent || 0);
+    const depotCostVal = Number(depotCost || 0);
+    const taxVal = Number(tax || 0);
+
+    // 🔴 OFFLINE: queue for sync + add a local vendor bill + SHOW CHOICE POPUP
+    if (!online || !token) {
+      if (!user?.id) {
         setSubmitting(false);
         setSummaryOpen(false);
-
-        const data = res?.data;
-        const items: any[] = Array.isArray(data) ? data : (Array.isArray(data?.items) ? data.items : []);
-        const rows = (items || [])
-          .map((o) => ({
-            oilId: Number(o?.id),
-            oilType: String(o?.oil_type || '').toLowerCase() === 'diesel' ? 'diesel' : 'petrol',
-            truckPlate: o?.truck_plate ?? truckPlate,
-            currentPayable: Number(o?.total_landed_cost || 0),
-          }))
-          .filter((r) => r.oilId && (r.oilType === 'diesel' || r.oilType === 'petrol'))
-          .slice(0, 2);
-
-        if (rows.length > 0) {
-          await createExtra(rows[0].oilId, 'truck_rent', Number(truckRent || 0));
-          await createExtra(rows[0].oilId, 'depot_cost', Number(depotCost || 0));
-          const fullTax = Number(tax || 0);
-          if (fullTax > 0) await createExtra(rows[0].oilId, 'tax', fullTax);
-        }
-
-        const vendor = (oilWell && oilWell.trim()) || (supplierName && supplierName.trim()) || '—';
-
-        setMultiRows(rows);
-        setMultiVendorName(vendor);
-        setMultiCurrency(currencyCode || 'USD');
-
-        // Build per-row allocations so the multi sheet pays oil + extras accurately
-        if (rows.length >= 1) {
-          const halfTruck = Number(truckRent || 0) / (rows.length || 1);
-          const halfDepot = Number(depotCost || 0) / (rows.length || 1);
-          const halfTax = Number(tax || 0) / (rows.length || 1);
-
-          const allocationsPerRow: RowAlloc[] = rows.map((r) => ({
-            oilId: r.oilId,
-            allocation: {
-              oilCost: Number(r.currentPayable || 0),
-              extras: [
-                { category: 'truck_rent', amount: halfTruck },
-                { category: 'depot_cost', amount: halfDepot },
-                { category: 'tax', amount: halfTax },
-              ],
-              currency: currencyCode,
-              total: Number(r.currentPayable || 0) + halfTruck + halfDepot + halfTax,
-            },
-          }));
-          setMultiAllocations(allocationsPerRow);
-          setChoiceMode('multi');
-          setChoiceOpen(true);
-        } else {
-          router.push('/TrackVendorBills/vendorbills');
-        }
+        console.warn('Missing user – cannot queue oil form for sync');
         return;
       }
 
-      // SINGLE
-      const payload: any = {
-        oil_type: oilType,
-        qty: undefined,
-        liters: Number(liters),
-        ...commonHeader,
-        landed_cost_per_l: landedCostPerL ? Number(landedCostPerL) : undefined,
-        oil_well: oilWell || undefined,
-      };
+      // queue the form for later sync
+     const localFormId = queueOilModalForSync(user.id, {
+      mode,
+      payload,
+      truck_rent: truckRentVal,
+      depot_cost: depotCostVal,
+      tax: taxVal,
+      currency: currencyCode,
+    });
 
-      const res = await api.post('/diiwaanoil', payload, { headers: { Authorization: `Bearer ${token}` } });
+
+      try {
+        const existing = await getVendorBillsForOwner(user.id);
+        const todayIso = new Date().toISOString();
+        const extrasTotal = truckRentVal + depotCostVal + taxVal;
+        const fallbackSupplier =
+          (supplierName && supplierName.trim()) ||
+          (oilWell && oilWell.trim()) ||
+          '—';
+
+        let bill: SupplierDueItem;
+
+        if (isBoth) {
+          const dLitVal = Number(dLit || 0);
+          const pLitVal = Number(pLit || 0);
+          const dCostPerL = Number(dCost || 0);
+          const pCostPerL = Number(pCost || 0);
+
+          const dOilCost = dLitVal * dCostPerL;
+          const pOilCost = pLitVal * pCostPerL;
+          const totalOilCost = dOilCost + pOilCost;
+          const overall = totalOilCost + extrasTotal;
+          const halfExtras = extrasTotal / 2;
+
+          bill = {
+            supplier_name: fallbackSupplier,
+            lot_id: null,
+            oil_id: null,
+            oil_type: null,
+            liters: dLitVal + pLitVal,
+            truck_plate: truckPlate || null,
+            truck_type: truckType || null,
+            oil_total_landed_cost: totalOilCost,
+            total_extra_cost: extrasTotal,
+            over_all_cost: overall,
+            total_paid: 0,
+            amount_due: overall,
+            child_oils: [
+              {
+                oil_id: 0,
+                oil_type: 'diesel',
+                liters: dLitVal,
+                sold_l: 0,
+                in_stock_l: dLitVal,
+                oil_total_landed_cost: dOilCost,
+                total_extra_cost: halfExtras,
+                over_all_cost: dOilCost + halfExtras,
+                total_paid: 0,
+                amount_due: dOilCost + halfExtras,
+                extra_costs: [],
+              },
+              {
+                oil_id: 0,
+                oil_type: 'petrol',
+                liters: pLitVal,
+                sold_l: 0,
+                in_stock_l: pLitVal,
+                oil_total_landed_cost: pOilCost,
+                total_extra_cost: halfExtras,
+                over_all_cost: pOilCost + halfExtras,
+                total_paid: 0,
+                amount_due: pOilCost + halfExtras,
+                extra_costs: [],
+              },
+            ],
+            extra_costs: [],
+            date: todayIso,
+
+
+            local_oil_form_id: localFormId,
+          };
+
+          await saveVendorBillsForOwner(user.id, [...existing, bill]);
+
+          // Build offline multi rows + allocations so popup works
+          const rows: {
+            oilId: number;
+            oilType: 'diesel' | 'petrol';
+            truckPlate?: string | null;
+            currentPayable: number;
+          }[] = [
+            {
+              oilId: 0,
+              oilType: 'diesel',
+              truckPlate: truckPlate || null,
+              currentPayable: dOilCost,
+            },
+            {
+              oilId: 0,
+              oilType: 'petrol',
+              truckPlate: truckPlate || null,
+              currentPayable: pOilCost,
+            },
+          ];
+
+          const vendor = fallbackSupplier;
+
+          setMultiRows(rows);
+          setMultiVendorName(vendor);
+          setMultiCurrency(currencyCode || 'USD');
+
+          if (rows.length >= 1) {
+            const halfTruck = truckRentVal / (rows.length || 1);
+            const halfDepot = depotCostVal / (rows.length || 1);
+            const halfTax = taxVal / (rows.length || 1);
+
+            const allocationsPerRow: RowAlloc[] = rows.map((r) => ({
+              oilId: r.oilId,
+              allocation: {
+                oilCost: Number(r.currentPayable || 0),
+                extras: [
+                  { category: 'truck_rent', amount: halfTruck },
+                  { category: 'depot_cost', amount: halfDepot },
+                  { category: 'tax', amount: halfTax },
+                ],
+                currency: currencyCode,
+                total: Number(r.currentPayable || 0) + halfTruck + halfDepot + halfTax,
+              },
+            }));
+
+            setMultiAllocations(allocationsPerRow);
+            setChoiceMode('multi');
+            setChoiceOpen(true);
+          } else {
+            // fallback: just go to vendor bills
+            router.push('/TrackVendorBills/vendorbills');
+          }
+        } else {
+          const litVal = Number(liters || 0);
+          const costPerL = Number(landedCostPerL || 0);
+          const oilCost = litVal * costPerL;
+          const overall = oilCost + extrasTotal;
+
+          bill = {
+            supplier_name: fallbackSupplier,
+            lot_id: null,
+            oil_id: null,
+            oil_type: oilType === 'both' ? null : (oilType as any),
+            liters: litVal,
+            truck_plate: truckPlate || null,
+            truck_type: truckType || null,
+            oil_total_landed_cost: oilCost,
+            total_extra_cost: extrasTotal,
+            over_all_cost: overall,
+            total_paid: 0,
+            amount_due: overall,
+            child_oils: [],
+            extra_costs: [],
+            local_oil_form_id: localFormId,
+            date: todayIso,
+          };
+
+          await saveVendorBillsForOwner(user.id, [...existing, bill]);
+
+          // Build offline single allocation + open choice popup
+          const allocation: Allocation = {
+            oilCost,
+            extras: [
+              { category: 'truck_rent', amount: truckRentVal },
+              { category: 'depot_cost', amount: depotCostVal },
+              { category: 'tax', amount: taxVal },
+            ],
+            currency: currencyCode,
+            total: overall,
+          };
+
+          const vendor = fallbackSupplier;
+
+          setSingleAllocation(allocation);
+          setCreatedOilId(0); // local placeholder
+          setCreatedLotId(null);
+          setVendorDisplayName(vendor);
+          setCurrentPayable(Math.max(0, overall));
+          setChoiceMode('single');
+          setChoiceOpen(true);
+        }
+      } catch (err) {
+        console.warn('[oilmodal] failed to add local vendor bill for offline create', err);
+      }
+
+      setSubmitting(false);
+      setSummaryOpen(false);
+      return;
+    }
+
+    // 🟢 ONLINE: existing behaviour
+    if (isBoth) {
+      const res = await api.post('/diiwaanoil', bothPayload, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
 
       setSubmitting(false);
       setSummaryOpen(false);
 
-      const oil = res?.data || {};
-      const newId = Number(oil?.id);
+      const data = res?.data;
+      const items: any[] = Array.isArray(data)
+        ? data
+        : Array.isArray(data?.items)
+        ? data.items
+        : [];
+      const rows = (items || [])
+        .map((o) => ({
+          oilId: Number(o?.id),
+          oilType: String(o?.oil_type || '').toLowerCase() === 'diesel' ? 'diesel' : 'petrol',
+          truckPlate: o?.truck_plate ?? truckPlate,
+          currentPayable: Number(o?.total_landed_cost || 0),
+        }))
+        .filter((r) => r.oilId && (r.oilType === 'diesel' || r.oilType === 'petrol'))
+        .slice(0, 2);
 
-      // --- resolve the LOT id so the first payment can allocate by LOT (extras → base) ---
-      let newLotId: number | null =
-        Number.isFinite(oil?.lot_id) ? Number(oil.lot_id) :
-        Number.isFinite(oil?.lot?.id) ? Number(oil.lot.id) : null;
-
-      if (!newLotId && Number.isFinite(newId)) {
-        try {
-          const r = await api.get(`/diiwaanoil/${newId}`, { headers: { Authorization: `Bearer ${token}` } });
-          const d = r?.data || {};
-          newLotId =
-            Number.isFinite(d?.lot_id) ? Number(d.lot_id) :
-            Number.isFinite(d?.lot?.id) ? Number(d.lot.id) : null;
-        } catch {}
-      }
-
-
-      if (Number.isFinite(newId)) {
-        await createExtra(newId, 'truck_rent', Number(truckRent || 0));
-        await createExtra(newId, 'depot_cost', Number(depotCost || 0));
-        await createExtra(newId, 'tax', Number(tax || 0));
+      if (rows.length > 0) {
+        await createExtra(rows[0].oilId, 'truck_rent', truckRentVal);
+        await createExtra(rows[0].oilId, 'depot_cost', depotCostVal);
+        const fullTax = taxVal;
+        if (fullTax > 0) await createExtra(rows[0].oilId, 'tax', fullTax);
       }
 
       const vendor =
-        (oil?.oil_well && String(oil.oil_well).trim()) ||
-        (oil?.supplier_name && String(oil.supplier_name).trim()) ||
-        (supplierName || '').trim() ||
-        null;
+        (oilWell && oilWell.trim()) ||
+        (supplierName && supplierName.trim()) ||
+        '—';
 
-      // include extras so the VendorPaymentCreateSheet sees the same figure as vendorbills
-      const extrasSum =
-        Number(truckRent || 0) + Number(depotCost || 0) + Number(tax || 0);
+      setMultiRows(rows);
+      setMultiVendorName(vendor);
+      setMultiCurrency(currencyCode || 'USD');
 
-      const payableGuess =
-        Number(oil?.total_landed_cost || 0) + extrasSum;
+      if (rows.length >= 1) {
+        const halfTruck = truckRentVal / (rows.length || 1);
+        const halfDepot = depotCostVal / (rows.length || 1);
+        const halfTax = taxVal / (rows.length || 1);
 
-      // Build allocation for single flow
-      const allocation: Allocation = {
-        oilCost: Number(oil?.total_landed_cost || 0),
-        extras: [
-          { category: 'truck_rent', amount: Number(truckRent || 0) },
-          { category: 'depot_cost', amount: Number(depotCost || 0) },
-          { category: 'tax', amount: Number(tax || 0) },
-        ],
-        currency: currencyCode,
-        total: Number(oil?.total_landed_cost || 0) + extrasSum,
-      };
+        const allocationsPerRow: RowAlloc[] = rows.map((r) => ({
+          oilId: r.oilId,
+          allocation: {
+            oilCost: Number(r.currentPayable || 0),
+            extras: [
+              { category: 'truck_rent', amount: halfTruck },
+              { category: 'depot_cost', amount: halfDepot },
+              { category: 'tax', amount: halfTax },
+            ],
+            currency: currencyCode,
+            total: Number(r.currentPayable || 0) + halfTruck + halfDepot + halfTax,
+          },
+        }));
+        setMultiAllocations(allocationsPerRow);
+        setChoiceMode('multi');
+        setChoiceOpen(true);
+      } else {
+        router.push('/TrackVendorBills/vendorbills');
+      }
 
-      setSingleAllocation(allocation);
-      setCreatedOilId(Number.isFinite(newId) ? newId : null);
-      setCreatedLotId(newLotId);  // <— store the LOT id
-      setVendorDisplayName(vendor);
-      setCurrentPayable(Math.max(0, payableGuess));
-
-      setChoiceMode('single');
-      setChoiceOpen(true);
-
-    } catch (e: any) {
-      setSubmitting(false);
-      // TODO: toast/snackbar
+      return;
     }
-  };
+
+    // ONLINE SINGLE
+    const res = await api.post('/diiwaanoil', singlePayload, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    setSubmitting(false);
+    setSummaryOpen(false);
+
+    const oil = res?.data || {};
+    const newId = Number(oil?.id);
+
+    // Resolve LOT id for vendor payment sheet
+    let newLotId: number | null =
+      Number.isFinite(oil?.lot_id) ? Number(oil.lot_id) :
+      Number.isFinite(oil?.lot?.id) ? Number(oil.lot.id) :
+      null;
+
+    if (!newLotId && Number.isFinite(newId)) {
+      try {
+        const r = await api.get(`/diiwaanoil/${newId}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const d = r?.data || {};
+        newLotId =
+          Number.isFinite(d?.lot_id) ? Number(d.lot_id) :
+          Number.isFinite(d?.lot?.id) ? Number(d.lot.id) :
+          null;
+      } catch {
+        // ignore
+      }
+    }
+
+    if (Number.isFinite(newId)) {
+      await createExtra(newId, 'truck_rent', truckRentVal);
+      await createExtra(newId, 'depot_cost', depotCostVal);
+      await createExtra(newId, 'tax', taxVal);
+    }
+
+    const vendor =
+      (oil?.oil_well && String(oil.oil_well).trim()) ||
+      (oil?.supplier_name && String(oil.supplier_name).trim()) ||
+      (supplierName || '').trim() ||
+      null;
+
+    const extrasSum = truckRentVal + depotCostVal + taxVal;
+
+    const payableGuess =
+      Number(oil?.total_landed_cost || 0) + extrasSum;
+
+    const allocation: Allocation = {
+      oilCost: Number(oil?.total_landed_cost || 0),
+      extras: [
+        { category: 'truck_rent', amount: truckRentVal },
+        { category: 'depot_cost', amount: depotCostVal },
+        { category: 'tax', amount: taxVal },
+      ],
+      currency: currencyCode,
+      total: Number(oil?.total_landed_cost || 0) + extrasSum,
+    };
+
+    setSingleAllocation(allocation);
+    setCreatedOilId(Number.isFinite(newId) ? newId : null);
+    setCreatedLotId(newLotId);
+    setVendorDisplayName(vendor);
+    setCurrentPayable(Math.max(0, payableGuess));
+
+    setChoiceMode('single');
+    setChoiceOpen(true);
+  } catch (e: any) {
+    setSubmitting(false);
+    console.warn('Oil create failed', e?.response?.data || e?.message || e);
+  }
+};
+
 
   const onChoosePayNow = () => {
     setChoiceOpen(false);
@@ -657,10 +925,56 @@ export default function OilCreatePage() {
     else setMultiSheetOpen(true);
   };
 
-  const onChooseRecordAP = () => {
-    setChoiceOpen(false);
+  const onChooseRecordAP = async () => {
+  setChoiceOpen(false);
+
+  const ownerId = user?.id ?? 0;
+  if (!ownerId) {
+    // No local owner context – just go back to bills.
     router.push('/TrackVendorBills/vendorbills');
-  };
+    return;
+  }
+
+  // Only need a synthetic row when we're offline / no token.
+  if (!online || !token) {
+    try {
+      const nowIso = new Date().toISOString();
+
+      // currentPayable already holds the total amount due you computed
+      // when creating the oil record (overall cost).
+      const vp: VendorPaymentWithContext = {
+        id: -Date.now(), // temporary local ID
+        amount: 0, // no cash paid yet, it's an AP
+        amount_due: Math.max(0, currentPayable || 0),
+        note: 'Recorded as AP (offline)',
+        payment_method: 'equity',
+        payment_date: nowIso,
+        supplier_name: vendorDisplayName ?? null,
+        lot_id: createdLotId ?? null,
+        oil_id: createdOilId ?? null,
+        extra_cost_id: null,
+        created_at: nowIso,
+        updated_at: nowIso,
+        truck_plate: truckPlate || null,
+        truck_type: truckType || null,
+        transaction_type: 'ap_record_offline', // any distinct label you like
+        currency: currencyCode,
+        fx_rate_to_usd: null,
+        supplier_due_context: null,
+        extra_cost_context: null,
+      };
+
+      await addLocalVendorPayment(ownerId, vp);
+      console.log('[oilmodal] added offline AP placeholder to vendor payments cache');
+    } catch (err) {
+      console.warn('[oilmodal] failed to add offline AP placeholder payment', err);
+    }
+  }
+
+  // Navigate as before
+  router.push('/TrackVendorBills/vendorbills');
+};
+
 
   const onVendorPaymentDone = () => {
     setVendorSheetOpen(false);

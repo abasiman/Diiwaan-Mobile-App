@@ -1,27 +1,18 @@
-// app/(tabs)/customerslist.tsx
-import { Feather } from '@expo/vector-icons';
+// app/Wakaalad/wakaalad_dashboard.tsx
+import { Feather, Ionicons } from '@expo/vector-icons';
+import DateTimePicker from '@react-native-community/datetimepicker';
 import NetInfo from '@react-native-community/netinfo';
-import { useFocusEffect } from '@react-navigation/native';
+import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
+import dayjs from 'dayjs';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react';
-
-import api from '@/services/api';
+import { StatusBar } from 'expo-status-bar';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
-  Animated,
   BackHandler,
   Dimensions,
-  Easing,
-  FlatList,
-  KeyboardAvoidingView,
+  Modal,
   Platform,
   RefreshControl,
   ScrollView,
@@ -29,76 +20,118 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  TouchableWithoutFeedback,
   View,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { useAuth } from '../../src/context/AuthContext';
-import {
-  createOrUpdateCustomerLocal,
-  getCustomersLocal,
-  hardDeleteCustomerLocal,
-  markCustomerDeletedLocal,
-  syncCustomersWithServer,
-  upsertCustomersFromServer,
-  type CustomerRow as Customer,
-} from '../db/customerRepo';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
-const BRAND_BLUE = '#0B2447';
-const BRAND_BLUE_2 = '#0B2447';
-const ACCENT = '#576CBC';
-const BG = '#F7F9FC';
-const TEXT = '#0B1220';
-const MUTED = '#6B7280';
-const DANGER = '#EF4444';
-const SUCCESS = '#10B981';
-const BORDER = '#E5E7EB';
+import CreateWakaaladModal from '../Wakaladmodels/createwakaladmodal';
+import WakaaladActionsModal, { WakaaladActionMode } from '../Wakaladmodels/wakaaladactions';
 
-const { height: SCREEN_H } = Dimensions.get('window');
-const TOP_GAP = 80;
-const SHEET_H = Math.min(SCREEN_H - TOP_GAP, SCREEN_H * 0.9);
-const MINI_SHEET_H = 180;
+import { useAuth } from '@/src/context/AuthContext';
 
-export default function CustomersList() {
-  const { token, user } = useAuth();
+// OFFLINE: repo + sync
+import type { WakaaladRead } from '../WakaaladOffline/wakaaladRepo';
+import { getWakaaladLocal } from '../WakaaladOffline/wakaaladRepo';
+import { syncWakaaladFromServer } from '../WakaaladOffline/wakaaladSync';
+
+const { width } = Dimensions.get('window');
+
+type UnitMode = 'fuusto' | 'caag' | 'liters';
+
+const COLOR_BG = '#FFFFFF';
+const COLOR_TEXT = '#0B1221';
+const COLOR_MUTED = '#64748B';
+const COLOR_CARD = '#F8FAFC';
+const COLOR_ACCENT = '#0B2447'; // dark blue for accents
+const COLOR_SUCCESS = '#16A34A';
+
+const CAPACITY = { fuusto: 240, caag: 20 } as const;
+const fuustoCap = (oilType?: string) =>
+  (String(oilType || '').toLowerCase() === 'petrol' ? 230 : CAPACITY.fuusto);
+
+function formatNumber(n?: number | null, fractionDigits = 0) {
+  if (n === undefined || n === null || isNaN(Number(n))) return '—';
+  return new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: fractionDigits,
+    minimumFractionDigits: 0,
+  }).format(Number(n));
+}
+function formatDateLocal(iso?: string | null) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '—';
+  return new Intl.DateTimeFormat(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  }).format(d);
+}
+function percentSold(it: WakaaladRead) {
+  const total = Number(it.wakaal_stock || 0) + Number(it.wakaal_sold || 0);
+  if (total <= 0) return 0;
+  const pct = (Number(it.wakaal_sold || 0) / total) * 100;
+  return Math.max(0, Math.min(100, pct));
+}
+function percentStock(it: WakaaladRead) {
+  const total = Number(it.wakaal_stock || 0) + Number(it.wakaal_sold || 0);
+  if (total <= 0) return 0;
+  const pct = (Number(it.wakaal_stock || 0) / total) * 100;
+  return Math.max(0, Math.min(100, pct));
+}
+
+/** Green round confirmation tick */
+const ConfirmBadge = ({ size = 16 }: { size?: number }) => (
+  <View
+    style={{
+      width: size,
+      height: size,
+      borderRadius: size / 2,
+      backgroundColor: COLOR_SUCCESS,
+      alignItems: 'center',
+      justifyContent: 'center',
+    }}
+  >
+    <Feather name="check" size={Math.max(10, Math.floor(size * 0.62))} color="#fff" />
+  </View>
+);
+
+export default function WakaaladDashboard() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
+  const tabBarHeight = useBottomTabBarHeight?.() ?? 0;
+  const fabBottom = Math.max(16, tabBarHeight + insets.bottom + 12);
+
+  const { token, user } = useAuth();
+  const ownerId = user?.id;
 
   const [online, setOnline] = useState(true);
 
-  const [customers, setCustomers] = useState<Customer[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
+  const [items, setItems] = useState<WakaaladRead[]>([]);
   const [search, setSearch] = useState('');
-  const [offset, setOffset] = useState(0);
-  const [limit] = useState(20);
-  const [hasMore, setHasMore] = useState(true);
+  const [showFilters, setShowFilters] = useState(false);
+  const [showDatePicker, setShowDatePicker] = useState<'start' | 'end' | null>(null);
+  const [dateRange, setDateRange] = useState({
+    startDate: dayjs().startOf('month').toDate(),
+    endDate: dayjs().endOf('day').toDate(),
+  });
 
-  const offsetRef = useRef(0);
-  const loadingRef = useRef(false);
+  // Create modal
+  const [createOpen, setCreateOpen] = useState(false);
 
-  const [selectedId, setSelectedId] = useState<number | null>(null);
-  const selectedCustomer = useMemo(
-    () => customers.find((c) => c.id === selectedId) || null,
-    [selectedId, customers]
-  );
+  // Unit selector (prominent, below the search)
+  const [unitMode, setUnitMode] = useState<UnitMode>('fuusto'); // default fuusto
 
-  const settingsY = useRef(new Animated.Value(SCREEN_H)).current;
-  const addY = useRef(new Animated.Value(SCREEN_H)).current;
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [isAddOpen, setIsAddOpen] = useState(false);
+  // Actions modal
+  const [actionModalOpen, setActionModalOpen] = useState(false);
+  const [actionMode, setActionMode] = useState<WakaaladActionMode>('edit');
+  const [selectedWk, setSelectedWk] = useState<WakaaladRead | null>(null);
 
-  const [formMode, setFormMode] = useState<'add' | 'edit'>('add');
-  const [formName, setFormName] = useState('');
-  const [formPhone, setFormPhone] = useState('');
-  const [formAmountDue, setFormAmountDue] = useState<string>('0'); // still unused, kept for compatibility
-  const [formStatus, setFormStatus] = useState<'active' | 'inactive' | ''>('active');
-  const [formAddress, setFormAddress] = useState('');
-  const [submitting, setSubmitting] = useState(false);
+  const fetchingRef = useRef(false);
 
-  const formScrollRef = useRef<ScrollView>(null);
-
-  // ---- network status (offline/online) ----
+  // Connectivity watcher
   useEffect(() => {
     const sub = NetInfo.addEventListener((state) => {
       const ok = Boolean(state.isConnected && state.isInternetReachable);
@@ -107,773 +140,782 @@ export default function CustomersList() {
     return () => sub();
   }, []);
 
-  const resetForm = useCallback(() => {
-    setFormMode('add');
-    setFormName('');
-    setFormPhone('');
-    setFormAmountDue('0');
-    setFormStatus('active');
-    setFormAddress('');
-    setSubmitting(false);
-  }, []);
+  // Hardware back → menu
+  useEffect(() => {
+    const onHardwareBackPress = () => {
+      router.replace('/menu');
+      return true;
+    };
+    const sub = BackHandler.addEventListener('hardwareBackPress', onHardwareBackPress);
+    return () => sub.remove();
+  }, [router]);
 
-  const goToInvoices = useCallback(
-    (name?: string | null) => {
-      const safe = (name ?? '').trim();
-      if (!safe) return Alert.alert('Xulasho khaldan', 'Magaca macaamiilka waa madhan.');
-      const encoded = encodeURIComponent(safe);
-      router.push({ pathname: '/(Transactions)/[customer]', params: { customer: encoded } });
-    },
-    [router]
-  );
+  // OFFLINE-FIRST loader: sync from server (if online) → read from local DB
+  const loadAndMaybeSync = useCallback(
+    async (withSpinner: boolean = true) => {
+      if (!ownerId) return;
+      if (fetchingRef.current) return;
+      fetchingRef.current = true;
 
-  const closeSettings = useCallback(() => {
-    Animated.timing(settingsY, {
-      toValue: SCREEN_H,
-      duration: 220,
-      easing: Easing.in(Easing.cubic),
-      useNativeDriver: false,
-    }).start(({ finished }) => finished && setIsSettingsOpen(false));
-  }, [settingsY]);
-
-  const openAdd = useCallback(() => {
-    setFormMode('add');
-    resetForm();
-    setIsAddOpen(true);
-    Animated.timing(addY, {
-      toValue: SCREEN_H - SHEET_H,
-      duration: 300,
-      easing: Easing.out(Easing.cubic),
-      useNativeDriver: false,
-    }).start(() => {
-      requestAnimationFrame(() => formScrollRef.current?.scrollTo({ y: 0, animated: false }));
-    });
-  }, [addY, resetForm]);
-
-  const openEdit = useCallback(
-    (c: Customer) => {
-      setFormMode('edit');
-      setFormName(c.name || '');
-      setFormPhone(c.phone || '');
-      setFormAmountDue(String(c.amount_due ?? 0));
-      setFormStatus((c.status as any) || 'active');
-      setFormAddress(c.address || '');
-
-      Animated.parallel([
-        Animated.timing(settingsY, {
-          toValue: SCREEN_H,
-          duration: 180,
-          easing: Easing.in(Easing.cubic),
-          useNativeDriver: false,
-        }),
-        Animated.timing(addY, {
-          toValue: SCREEN_H - SHEET_H,
-          delay: 100,
-          duration: 280,
-          easing: Easing.out(Easing.cubic),
-          useNativeDriver: false,
-        }),
-      ]).start(() => {
-        setIsAddOpen(true);
-        requestAnimationFrame(() => formScrollRef.current?.scrollTo({ y: 0, animated: false }));
-      });
-    },
-    [addY, settingsY]
-  );
-
-  const closeAdd = useCallback(() => {
-    Animated.timing(addY, {
-      toValue: SCREEN_H,
-      duration: 240,
-      easing: Easing.in(Easing.cubic),
-      useNativeDriver: false,
-    }).start(({ finished }) => finished && setIsAddOpen(false));
-  }, [addY]);
-
-  // ---- Local page loader (SQLite only) ----
-  const loadPage = useCallback(
-    (reset = false) => {
-      if (!user?.id) return; // no tenant yet
-      if (loadingRef.current) return;
-      loadingRef.current = true;
-
+      if (withSpinner) setLoading(true);
       try {
-        if (reset) {
-          setLoading(true);
-          setHasMore(true);
-          offsetRef.current = 0;
-          setOffset(0);
+        if (online && token) {
+          try {
+            await syncWakaaladFromServer({
+              token,
+              ownerId,
+              startDate: dateRange.startDate,
+              endDate: dateRange.endDate,
+            });
+          } catch (e: any) {
+            console.warn('syncWakaaladFromServer failed', e?.message || e);
+          }
         }
 
-        const localOffset = reset ? 0 : offsetRef.current;
-        const data = getCustomersLocal(search, limit, localOffset, user.id);
-
-        setCustomers((prev) => {
-          if (reset) return data;
-          return [...prev, ...data];
-        });
-
-        setHasMore(data.length === limit);
-        offsetRef.current = localOffset + data.length;
-        setOffset(offsetRef.current);
-        setError(null);
-      } catch (e: any) {
-        setError(e?.message || 'Failed to load customers from local db.');
+        try {
+          const localItems = await getWakaaladLocal({
+            ownerId,
+            startDate: dateRange.startDate,
+            endDate: dateRange.endDate,
+          });
+          setItems(localItems);
+        } catch (e: any) {
+          console.warn('getWakaaladLocal failed', e?.message || e);
+        }
       } finally {
-        setLoading(false);
-        loadingRef.current = false;
+        if (withSpinner) setLoading(false);
+        fetchingRef.current = false;
       }
     },
-    [search, limit, user?.id]
+    [ownerId, online, token, dateRange.startDate, dateRange.endDate]
   );
 
-  // ---- Pull fresh data from server → SQLite (when online) ----
-  // ---- Pull fresh data from server → SQLite (when online) ----
-const pullLatestFromServer = useCallback(async () => {
-  if (!online || !token || !user?.id) return;
-
-  try {
-    const res = await api.get('/diiwaancustomers', {
-      // IMPORTANT: do NOT send q: undefined, just offset/limit
-      params: {
-        offset: 0,
-        limit: 5000, // big enough to cover all existing customers
-      },
-    });
-
-    // Some backends return array, some wrap in .items – keep it safe
-    const raw = (res as any).data;
-    const data = Array.isArray(raw?.items) ? raw.items : (Array.isArray(raw) ? raw : []);
-
-    upsertCustomersFromServer(data, user.id);
-  } catch (e) {
-    // ignore; offline still works
-    console.log('pullLatestFromServer error', e?.response?.data || e?.message || e);
-  }
-}, [online, token, user?.id]);
-
-
-  // Initial load
+  // Initial load and re-load when owner/date-range/online changes
   useEffect(() => {
-    if (!user?.id) return;
-
-    // 1) always load from local db
-    loadPage(true);
-
-    // 2) if online, sync dirty → server and pull fresh list
-    if (online && token) {
-      (async () => {
-        try {
-          await syncCustomersWithServer(api);
-          await pullLatestFromServer();
-          loadPage(true);
-        } catch {
-          // ignore
-        }
-      })();
-    }
-  }, [online, token, user?.id, loadPage, pullLatestFromServer]);
-
-  // Re-run local query on search change (no network)
-  useEffect(() => {
-    if (!user?.id) return;
-    const t = setTimeout(() => {
-      loadPage(true);
-    }, 200);
-    return () => clearTimeout(t);
-  }, [search, loadPage, user?.id]);
+    loadAndMaybeSync(true);
+  }, [loadAndMaybeSync]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    try {
-      if (online && token && user?.id) {
-        await syncCustomersWithServer(api);
-        await pullLatestFromServer();
-      }
-      loadPage(true);
-    } finally {
-      setRefreshing(false);
-    }
-  }, [online, token, user?.id, loadPage, pullLatestFromServer]);
+    await loadAndMaybeSync(false);
+    setRefreshing(false);
+  }, [loadAndMaybeSync]);
 
-  const loadMore = useCallback(() => {
-    if (!loading && hasMore && !loadingRef.current) {
-      loadPage(false);
-    }
-  }, [hasMore, loading, loadPage]);
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const from = dayjs(dateRange.startDate).startOf('day').valueOf();
+    const to = dayjs(dateRange.endDate).endOf('day').valueOf();
 
-  const fmtMoney = (n: number) =>
-    new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: 'USD',
-      maximumFractionDigits: 2,
-    }).format(n || 0);
+    const base = items.filter((it) => {
+      const t = it.date ? new Date(it.date).getTime() : 0;
+      const dateOK = t >= from && t <= to;
+      if (!q) return dateOK;
+      const hay = `${it.wakaalad_name} ${it.oil_type}`.toLowerCase();
+      return dateOK && hay.includes(q);
+    });
 
-  const handleCreateOrUpdate = useCallback(async () => {
-    if (!formName.trim()) {
-      Alert.alert('Fadlan geli magaca macaamiilka');
-      return;
-    }
-    if (!user?.id) {
-      Alert.alert('Error', 'No tenant selected.');
-      return;
-    }
+    return base.sort((a, b) => {
+      const ta = a.date ? new Date(a.date).getTime() : 0;
+      const tb = b.date ? new Date(b.date).getTime() : 0;
+      return tb - ta;
+    });
+  }, [items, search, dateRange]);
 
-    const payload = {
-      name: formName.trim(),
-      phone: formPhone.trim() || null,
-      address: formAddress.trim() || null,
-      status: formStatus || 'active',
-    };
-
-    setSubmitting(true);
-    try {
-      if (online && token) {
-        // Online: hit API, then cache into SQLite
-        if (formMode === 'add') {
-          const res = await api.post('/diiwaancustomers', payload);
-          upsertCustomersFromServer([res.data], user.id);
-        } else if (formMode === 'edit' && selectedCustomer) {
-          const res = await api.patch(
-            `/diiwaancustomers/${selectedCustomer.id}`,
-            payload
-          );
-          upsertCustomersFromServer([res.data], user.id);
-        }
-      } else {
-        // Offline: write to SQLite only; server will get it on next sync
-        if (formMode === 'add') {
-          createOrUpdateCustomerLocal(payload, user.id);
-        } else if (formMode === 'edit' && selectedCustomer) {
-          createOrUpdateCustomerLocal(payload, user.id, selectedCustomer);
-        }
-      }
-
-      closeAdd();
-      loadPage(true);
-    } catch (e: any) {
-      Alert.alert('Error', e?.response?.data?.detail || 'Operation failed.');
-    } finally {
-      setSubmitting(false);
-    }
-  }, [
-    formName,
-    formPhone,
-    formAddress,
-    formStatus,
-    formMode,
-    selectedCustomer,
-    closeAdd,
-    online,
-    token,
-    loadPage,
-    user?.id,
-  ]);
-
-  const handleDelete = useCallback(() => {
-    if (!selectedCustomer) return;
-    Alert.alert('Delete', `Delete ${selectedCustomer.name || 'this customer'}?`, [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Delete',
-        style: 'destructive',
-        onPress: async () => {
-          try {
-            if (online && token && selectedCustomer.id > 0) {
-              // online delete: tell server, then hard delete from local
-              await api.delete(`/diiwaancustomers/${selectedCustomer.id}`);
-              hardDeleteCustomerLocal(selectedCustomer.id);
-            } else {
-              // offline: mark deleted + dirty, so sync can send DELETE later
-              markCustomerDeletedLocal(selectedCustomer.id);
-            }
-            closeSettings();
-            loadPage(true);
-            setSelectedId(null);
-          } catch (e: any) {
-            Alert.alert('Error', e?.response?.data?.detail || 'Delete failed.');
-          }
-        },
-      },
-    ]);
-  }, [selectedCustomer, closeSettings, online, token, loadPage]);
-
-  useFocusEffect(
-    useCallback(() => {
-      const onBack = () => {
-        let handled = false;
-        if (isAddOpen) {
-          closeAdd();
-          handled = true;
-        }
-        if (isSettingsOpen) {
-          closeSettings();
-          handled = true;
-        }
-        return handled;
-      };
-      const sub = BackHandler.addEventListener('hardwareBackPress', onBack);
-      return () => sub.remove();
-    }, [isAddOpen, isSettingsOpen, closeAdd, closeSettings])
+  // Selected unit label
+  const unitLabel = useMemo(
+    () => (unitMode === 'fuusto' ? 'Fuusto' : unitMode === 'caag' ? 'Caag' : 'Liters'),
+    [unitMode]
   );
 
-  const renderItem = ({ item }: { item: Customer }) => {
-    const selected = item.id === selectedId;
-    return (
-      <TouchableOpacity
-        onPress={() => goToInvoices(item.name)}
-        onLongPress={() => {
-          setSelectedId(item.id);
-          setIsSettingsOpen(true);
-          Animated.timing(settingsY, {
-            toValue: SCREEN_H - MINI_SHEET_H,
-            duration: 260,
-            easing: Easing.out(Easing.cubic),
-            useNativeDriver: false,
-          }).start();
-        }}
-        style={[styles.itemRow, selected && styles.itemRowSelected]}
-        activeOpacity={0.7}
-      >
-        <View style={styles.itemLeft}>
-          <Text style={styles.itemName} numberOfLines={1}>
-            {item.name || '—'}
-          </Text>
-          <Text style={styles.itemSub} numberOfLines={1}>
-            {item.phone || 'No phone'}
-          </Text>
-        </View>
+  // Always derive from TOTAL liters (wakaal_stock / wakaal_sold)
+  const totalLitersStock = (it: WakaaladRead) => Number(it.wakaal_stock || 0);
+  const totalLitersSold = (it: WakaaladRead) => Number(it.wakaal_sold || 0);
 
-        <View style={styles.itemRight}>
-          <Text
-            style={[
-              styles.amountDue,
-              (item.amount_due || 0) > 0 ? styles.amountDanger : styles.amountOkay,
-            ]}
-          >
-            {fmtMoney(item.amount_due || 0)}
-          </Text>
-          <Text style={styles.amountHint}>Balance</Text>
-        </View>
-      </TouchableOpacity>
-    );
+  function stockValue(it: WakaaladRead): number {
+    const liters = totalLitersStock(it);
+    if (unitMode === 'liters') return liters;
+    if (unitMode === 'fuusto') return Math.floor(liters / fuustoCap(it.oil_type));
+    return Math.floor(liters / CAPACITY.caag); // caag
+  }
+
+  function soldValue(it: WakaaladRead): number {
+    const liters = totalLitersSold(it);
+    if (unitMode === 'liters') return liters;
+    if (unitMode === 'fuusto') return Math.floor(liters / fuustoCap(it.oil_type));
+    return Math.floor(liters / CAPACITY.caag); // caag
+  }
+
+  function unitSuffix(): string {
+    if (unitMode === 'fuusto') return 'fuusto';
+    if (unitMode === 'caag') return 'caag';
+    return 'L';
+  }
+
+  // Actions modal open
+  const openActions = (wk: WakaaladRead, initialMode: WakaaladActionMode = 'edit') => {
+    setSelectedWk(wk);
+    setActionMode(initialMode);
+    setActionModalOpen(true);
   };
 
   return (
-    <SafeAreaView style={styles.screen} edges={['top', 'left', 'right']}>
+    <View style={styles.page}>
       {/* Header */}
-      <LinearGradient
-        colors={[BRAND_BLUE, BRAND_BLUE_2]}
-        start={{ x: 0, y: 0 }}
-        end={{ x: 1, y: 1 }}
-        style={styles.header}
-      >
-        <View style={styles.headerInner}>
-          <View style={{ width: 32 }} />
-          <Text style={styles.headerTitle} numberOfLines={1}>
-            Macaamiisha
-          </Text>
-          <View style={{ width: 32 }} />
-        </View>
-        {!online && (
-          <Text style={{ color: '#FBBF24', marginTop: 6, textAlign: 'center', fontSize: 11 }}>
-            Offline – xogta waxa laga soo qaaday kaydka gudaha
-          </Text>
-        )}
-      </LinearGradient>
-
-      {/* Actions */}
-      <View style={styles.actionsRow}>
-        <TouchableOpacity
-          style={[styles.pill, styles.pillPrimary]}
-          onPress={() => router.push('/customersettings')}
-          activeOpacity={0.9}
+      <SafeAreaView edges={['top']} style={{ backgroundColor: COLOR_BG }}>
+        <StatusBar style="light" translucent />
+        <LinearGradient
+          colors={[COLOR_ACCENT, COLOR_ACCENT]}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 0 }}
+          style={[styles.header, { paddingTop: 6, overflow: 'hidden' }]}
         >
-          <Feather name="settings" size={16} color={BRAND_BLUE} />
-          <Text style={styles.pillPrimaryTxt}>bedel xogta</Text>
-          <View style={{ width: 8 }} />
-        </TouchableOpacity>
+          <View style={styles.headerRowTop}>
+            {/* Back */}
+            <TouchableOpacity
+              style={styles.backBtn}
+              onPress={() => router.replace('/menu')}
+              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              activeOpacity={0.9}
+            >
+              <Feather name="arrow-left" size={16} color={COLOR_ACCENT} />
+            </TouchableOpacity>
 
-        <TouchableOpacity style={[styles.pill, styles.pillAlt]} onPress={openAdd} activeOpacity={0.9}>
-          <Feather name="user-plus" size={16} color="#243B6B" />
-          <Text style={styles.pillAltTxt}>ku dar macmiil</Text>
-        </TouchableOpacity>
-      </View>
+            {/* Title */}
+            <View style={{ flex: 1, alignItems: 'center' }}>
+              <Text style={styles.headerTitle}>Wakaalad</Text>
+              <Text style={styles.headerDate}>
+                {dayjs(dateRange.startDate).format('MMM D, YYYY')} –{' '}
+                {dayjs(dateRange.endDate).format('MMM D, YYYY')}
+              </Text>
+            </View>
+          </View>
+        </LinearGradient>
+      </SafeAreaView>
 
       {/* Search */}
-      <View style={styles.searchWrapOuter}>
-        <Feather name="search" size={18} color={MUTED} />
-        <TextInput
-          value={search}
-          onChangeText={setSearch}
-          placeholder="raadi macaamiil (offline/online)"
-          placeholderTextColor="#9CA3AF"
-          style={styles.searchInputOuter}
-          autoCorrect={false}
-          returnKeyType="search"
-        />
+      <View style={styles.searchRow}>
+        <View style={styles.searchBox}>
+          <Feather name="search" size={12} color={COLOR_MUTED} />
+          <TextInput
+            style={styles.searchInput}
+            placeholder="Search wakaalad name or oil type…"
+            placeholderTextColor={COLOR_MUTED}
+            value={search}
+            onChangeText={setSearch}
+            autoCapitalize="none"
+            autoCorrect={false}
+            returnKeyType="search"
+          />
+          {!!search && (
+            <TouchableOpacity onPress={() => setSearch('')}>
+              <Feather name="x-circle" size={12} color={COLOR_MUTED} />
+            </TouchableOpacity>
+          )}
+
+          <TouchableOpacity
+            onPress={() => setShowFilters(true)}
+            style={styles.headerFilterBtnSmall}
+          >
+            <Feather name="filter" size={12} color={COLOR_ACCENT} />
+            <Text style={styles.headerFilterTxtSmall}>DATE</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
-      {/* Content */}
-      <View style={styles.content}>
-        {loading && customers.length === 0 ? (
-          <View style={styles.center}>
-            <ActivityIndicator size="large" color={ACCENT} />
-            {error ? <Text style={styles.errorText}>{error}</Text> : null}
+      {/* BIG Unit Selector */}
+      <View style={styles.unitBar}>
+        <Text style={styles.unitBarLabel}>Display in</Text>
+        <View style={styles.unitChipsRow}>
+          {(['fuusto', 'caag', 'liters'] as UnitMode[]).map((u) => {
+            const active = unitMode === u;
+            const label = u === 'fuusto' ? 'Fuusto' : u === 'caag' ? 'Caag' : 'Liters';
+            return (
+              <TouchableOpacity
+                key={u}
+                onPress={() => setUnitMode(u)}
+                activeOpacity={0.9}
+                style={[styles.unitChip, active && styles.unitChipActive]}
+              >
+                <Feather name="layers" size={12} color={active ? '#fff' : COLOR_ACCENT} />
+                <Text style={[styles.unitChipTxt, active && styles.unitChipTxtActive]}>
+                  {label}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      </View>
+
+      {/* List */}
+      <ScrollView
+        contentContainerStyle={[
+          styles.scrollContent,
+          { paddingBottom: 24 + tabBarHeight + insets.bottom + 80 },
+        ]}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator
+      >
+        {loading ? (
+          <View style={styles.loading}>
+            <ActivityIndicator />
+          </View>
+        ) : filtered.length === 0 ? (
+          <View style={styles.empty}>
+            <Feather name="inbox" size={18} color={COLOR_MUTED} />
+            <Text style={styles.emptyText}>No wakaalad found.</Text>
           </View>
         ) : (
-          <FlatList
-            data={customers}
-            keyExtractor={(it) => String(it.id)}
-            renderItem={renderItem}
-            ItemSeparatorComponent={() => <View style={styles.separator} />}
-            style={{ flex: 1 }}
-            contentContainerStyle={{ paddingBottom: 24, paddingTop: 8 }}
-            onEndReachedThreshold={0.4}
-            onEndReached={loadMore}
-            keyboardShouldPersistTaps="handled"
-            keyboardDismissMode="on-drag"
-            showsVerticalScrollIndicator
-            refreshControl={
-              <RefreshControl
-                refreshing={refreshing}
-                onRefresh={onRefresh}
-                tintColor={ACCENT}
-              />
-            }
-            ListEmptyComponent={
-              !loading ? <Text style={styles.emptyText}>No customers yet.</Text> : null
-            }
-            ListFooterComponent={
-              hasMore ? (
-                <View style={{ paddingVertical: 16, alignItems: 'center' }}>
-                  <ActivityIndicator color={ACCENT} />
-                </View>
-              ) : null
-            }
-          />
-        )}
-      </View>
+          filtered.map((wk) => {
+            const pctSold = percentSold(wk);
+            const pctStock = percentStock(wk);
+            const totalLiters = (wk.wakaal_stock || 0) + (wk.wakaal_sold || 0);
 
-      {/* Backdrop */}
-      <Backdrop
-        visible={isSettingsOpen || isAddOpen}
-        onPress={() => {
-          if (isAddOpen) closeAdd();
-          if (isSettingsOpen) closeSettings();
+            const stock = stockValue(wk);
+            const sold = soldValue(wk);
+            const suffix = unitSuffix();
+
+            const pctForLabel = Math.max(4, Math.min(96, Math.round(pctStock)));
+
+            return (
+              <View key={wk.id} style={styles.card}>
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  {/* Title row with single Actions button */}
+                  <View style={styles.titleRow}>
+                    <Text style={styles.title} numberOfLines={1}>
+                      {wk.wakaalad_name || '—'}
+                    </Text>
+
+                    <TouchableOpacity
+                      onPress={() => openActions(wk, 'edit')}
+                      style={styles.actionsBtn}
+                      activeOpacity={0.9}
+                    >
+                      <Feather name="settings" size={12} color={COLOR_ACCENT} />
+                      <Text style={styles.actionsBtnTxt}>Actions</Text>
+                    </TouchableOpacity>
+                  </View>
+
+                  <View style={styles.metaRow}>
+                    <View style={styles.metaPill}>
+                      <Feather name="droplet" size={10} color={COLOR_TEXT} />
+                      <Text style={styles.metaText}>
+                        {String(wk.oil_type || '—').toUpperCase()}
+                      </Text>
+                    </View>
+                    <View style={styles.metaPill}>
+                      <Feather name="calendar" size={10} color={COLOR_TEXT} />
+                      <Text style={styles.metaText}>{formatDateLocal(wk.date)}</Text>
+                    </View>
+                    <View style={styles.metaPill}>
+                      <Feather name="database" size={10} color={COLOR_TEXT} />
+                      <Text style={styles.metaText}>
+                        Total {formatNumber(totalLiters)} L
+                      </Text>
+                    </View>
+                  </View>
+
+                  {/* Progress bar */}
+                  <View
+                    style={styles.progressWrap}
+                    accessible
+                    accessibilityRole="progressbar"
+                    accessibilityLabel="Wakaalad remaining stock"
+                    accessibilityValue={{ now: Math.round(pctStock), min: 0, max: 100 }}
+                  >
+                    <View style={styles.progressBg} />
+                    <View style={[styles.progressFill, { width: `${pctStock}%` }]} />
+
+                    {/* Sliding percentage tag */}
+                    <View
+                      pointerEvents="none"
+                      style={[
+                        styles.progressTag,
+                        { left: `${pctForLabel}%`, transform: [{ translateX: -18 }] },
+                      ]}
+                    >
+                      <Text style={styles.progressTagTxt}>{Math.round(pctStock)}%</Text>
+                    </View>
+                  </View>
+
+                  {/* Stat boxes show values in selected unit */}
+                  <View style={styles.statsRow}>
+                    <View style={styles.statBox}>
+                      <Text style={styles.statLabel}>Stock ({unitLabel})</Text>
+                      <Text style={styles.statValue}>
+                        {formatNumber(stock)} {suffix}
+                      </Text>
+                    </View>
+
+                    {/* SOLD with round green confirmation tick */}
+                    <View style={styles.statBox}>
+                      <Text style={styles.statLabel}>Sold ({unitLabel})</Text>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                        {unitMode === 'fuusto' && <ConfirmBadge size={16} />}
+                        <Text style={styles.statValue}>
+                          {formatNumber(sold)} {suffix}
+                        </Text>
+                      </View>
+                    </View>
+                  </View>
+                </View>
+              </View>
+            );
+          })
+        )}
+      </ScrollView>
+
+      {/* ===== FAB (above bottom tabs) ===== */}
+      <TouchableOpacity
+        style={[styles.fab, { bottom: fabBottom }]}
+        onPress={() => setCreateOpen(true)}
+        activeOpacity={0.9}
+        accessibilityRole="button"
+        accessibilityLabel="Create wakaalad"
+        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+      >
+        <LinearGradient
+          colors={['#1E40AF', '#1E40AF']}
+          style={styles.fabGradient}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 1 }}
+        >
+          <Ionicons name="add" size={20} color="white" />
+          <Text style={styles.fabText}>create</Text>
+        </LinearGradient>
+      </TouchableOpacity>
+
+      {/* Filters (DATE) Modal */}
+      <Modal
+        visible={showFilters}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowFilters(false)}
+      >
+        <TouchableWithoutFeedback onPress={() => setShowFilters(false)}>
+          <View style={styles.modalBackdrop}>
+            <TouchableWithoutFeedback onPress={() => {}}>
+              <View style={[styles.modalCard, { width: '94%', maxHeight: '80%' }]}>
+                <View style={styles.modalHeader}>
+                  <Text style={styles.modalTitle}>Date Range</Text>
+                  <TouchableOpacity onPress={() => setShowFilters(false)}>
+                    <Feather name="x" size={16} color="#1F2937" />
+                  </TouchableOpacity>
+                </View>
+
+                <ScrollView
+                  contentContainerStyle={{ paddingBottom: 8 }}
+                  showsVerticalScrollIndicator
+                  keyboardShouldPersistTaps="handled"
+                >
+                  <View style={styles.filterSection}>
+                    <Text style={styles.filterLabel}>Date Range</Text>
+                    <View style={styles.dateRangeContainer}>
+                      <TouchableOpacity
+                        style={styles.dateBtn}
+                        onPress={() => setShowDatePicker('start')}
+                      >
+                        <Text style={styles.dateBtnText}>
+                          {dayjs(dateRange.startDate).format('MMM D, YYYY')}
+                        </Text>
+                        <Feather name="calendar" size={12} color={COLOR_ACCENT} />
+                      </TouchableOpacity>
+                      <Text style={styles.rangeSep}>to</Text>
+                      <TouchableOpacity
+                        style={styles.dateBtn}
+                        onPress={() => setShowDatePicker('end')}
+                      >
+                        <Text style={styles.dateBtnText}>
+                          {dayjs(dateRange.endDate).format('MMM D, YYYY')}
+                        </Text>
+                        <Feather name="calendar" size={12} color={COLOR_ACCENT} />
+                      </TouchableOpacity>
+                    </View>
+
+                    {showDatePicker && (
+                      <DateTimePicker
+                        value={
+                          showDatePicker === 'start'
+                            ? dateRange.startDate
+                            : dateRange.endDate
+                        }
+                        mode="date"
+                        display={Platform.OS === 'ios' ? 'spinner' : 'default'}
+                        onChange={(_, sel) => {
+                          const mode = showDatePicker; // capture before clearing
+                          setShowDatePicker(null);
+                          if (!sel || !mode) return;
+                          setDateRange((prev) =>
+                            mode === 'start'
+                              ? { ...prev, startDate: dayjs(sel).startOf('day').toDate() }
+                              : { ...prev, endDate: dayjs(sel).endOf('day').toDate() }
+                          );
+                        }}
+                      />
+                    )}
+                  </View>
+                </ScrollView>
+
+                <View style={styles.filterActions}>
+                  <TouchableOpacity
+                    style={styles.resetBtn}
+                    onPress={() =>
+                      setDateRange({
+                        startDate: dayjs().startOf('month').toDate(),
+                        endDate: dayjs().endOf('day').toDate(),
+                      })
+                    }
+                  >
+                    <Text style={styles.resetTxt}>Reset</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.applyBtn}
+                    onPress={() => {
+                      setShowFilters(false);
+                      loadAndMaybeSync(true);
+                    }}
+                  >
+                    <Text style={styles.applyTxt}>Apply</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </TouchableWithoutFeedback>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
+
+      {/* Create Wakaalad Modal */}
+      <CreateWakaaladModal
+        visible={createOpen}
+        onClose={() => setCreateOpen(false)}
+        onCreated={() => {
+          setCreateOpen(false);
+          loadAndMaybeSync(false);
         }}
       />
 
-      {/* Settings Bottom Sheet */}
-      <Animated.View
-        style={[styles.sheet, { height: MINI_SHEET_H, top: settingsY }]}
-        pointerEvents={isSettingsOpen ? 'auto' : 'none'}
-      >
-        <View style={styles.sheetHandle} />
-        <Text style={styles.sheetTitle}>{selectedCustomer?.name || 'Actions'}</Text>
-        <View style={styles.sheetRow}>
-          <TouchableOpacity
-            style={[styles.sheetAction, { backgroundColor: selectedCustomer ? ACCENT : '#B9C3FF' }]}
-            onPress={() => selectedCustomer && openEdit(selectedCustomer)}
-            disabled={!selectedCustomer}
-          >
-            <Feather name="edit-2" size={16} color="#fff" />
-            <Text style={styles.sheetActionText}>Edit</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.sheetAction, { backgroundColor: selectedCustomer ? DANGER : '#F5B4B4' }]}
-            onPress={handleDelete}
-            disabled={!selectedCustomer}
-          >
-            <Feather name="trash-2" size={16} color="#fff" />
-            <Text style={styles.sheetActionText}>Delete</Text>
-          </TouchableOpacity>
-        </View>
-        <TouchableOpacity style={styles.sheetClose} onPress={closeSettings}>
-          <Text style={styles.sheetCloseTxt}>Close</Text>
-        </TouchableOpacity>
-      </Animated.View>
-
-      {/* Add/Edit Bottom Sheet */}
-      <Animated.View
-        style={[styles.sheet, { height: SHEET_H, top: addY }]}
-        pointerEvents={isAddOpen ? 'auto' : 'none'}
-      >
-        <View style={styles.sheetHandle} />
-        <Text style={styles.sheetTitle}>
-          {formMode === 'add' ? 'Add macaamiil' : 'Edit macaamiil'}
-        </Text>
-
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          keyboardVerticalOffset={Platform.select({ ios: 12, android: 0 })}
-          style={{ flex: 1 }}
-        >
-          <ScrollView
-            ref={formScrollRef}
-            style={{ flex: 1 }}
-            contentContainerStyle={{ paddingBottom: 24, paddingTop: 4, flexGrow: 1 }}
-            keyboardShouldPersistTaps="handled"
-            showsVerticalScrollIndicator
-          >
-            <View style={styles.formRow}>
-              <Text style={styles.label}>Magaca</Text>
-              <TextInput
-                value={formName}
-                onChangeText={setFormName}
-                placeholder="Magaca macaamiilka"
-                placeholderTextColor="#9CA3AF"
-                style={styles.input}
-                returnKeyType="next"
-              />
-            </View>
-
-            <View style={styles.formRow}>
-              <Text style={styles.label}>Phone</Text>
-              <TextInput
-                value={formPhone}
-                onChangeText={setFormPhone}
-                placeholder="(+252) 61 234 5678"
-                placeholderTextColor="#9CA3AF"
-                keyboardType="phone-pad"
-                style={styles.input}
-                returnKeyType="next"
-              />
-            </View>
-
-            <View style={styles.formRow}>
-              <Text style={styles.label}>Address</Text>
-              <TextInput
-                value={formAddress}
-                onChangeText={setFormAddress}
-                placeholder="Degmada, xaafadda…"
-                placeholderTextColor="#9CA3AF"
-                style={[styles.input, { height: 100, textAlignVertical: 'top', paddingTop: 12 }]}
-                multiline
-                returnKeyType="done"
-              />
-            </View>
-
-            <View style={styles.formActions}>
-              <TouchableOpacity
-                style={[styles.btn, styles.btnGhost]}
-                onPress={closeAdd}
-                disabled={submitting}
-              >
-                <Text style={[styles.btnTxt, { color: TEXT }]}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.btn, submitting ? { opacity: 0.6 } : null]}
-                onPress={handleCreateOrUpdate}
-                disabled={submitting}
-              >
-                <Text style={styles.btnTxt}>
-                  {formMode === 'add' ? 'Save' : 'Update'}
-                </Text>
-              </TouchableOpacity>
-            </View>
-          </ScrollView>
-        </KeyboardAvoidingView>
-      </Animated.View>
-    </SafeAreaView>
+      {/* Actions Modal (Edit / Restock / Delete) */}
+      <WakaaladActionsModal
+        visible={actionModalOpen}
+        mode={actionMode}
+        wakaalad={selectedWk}
+        onClose={() => setActionModalOpen(false)}
+        onSuccess={() => {
+          setActionModalOpen(false);
+          loadAndMaybeSync(false);
+        }}
+      />
+    </View>
   );
 }
 
-function Backdrop({ visible, onPress }: { visible: boolean; onPress: () => void }) {
-  const opacity = useRef(new Animated.Value(0)).current;
-  useEffect(() => {
-    Animated.timing(opacity, {
-      toValue: visible ? 1 : 0,
-      duration: 180,
-      useNativeDriver: true,
-    }).start();
-  }, [visible, opacity]);
-
-  if (!visible) return null;
-  return (
-    <Animated.View style={[styles.backdrop, { opacity }]}>
-      <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={onPress} />
-    </Animated.View>
-  );
-}
+const CARD_WIDTH = (width - 16 * 2 - 10 * 2) / 3;
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, backgroundColor: BG },
+  page: { flex: 1, backgroundColor: COLOR_BG },
 
   header: {
-    paddingHorizontal: 14,
-    paddingTop: 14,
-    paddingBottom: 16,
-    borderBottomLeftRadius: 18,
-    borderBottomRightRadius: 18,
-  },
-  headerInner: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  headerTitle: {
-    flex: 1,
-    textAlign: 'center',
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '900',
+    paddingBottom: 18,
+    paddingHorizontal: 16,
+    borderBottomLeftRadius: 22,
+    borderBottomRightRadius: 22,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.1,
+    shadowRadius: 12,
+    elevation: 4,
   },
 
-  actionsRow: {
-    flexDirection: 'row',
+  headerRowTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  backBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 8,
+    backgroundColor: '#FFFFFF',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 12,
-    marginTop: 10,
-    marginBottom: 10,
-    paddingHorizontal: 14,
-  },
-  pill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    height: 40,
-    paddingHorizontal: 14,
-    borderRadius: 12,
+    justifyContent: 'center',
     borderWidth: 1,
+    borderColor: '#D8E0F5',
   },
-  pillPrimary: { backgroundColor: '#fff', borderColor: 'rgba(0,0,0,0.05)' },
-  pillPrimaryTxt: { color: BRAND_BLUE, fontWeight: '800' },
-  pillAlt: { backgroundColor: '#EEF2FF', borderColor: '#E0E7FF' },
-  pillAltTxt: { color: '#243B6B', fontWeight: '800' },
+  headerTitle: { fontSize: 15, fontWeight: '800', color: '#E0E7FF', textAlign: 'center' },
+  headerDate: { color: '#CBD5E1', fontSize: 10, marginTop: 2, textAlign: 'center' },
 
-  searchWrapOuter: {
-    marginTop: 6,
-    marginBottom: 6,
-    alignSelf: 'center',
-    width: '88%',
+  createBtn: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    backgroundColor: '#fff',
-    paddingHorizontal: 12,
+    gap: 6,
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#D8E0F5',
+  },
+  createBtnTxt: { color: COLOR_ACCENT, fontWeight: '800', fontSize: 11 },
+
+  // Search row
+  searchRow: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 6 },
+  searchBox: {
+    paddingHorizontal: 8,
+    paddingVertical: 6,
     borderRadius: 10,
-    height: 40,
+    borderWidth: 1.5, // thicker border
+    borderColor: COLOR_ACCENT, // dark blue border
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#FFFFFF',
+  },
+  searchInput: { flex: 1, fontSize: 11, paddingVertical: 2, color: COLOR_TEXT },
+  headerFilterBtnSmall: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: '#EEF2FF',
+    paddingVertical: 5,
+    paddingHorizontal: 8,
+    borderRadius: 8,
     borderWidth: 1,
     borderColor: '#DDE3F0',
+    marginLeft: 6,
   },
-  searchInputOuter: {
-    flex: 1,
-    color: TEXT,
-    fontSize: 14,
-    paddingVertical: 2,
+  headerFilterTxtSmall: { color: COLOR_ACCENT, fontSize: 10, fontWeight: '800' },
+
+  // BIG Unit Selector
+  unitBar: {
+    paddingHorizontal: 16,
+    paddingBottom: 8,
+    paddingTop: 0,
   },
-
-  content: { flex: 1, paddingHorizontal: 14, paddingTop: 8 },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 10 },
-  errorText: { color: DANGER, marginTop: 8 },
-  emptyText: { textAlign: 'center', color: MUTED, marginTop: 24 },
-
-  separator: { height: 10 },
-
-  itemRow: {
+  unitBarLabel: {
+    fontSize: 10,
+    color: '#334155',
+    fontWeight: '900',
+    marginBottom: 6,
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+  },
+  unitChipsRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  unitChip: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#fff',
-    borderRadius: 14,
-    paddingVertical: 12,
-    paddingHorizontal: 14,
+    gap: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 10,
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: '#D9E3FF',
+    backgroundColor: '#ECF2FF',
   },
-  itemRowSelected: {
-    borderColor: ACCENT,
-    shadowColor: ACCENT,
-    shadowOpacity: 0.15,
-    shadowOffset: { width: 0, height: 6 },
-    shadowRadius: 12,
-    elevation: 3,
+  unitChipActive: {
+    backgroundColor: COLOR_ACCENT,
+    borderColor: COLOR_ACCENT,
   },
-  itemLeft: { flex: 1, paddingRight: 10 },
-  itemName: { fontSize: 16, color: TEXT, fontWeight: '700' },
-  itemSub: { fontSize: 13, color: MUTED, marginTop: 3 },
-  itemRight: { alignItems: 'flex-end' },
-  amountDue: { fontSize: 15, fontWeight: '800' },
-  amountDanger: { color: DANGER },
-  amountOkay: { color: SUCCESS },
-  amountHint: { fontSize: 11, color: MUTED, marginTop: 2 },
+  unitChipTxt: {
+    color: COLOR_ACCENT,
+    fontSize: 11,
+    fontWeight: '900',
+  },
+  unitChipTxtActive: {
+    color: '#FFFFFF',
+  },
 
-  sheet: {
+  scrollContent: { padding: 12 }, // dynamic bottom padding added inline in component
+  loading: { padding: 20, alignItems: 'center', justifyContent: 'center' },
+  empty: { paddingVertical: 36, alignItems: 'center', justifyContent: 'center', gap: 6 },
+  emptyText: { color: COLOR_MUTED, fontSize: 12 },
+
+  card: {
+    backgroundColor: COLOR_CARD,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#E9EEF6',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginBottom: 10,
+    flexDirection: 'row',
+    gap: 10,
+    shadowColor: 'rgba(2,6,23,0.04)',
+    shadowOpacity: 1,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 1 },
+    elevation: 1,
+  },
+  titleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  title: { fontSize: 13, fontWeight: '900', color: COLOR_TEXT, flexShrink: 1, paddingRight: 8 },
+
+  actionsBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#E0E7F0',
+  },
+  actionsBtnTxt: { color: COLOR_ACCENT, fontWeight: '900', fontSize: 11 },
+
+  metaRow: { flexDirection: 'row', gap: 6, marginTop: 6, flexWrap: 'wrap' },
+  metaPill: {
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#E7ECF3',
+    borderRadius: 999,
+    paddingVertical: 3,
+    paddingHorizontal: 6,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  metaText: { color: COLOR_TEXT, fontSize: 10, fontWeight: '700' },
+
+  // Progress
+  progressWrap: { marginTop: 10, height: 20, justifyContent: 'center' },
+  progressBg: {
     position: 'absolute',
     left: 0,
     right: 0,
-    backgroundColor: '#fff',
-    borderTopLeftRadius: 18,
-    borderTopRightRadius: 18,
-    paddingHorizontal: 16,
-    paddingTop: 10,
-    paddingBottom: 12,
-    borderTopWidth: 1,
-    borderColor: BORDER,
-    zIndex: 20,
-    elevation: 20,
-  },
-  sheetHandle: {
-    alignSelf: 'center',
-    width: 44,
-    height: 4,
-    borderRadius: 999,
+    height: 10,
     backgroundColor: '#E5E7EB',
-    marginBottom: 10,
+    borderRadius: 999,
   },
-  sheetTitle: { fontSize: 16, fontWeight: '800', color: TEXT, textAlign: 'center', marginBottom: 8 },
-  sheetRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 12,
-    marginTop: 8,
+  progressFill: {
+    position: 'absolute',
+    left: 0,
+    height: 10,
+    backgroundColor: COLOR_ACCENT, // dark blue fill
+    borderRadius: 999,
   },
-  sheetAction: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingHorizontal: 16,
-    height: 44,
-    borderRadius: 12,
+  progressTag: {
+    position: 'absolute',
+    bottom: 12,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    backgroundColor: COLOR_ACCENT,
+    borderRadius: 8,
   },
-  sheetActionText: { color: '#fff', fontWeight: '700' },
-  sheetClose: { marginTop: 12, alignSelf: 'center', paddingVertical: 6, paddingHorizontal: 12 },
-  sheetCloseTxt: { color: MUTED, fontWeight: '600' },
+  progressTagTxt: { color: '#FFFFFF', fontSize: 10, fontWeight: '800' },
 
-  formRow: { marginBottom: 12 },
-  label: { fontWeight: '700', color: TEXT, marginBottom: 6 },
-  input: {
-    backgroundColor: '#fff',
-    borderWidth: 1,
-    borderColor: BORDER,
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    height: 44,
-    color: TEXT,
-  },
-
-  formActions: { flexDirection: 'row', gap: 10, marginTop: 8 },
-  btn: {
+  // Stats
+  statsRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 8 },
+  statBox: {
     flex: 1,
-    height: 48,
-    borderRadius: 12,
-    backgroundColor: ACCENT,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#E7ECF3',
+    borderRadius: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+  },
+  statBoxSmall: {
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    backgroundColor: '#ECFEFF',
+    borderWidth: 1,
+    borderColor: '#CFFAFE',
+    borderRadius: 10,
+  },
+  statLabel: { color: COLOR_MUTED, fontSize: 10, fontWeight: '700', marginBottom: 2 },
+  statValue: { color: COLOR_TEXT, fontSize: 13, fontWeight: '900' },
+  statMini: { color: '#0369A1', fontSize: 10, fontWeight: '900' },
+
+  breakdownText: { color: '#6B7280', fontSize: 10, marginTop: 0 },
+
+  // Floating Action Button
+  fab: {
+    position: 'absolute',
+    right: 20,
+    zIndex: 999, // iOS stacking
+    elevation: 12, // Android stacking
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.25,
+    shadowRadius: 7,
+  },
+  fabGradient: {
+    minWidth: 52,
+    height: 52,
+    paddingHorizontal: 14,
+    borderRadius: 26,
+    justifyContent: 'center',
+    alignItems: 'center',
+    flexDirection: 'row', // icon + text inline
+    gap: 8,
+  },
+
+  fabText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 0.2,
+  },
+
+  // Modal
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(2,6,23,0.55)',
     alignItems: 'center',
     justifyContent: 'center',
+    padding: 16,
   },
-  btnGhost: {
+  modalCard: {
+    width: '100%',
     backgroundColor: '#fff',
+    borderRadius: 14,
+    padding: 12,
     borderWidth: 1,
-    borderColor: BORDER,
+    borderColor: '#EBEFF5',
   },
-  btnTxt: { color: '#fff', fontWeight: '800' },
+  modalHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  modalTitle: { fontSize: 14, fontWeight: '900', color: COLOR_TEXT },
 
-  backdrop: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.35)',
-    zIndex: 10,
-    elevation: 10,
+  filterSection: { marginTop: 8, marginBottom: 8 },
+  filterLabel: {
+    fontSize: 9,
+    fontWeight: '900',
+    letterSpacing: 0.3,
+    color: '#6B7280',
+    marginBottom: 6,
+    textTransform: 'uppercase',
   },
+  dateRangeContainer: { flexDirection: 'row', alignItems: 'center' },
+  dateBtn: {
+    flex: 1,
+    padding: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#F9FAFB',
+  },
+  dateBtnText: { color: '#1F2937', fontSize: 11, fontWeight: '700' },
+  rangeSep: { fontSize: 10, color: '#6B7280', marginHorizontal: 8 },
+
+  filterActions: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 10 },
+  resetBtn: {
+    flex: 1,
+    padding: 9,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    marginRight: 8,
+    alignItems: 'center',
+    backgroundColor: 'white',
+  },
+  resetTxt: { fontSize: 11, fontWeight: '800', color: '#1F2937' },
+  applyBtn: {
+    flex: 1,
+    padding: 9,
+    borderRadius: 8,
+    backgroundColor: COLOR_ACCENT,
+    alignItems: 'center',
+  },
+  applyTxt: { fontSize: 11, fontWeight: '800', color: 'white' },
 });
