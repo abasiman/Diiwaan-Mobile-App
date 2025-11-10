@@ -121,6 +121,20 @@ export function upsertCustomersFromServer(customers: ApiCustomer[], ownerId: num
           c.updated_at ?? new Date().toISOString(),
         ]
       );
+
+      // 🔹 NEW: remove any offline temp duplicates for same owner + name (+ phone)
+      if (c.name) {
+        db.runSync(
+          `
+          DELETE FROM customers
+          WHERE owner_id = ?
+            AND id < 0
+            AND LOWER(name) = LOWER(?)
+            AND (phone IS NULL OR phone = ?);
+        `,
+          [ownerId, c.name, c.phone ?? null]
+        );
+      }
     }
   });
 }
@@ -202,14 +216,12 @@ export function createOrUpdateCustomerLocal(
 }
 
 /**
- * NEW: apply a local *delta* to a customer's balance when we create
+ * apply a local *delta* to a customer's balance when we create
  * an OFFLINE sale (credit). This only changes local numbers so the
  * CustomersList shows the updated balance immediately.
  *
  * - `deltaAmountDueUsd` should be the credit/outstanding portion in USD.
  * - Look up by owner + customer name (same name you use in sales).
- * - If the customer doesn't exist yet, we create a temp local row (id < 0)
- *   with dirty=1 so it will be POSTed on next sync.
  */
 export function applyLocalCustomerBalanceDeltaByName(
   ownerId: number,
@@ -230,17 +242,19 @@ export function applyLocalCustomerBalanceDeltaByName(
       WHERE owner_id = ?
         AND deleted = 0
         AND name = ?
+      ORDER BY datetime(updated_at) DESC, id DESC
       LIMIT 1;
     `,
       [ownerId, name]
     );
 
+
     if (!existing) {
-      // 🔹 No auto-create: if the customer doesn't exist locally, do nothing.
+      // No auto-create: if the customer doesn't exist locally, do nothing.
       return;
     }
 
-    // 🔹 Only bump local numbers; still NOT touching `dirty`
+    // Only bump local numbers; still NOT touching `dirty`
     db.runSync(
       `
       UPDATE customers
@@ -253,7 +267,6 @@ export function applyLocalCustomerBalanceDeltaByName(
     );
   });
 }
-
 
 // ---------- Local delete helpers ----------
 export function markCustomerDeletedLocal(id: number) {

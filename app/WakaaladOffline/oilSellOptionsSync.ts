@@ -1,49 +1,36 @@
 // app/WakaaladOffline/oilSellOptionsSync.ts
-
 import api from '@/services/api';
-import { upsertOilSellOptionsFromServer } from './oilSellOptionsRepo';
+import {
+  upsertOilSellOptionsFromServer,
+  type OilSellOption,
+} from './oilSellOptionsRepo';
 
 /**
- * Shape of /diiwaanoil/sell-options items coming from the backend.
- * (We keep this loose enough to match what upsertOilSellOptionsFromServer expects.)
- */
-export type OilSellOptionRemote = {
-  id: number;
-  oil_id: number;
-  lot_id?: number | null;
-  oil_type: string;
-  truck_plate?: string | null;
-  in_stock_l: number;
-  in_stock_fuusto: number;
-  in_stock_caag: number;
-  currency?: string | null;
-  liter_price?: number | null;
-  fuusto_price?: number | null;
-  caag_price?: number | null;
-
-  // backend sometimes uses this instead of liter_price
-  sell_price_per_l?: number | null;
-};
-
-/**
- * Full sync for /diiwaanoil/sell-options → local SQLite.
+ * Full sync for oil sell-options:
+ * - pull /diiwaanoil/sell-options from server
+ * - store snapshot into oilselloptions_all
  *
- * Call this from your global sync / RootLayout after login, or on pull-to-refresh.
+ * Called from GlobalSync in app/layout.tsx:
+ *   await run('syncAllOilSellOptions', () =>
+ *     syncAllOilSellOptions(ownerId, token)
+ *   );
  */
 export async function syncAllOilSellOptions(ownerId: number, token: string) {
   if (!ownerId || !token) return;
 
-  const res = await api.get<OilSellOptionRemote[]>('/diiwaanoil/sell-options', {
-    headers: { Authorization: `Bearer ${token}` },
+  const headers = { Authorization: `Bearer ${token}` };
+
+  // Assuming this endpoint returns the full list (no pagination in your current usage)
+  const res = await api.get<OilSellOption[]>('/diiwaanoil/sell-options', {
+    headers,
     params: {
-      only_available: true,    // or false if you ever want *all* lots
+      only_available: true,
       order: 'created_desc',
-      limit: 1000,             // same idea as wakaalad sell-options sync
     },
   });
 
-  const rows = Array.isArray(res.data) ? res.data : [];
-  if (!rows.length) return;
+  const options = Array.isArray(res.data) ? res.data : [];
+  if (!options.length) return;
 
-  upsertOilSellOptionsFromServer(rows, ownerId);
+  upsertOilSellOptionsFromServer(options, ownerId);
 }

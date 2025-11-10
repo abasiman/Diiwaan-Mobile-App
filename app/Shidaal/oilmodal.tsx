@@ -5,6 +5,8 @@ import { Feather } from '@expo/vector-icons';
 import NetInfo from '@react-native-community/netinfo';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { syncAllOilSellOptions } from '../WakaaladOffline/oilSellOptionsSync';
+
 
 import {
   ActivityIndicator,
@@ -581,15 +583,14 @@ export default function OilCreatePage() {
       }
 
       // queue the form for later sync
-     const localFormId = queueOilModalForSync(user.id, {
-      mode,
-      payload,
-      truck_rent: truckRentVal,
-      depot_cost: depotCostVal,
-      tax: taxVal,
-      currency: currencyCode,
-    });
-
+      const localFormId = queueOilModalForSync(user.id, {
+        mode,
+        payload,
+        truck_rent: truckRentVal,
+        depot_cost: depotCostVal,
+        tax: taxVal,
+        currency: currencyCode,
+      });
 
       try {
         const existing = await getVendorBillsForOwner(user.id);
@@ -657,8 +658,6 @@ export default function OilCreatePage() {
             ],
             extra_costs: [],
             date: todayIso,
-
-
             local_oil_form_id: localFormId,
           };
 
@@ -841,6 +840,15 @@ export default function OilCreatePage() {
         router.push('/TrackVendorBills/vendorbills');
       }
 
+      // 🔁 Refresh oil sell-options cache so wakaalad can use it offline
+      if (user?.id && token) {
+        try {
+          await syncAllOilSellOptions(user.id, token);
+        } catch (e) {
+          console.warn('syncAllOilSellOptions (both) after create failed', e);
+        }
+      }
+
       return;
     }
 
@@ -880,6 +888,15 @@ export default function OilCreatePage() {
       await createExtra(newId, 'truck_rent', truckRentVal);
       await createExtra(newId, 'depot_cost', depotCostVal);
       await createExtra(newId, 'tax', taxVal);
+    }
+
+    // 🔁 Refresh oil sell-options cache so wakaalad can use it offline
+    if (user?.id && token) {
+      try {
+        await syncAllOilSellOptions(user.id, token);
+      } catch (e) {
+        console.warn('syncAllOilSellOptions (single) after create failed', e);
+      }
     }
 
     const vendor =

@@ -10,6 +10,7 @@ import { initIncomeStatementDb } from './offlineincomestatement/incomeStatementD
 import React, { useCallback, useEffect, useLayoutEffect } from 'react';
 import { AppState, Platform, Text, View } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { initOilSellOptionsDb } from './WakaaladOffline/oilSellOptionsRepo';
 
 import { initMeProfileDb } from './profile/meProfileDb';
 import { syncMeProfile } from './profile/meProfileSync';
@@ -50,7 +51,7 @@ import { syncPendingOilSales } from './dbform/invocieoilSalesOfflineRepo';
 import { initWakaaladSellOptionsDb, syncAllWakaaladSellOptions } from './dbform/wakaaladSellOptionsRepo';
 import { syncPendingOilSaleReversals } from './dbsalereverse/oilSaleReverseOfflineRepo';
 
-import { initOilSellOptionsDb } from './WakaaladOffline/oilSellOptionsRepo';
+
 import { syncAllOilSellOptions } from './WakaaladOffline/oilSellOptionsSync';
 import { initWakaaladDb } from './WakaaladOffline/wakaaladOfflineDb';
 import { syncWakaaladFromServer } from './WakaaladOffline/wakaaladSync';

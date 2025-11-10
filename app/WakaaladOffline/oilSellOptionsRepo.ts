@@ -1,10 +1,9 @@
 // app/WakaaladOffline/oilSellOptionsRepo.ts
-
 import { db } from '../db/db';
+import { initOilSellOptionsDb } from './oilSellOptionsDb';
 
-export type OilSellOptionLocal = {
+export type OilSellOption = {
   id: number;
-  owner_id: number;
   oil_id: number;
   lot_id?: number | null;
   oil_type: string;
@@ -16,47 +15,38 @@ export type OilSellOptionLocal = {
   liter_price?: number | null;
   fuusto_price?: number | null;
   caag_price?: number | null;
+  created_at?: string | null;
+  updated_at?: string | null;
 };
 
-/**
- * Call this once on app startup (e.g. in app/layout.tsx useEffect)
- */
-export function initOilSellOptionsDb() {
-  db.execSync(`
-    CREATE TABLE IF NOT EXISTS oil_sell_options (
-      id INTEGER NOT NULL,
-      owner_id INTEGER NOT NULL,
-      oil_id INTEGER NOT NULL,
-      lot_id INTEGER,
-      oil_type TEXT,
-      truck_plate TEXT,
-      in_stock_l REAL NOT NULL DEFAULT 0,
-      in_stock_fuusto REAL NOT NULL DEFAULT 0,
-      in_stock_caag REAL NOT NULL DEFAULT 0,
-      currency TEXT,
-      liter_price REAL,
-      fuusto_price REAL,
-      caag_price REAL,
-      PRIMARY KEY (id, owner_id)
-    );
+type OilSellOptionRow = OilSellOption & {
+  owner_id: number;
+  dirty: number;
+  deleted: number;
+};
 
-    CREATE INDEX IF NOT EXISTS idx_oil_sell_options_owner
-      ON oil_sell_options(owner_id);
-  `);
+function ensureDb() {
+  initOilSellOptionsDb();
 }
 
 /**
- * Upsert rows coming from /diiwaanoil/sell-options into local SQLite.
- * `rows` should be the raw API items (OilSellOption from backend).
+ * Upsert options from server into local oilselloptions_all table.
+ * Called from:
+ *  - global sync (syncAllOilSellOptions)
+ *  - CreateWakaaladModal ONLINE fetch
  */
-export function upsertOilSellOptionsFromServer(rows: any[], ownerId: number) {
-  if (!rows || !rows.length) return;
+export function upsertOilSellOptionsFromServer(
+  options: OilSellOption[],
+  ownerId: number
+) {
+  if (!options?.length || !ownerId) return;
+  ensureDb();
 
   db.withTransactionSync(() => {
-    for (const r of rows) {
+    for (const o of options) {
       db.runSync(
         `
-        INSERT OR REPLACE INTO oil_sell_options (
+        INSERT INTO oilselloptions_all (
           id,
           owner_id,
           oil_id,
@@ -69,24 +59,52 @@ export function upsertOilSellOptionsFromServer(rows: any[], ownerId: number) {
           currency,
           liter_price,
           fuusto_price,
-          caag_price
+          caag_price,
+          created_at,
+          updated_at,
+          dirty,
+          deleted
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?,
+          0, 0
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-      `,
+        ON CONFLICT(id) DO UPDATE SET
+          owner_id        = excluded.owner_id,
+          oil_id          = excluded.oil_id,
+          lot_id          = excluded.lot_id,
+          oil_type        = excluded.oil_type,
+          truck_plate     = excluded.truck_plate,
+          in_stock_l      = excluded.in_stock_l,
+          in_stock_fuusto = excluded.in_stock_fuusto,
+          in_stock_caag   = excluded.in_stock_caag,
+          currency        = excluded.currency,
+          liter_price     = excluded.liter_price,
+          fuusto_price    = excluded.fuusto_price,
+          caag_price      = excluded.caag_price,
+          created_at      = COALESCE(excluded.created_at, created_at),
+          updated_at      = COALESCE(excluded.updated_at, updated_at),
+          dirty           = 0,
+          deleted         = 0;
+        `,
         [
-          r.id,
+          o.id,
           ownerId,
-          r.oil_id ?? r.id,
-          r.lot_id ?? null,
-          r.oil_type ?? '',
-          r.truck_plate ?? null,
-          Number(r.in_stock_l ?? 0),
-          Number(r.in_stock_fuusto ?? 0),
-          Number(r.in_stock_caag ?? 0),
-          r.currency ?? null,
-          r.liter_price ?? r.sell_price_per_l ?? null,
-          r.fuusto_price ?? null,
-          r.caag_price ?? null,
+          o.oil_id,
+          o.lot_id ?? null,
+          o.oil_type,
+          o.truck_plate ?? null,
+          o.in_stock_l ?? 0,
+          o.in_stock_fuusto ?? 0,
+          o.in_stock_caag ?? 0,
+          o.currency ?? null,
+          o.liter_price ?? null,
+          o.fuusto_price ?? null,
+          o.caag_price ?? null,
+          o.created_at ?? null,
+          o.updated_at ?? null,
         ]
       );
     }
@@ -94,105 +112,63 @@ export function upsertOilSellOptionsFromServer(rows: any[], ownerId: number) {
 }
 
 /**
- * Read sell options from local DB – used by CreateWakaaladModal
+ * What CreateWakaaladModal uses offline.
+ * Filters by owner_id (and deleted=0), optional "onlyAvailable".
  */
 export function getOilSellOptionsLocal(
   ownerId: number,
-  opts: { onlyAvailable?: boolean; limit?: number } = {}
-): OilSellOptionLocal[] {
-  const { onlyAvailable = true, limit = 200 } = opts;
+  opts?: { onlyAvailable?: boolean; limit?: number }
+): OilSellOption[] {
+  ensureDb();
 
-  const where: string[] = ['owner_id = ?'];
+  const limit = opts?.limit ?? 200;
   const params: any[] = [ownerId];
+  const where: string[] = ['owner_id = ? AND deleted = 0'];
 
-  if (onlyAvailable) {
-    where.push('in_stock_l > 0');
+  if (opts?.onlyAvailable) {
+    where.push('(in_stock_l > 0 OR in_stock_fuusto > 0 OR in_stock_caag > 0)');
   }
 
-  params.push(limit);
+  const sql = `
+    SELECT *
+    FROM oilselloptions_all
+    WHERE ${where.join(' AND ')}
+    ORDER BY datetime(created_at) DESC, id DESC
+    LIMIT ? OFFSET 0;
+  `;
 
-  const rows = db.getAllSync<OilSellOptionLocal>(
-    `
-      SELECT
-        id,
-        owner_id,
-        oil_id,
-        lot_id,
-        oil_type,
-        truck_plate,
-        in_stock_l,
-        in_stock_fuusto,
-        in_stock_caag,
-        currency,
-        liter_price,
-        fuusto_price,
-        caag_price
-      FROM oil_sell_options
-      WHERE ${where.join(' AND ')}
-      ORDER BY id DESC
-      LIMIT ?;
-    `,
-    params
-  );
-
-  return rows;
+  const rows = db.getAllSync<OilSellOptionRow>(sql, [...params, limit]);
+  return rows.map((r) => {
+    const { owner_id, dirty, deleted, ...rest } = r;
+    return rest;
+  });
 }
 
 /**
- * Optional helper: adjust local stock after creating a wakaalad
- * (so UI + offline cache stay in sync immediately).
+ * Adjust stock (in liters) when a wakaalad is created.
+ *
+ * NOTE: this uses oil_id (NOT the option id), matching how CreateWakaaladModal calls it:
+ *   applyOilSellOptionStockDelta(user.id, selected.oil_id ?? selected.id, -allocLiters);
  */
 export function applyOilSellOptionStockDelta(
   ownerId: number,
   oilId: number,
   deltaLiters: number
 ) {
-  if (!deltaLiters || !isFinite(deltaLiters)) return;
-
-  const row = db.getFirstSync<OilSellOptionLocal>(
-    `
-      SELECT
-        id,
-        owner_id,
-        oil_id,
-        lot_id,
-        oil_type,
-        truck_plate,
-        in_stock_l,
-        in_stock_fuusto,
-        in_stock_caag,
-        currency,
-        liter_price,
-        fuusto_price,
-        caag_price
-      FROM oil_sell_options
-      WHERE owner_id = ? AND oil_id = ?
-      LIMIT 1;
-    `,
-    [ownerId, oilId]
-  );
-
-  if (!row) return;
-
-  const newStockL = Math.max(0, (row.in_stock_l || 0) + deltaLiters);
-
-  const oilType = (row.oil_type || '').toLowerCase();
-  const fuustoCap =
-    oilType === 'petrol' ? 240 /* PETROL_FUUSTO_CAPACITY */ : 240 /* DEFAULT_CAPACITY.fuusto */;
-  const caagCap = 20;
-
-  const newFuusto = newStockL / fuustoCap;
-  const newCaag = newStockL / caagCap;
+  ensureDb();
 
   db.runSync(
     `
-      UPDATE oil_sell_options
-      SET
-        in_stock_l = ?,
-        in_stock_fuusto = ?,
-        in_stock_caag = ?
-      WHERE owner_id = ? AND oil_id = ?;
-    `,
-    [newStockL, newFuusto, newCaag, ownerId, oilId]
+    UPDATE oilselloptions_all
+    SET
+      in_stock_l = in_stock_l + ?,
+      dirty      = 1
+    WHERE owner_id = ? AND oil_id = ? AND deleted = 0;
+  `,
+    [deltaLiters, ownerId, oilId]
   );
 }
+
+// re-export init so layout.tsx import keeps working
+export { initOilSellOptionsDb } from './oilSellOptionsDb';
+

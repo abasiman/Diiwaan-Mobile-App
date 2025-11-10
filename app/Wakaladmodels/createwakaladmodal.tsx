@@ -22,6 +22,8 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import OilExtraCostModal from '../Shidaal/oilExtraCostModal';
+// add this import
+import { upsertLocalWakaaladSellOption } from '../dbform/wakaaladSellOptionsRepo';
 
 // local sell-options repo
 import {
@@ -406,87 +408,125 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
   }, [allocAmt, unit, selected?.oil_type, allocLiters]);
 
   async function handleSaveOpenExtras() {
-    if (!selected || !canSubmit || creating) return;
+  if (!selected || !canSubmit || creating) return;
 
-    if (!user?.id) {
-      showToast('Missing user – cannot save wakaalad');
-      return;
-    }
-
-    const prefillName = `${wkName.trim()} - wakaalad`;
-    const prefillQty = qtyBarrels;
-
-    const oilIdForExtras = selected.lot_id ? undefined : selected.oil_id ?? selected.id;
-    const lotIdForExtras = selected.lot_id ?? undefined;
-
-    const payload: WakaaladCreatePayload = {
-      oil_id: selected.oil_id ?? selected.id,
-      wakaalad_name: wkName.trim(),
-      allocate_liters: allocLiters,
-    };
-
-    try {
-      setCreating(true);
-
-      let wakaaladId: number | null = null;
-
-      if (online && token) {
-        // 🟢 ONLINE → direct API
-        const res = await api.post('/wakaalad_diiwaan', payload, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        wakaaladId = Number(res?.data?.id || 0) || null;
-        showToast('Wakaalad saved');
-      } else {
-        // 🔴 OFFLINE → queue for sync + create local shadow wakaalad in offline DB
-        await queueWakaaladFormForSync(user.id, payload);
-
-        const localWakaaladId = await insertLocalWakaaladFromForm({
-          ownerId: user.id,
-          oil_id: payload.oil_id,
-          oil_type: selected.oil_type,
-          wakaalad_name: payload.wakaalad_name,
-          allocate_liters: payload.allocate_liters,
-          date: new Date(),
-        });
-
-        wakaaladId = localWakaaladId;
-        showToast('Wakaalad saved offline – will sync when online');
-      }
-
-      onCreated?.(wakaaladId ?? 0);
-
-      // update local sell-options stock (both online & offline)
-      try {
-        applyOilSellOptionStockDelta(user.id, selected.oil_id ?? selected.id, -allocLiters);
-        const refreshed = getOilSellOptionsLocal(user.id, {
-          onlyAvailable: true,
-          limit: 200,
-        });
-        setOptions(refreshed);
-      } catch (e: any) {
-        console.warn('Failed to update local sell-options stock', e?.message || e);
-      }
-
-      // prime extras modal
-      setExtraOilId(oilIdForExtras);
-      setExtraLotId(lotIdForExtras);
-      setExtraPrefillName(prefillName);
-      setExtraPrefillQty(prefillQty);
-
-      setShowExtraCosts(true);
-
-      // reset form
-      setSelectedId(null);
-      setWkName('');
-      setAllocAmt('');
-      setUnit('fuusto');
-    } catch (e: any) {
-      showToast(String(e?.response?.data?.detail || e?.message || 'Unable to save wakaalad'));
-    } finally {
-      setCreating(false);
-    }
+  if (!user?.id) {
+    showToast('Missing user – cannot save wakaalad');
+    return;
   }
+
+  const prefillName = `${wkName.trim()} - wakaalad`;
+  const prefillQty = qtyBarrels;
+
+  const oilIdForExtras = selected.lot_id ? undefined : selected.oil_id ?? selected.id;
+  const lotIdForExtras = selected.lot_id ?? undefined;
+
+  const payload: WakaaladCreatePayload = {
+    oil_id: selected.oil_id ?? selected.id,
+    wakaalad_name: wkName.trim(),
+    allocate_liters: allocLiters,
+  };
+
+  try {
+    setCreating(true);
+
+    let wakaaladId: number | null = null;
+
+    if (online && token) {
+      // 🟢 ONLINE → direct API
+      const res = await api.post('/wakaalad_diiwaan', payload, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      wakaaladId = Number(res?.data?.id || 0) || null;
+      showToast('Wakaalad saved');
+    } else {
+      // 🔴 OFFLINE → queue for sync + create local shadow wakaalad in offline DB
+      await queueWakaaladFormForSync(user.id, payload);
+
+      const localWakaaladId = await insertLocalWakaaladFromForm({
+        ownerId: user.id,
+        oil_id: payload.oil_id,
+        oil_type: selected.oil_type,
+        wakaalad_name: payload.wakaalad_name,
+        allocate_liters: payload.allocate_liters,
+        date: new Date(),
+      });
+
+      wakaaladId = localWakaaladId;
+      showToast('Wakaalad saved offline – will sync when online');
+    }
+
+    // 🔹 Make this wakaalad immediately available in invoice (wakaalad_sell_options), even offline
+    if (wakaaladId != null && wakaaladId !== 0) {
+      const fuustoCapacity = fuustoCap(selected.oil_type);
+      const caagCapacity = CAAG_L;
+
+      // derive liter price if needed
+      let literPrice: number | null = selected.liter_price ?? null;
+      if (literPrice == null && selected.fuusto_price != null && fuustoCapacity > 0) {
+        literPrice = selected.fuusto_price / fuustoCapacity;
+      }
+      if (literPrice == null && selected.caag_price != null && caagCapacity > 0) {
+        literPrice = selected.caag_price / caagCapacity;
+      }
+
+      const fuustoPrice =
+        selected.fuusto_price ??
+        (literPrice != null ? literPrice * fuustoCapacity : null);
+      const caagPrice =
+        selected.caag_price ??
+        (literPrice != null ? literPrice * caagCapacity : null);
+
+      upsertLocalWakaaladSellOption({
+        ownerId: user.id,
+        wakaalad_id: wakaaladId, // server ID (online) or negative local ID (offline)
+        oil_id: selected.oil_id ?? selected.id,
+        oil_type: selected.oil_type,
+        wakaalad_name: wkName.trim(),
+        truck_plate: selected.truck_plate ?? null,
+        currency: selected.currency ?? null,
+        in_stock_l: allocLiters, // all allocated liters start as in-stock
+        liter_price: literPrice,
+        fuusto_price: fuustoPrice,
+        caag_price: caagPrice,
+        fuusto_capacity_l: fuustoCapacity,
+        caag_capacity_l: caagCapacity,
+      });
+    }
+
+    onCreated?.(wakaaladId ?? 0);
+
+    // update local sell-options stock (both online & offline)
+    try {
+      applyOilSellOptionStockDelta(user.id, selected.oil_id ?? selected.id, -allocLiters);
+      const refreshed = getOilSellOptionsLocal(user.id, {
+        onlyAvailable: true,
+        limit: 200,
+      });
+      setOptions(refreshed);
+    } catch (e: any) {
+      console.warn('Failed to update local sell-options stock', e?.message || e);
+    }
+
+    // prime extras modal
+    setExtraOilId(oilIdForExtras);
+    setExtraLotId(lotIdForExtras);
+    setExtraPrefillName(prefillName);
+    setExtraPrefillQty(prefillQty);
+
+    setShowExtraCosts(true);
+
+    // reset form
+    setSelectedId(null);
+    setWkName('');
+    setAllocAmt('');
+    setUnit('fuusto');
+  } catch (e: any) {
+    showToast(String(e?.response?.data?.detail || e?.message || 'Unable to save wakaalad'));
+  } finally {
+    setCreating(false);
+  }
+}
 
   const handleCloseAll = () => {
     if (showExtraCosts) return;

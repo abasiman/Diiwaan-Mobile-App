@@ -67,7 +67,46 @@ export async function getWakaaladLocal({
     endDateIso: endDate ? endDate.toISOString() : undefined,
   });
 
-  return rows.map(
+  // 🔹 DEDUPE: collapse local shadow (-id) + server (+id) into ONE row, preferring server.
+  const byKey = new Map<string, any>();
+
+  for (const row of rows) {
+    const key = [
+      row.oil_id,
+      String(row.wakaalad_name ?? '').trim().toLowerCase(),
+      String(row.date ?? '').slice(0, 10), // yyyy-mm-dd
+    ].join('|');
+
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, row);
+      continue;
+    }
+
+    const existingId = Number(existing.id ?? 0);
+    const thisId = Number(row.id ?? 0);
+
+    // Prefer positive (server) ID over negative (local shadow)
+    if (existingId < 0 && thisId > 0) {
+      byKey.set(key, row);
+    } else if (thisId > 0 && existingId > 0 && thisId > existingId) {
+      // both positive: keep the newer id, just in case
+      byKey.set(key, row);
+    }
+    // else keep existing
+  }
+
+  const deduped = Array.from(byKey.values());
+
+  // keep same ordering as before: newest date first, then id desc
+  deduped.sort((a, b) => {
+    const ta = a.date ? new Date(a.date).getTime() : 0;
+    const tb = b.date ? new Date(b.date).getTime() : 0;
+    if (tb !== ta) return tb - ta;
+    return Number(b.id || 0) - Number(a.id || 0);
+  });
+
+  return deduped.map(
     (row: any): WakaaladRead => ({
       id: Number(row.id),
       oil_id: Number(row.oil_id),
@@ -91,6 +130,51 @@ export async function getWakaaladLocal({
     })
   );
 }
+
+
+
+
+
+
+
+/**
+ * Apply a SALE locally (decrease stock, increase sold) so the
+ * wakaalad dashboard reflects it immediately while offline.
+ *
+ * liters is PHYSICAL liters taken from stock (estimatedLiters).
+ */
+export async function applyLocalWakaaladSale(
+  ownerId: number,
+  wakaaladId: number,
+  liters: number
+): Promise<void> {
+  if (!ownerId || !wakaaladId || !(liters > 0)) return;
+
+  // Load all wakaalad rows for this owner and find the one by ID
+  const rows = await listWakaaladRows(ownerId, {} as any);
+  const row: any | undefined = rows.find(
+    (r: any) => Number(r.id) === Number(wakaaladId)
+  );
+  if (!row) return; // nothing to update (will be fixed on next sync)
+
+  const currentStock = Number(row.wakaal_stock ?? 0);
+  const currentSold = Number(row.wakaal_sold ?? 0);
+
+  const nextStock = Math.max(0, currentStock - liters);
+  const nextSold = currentSold + liters;
+
+  const nextRow = {
+    ...row,
+    wakaal_stock: nextStock,
+    wakaal_sold: nextSold,
+    stock_liters: nextStock,
+    sold_liters: nextSold,
+  };
+
+  await upsertWakaaladRows(ownerId, [nextRow]);
+}
+
+
 
 /**
  * Create a local “shadow” wakaalad row when the user creates a wakaalad OFFLINE.

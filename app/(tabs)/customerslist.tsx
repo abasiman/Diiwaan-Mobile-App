@@ -64,6 +64,57 @@ const TOP_GAP = 80;
 const SHEET_H = Math.min(SCREEN_H - TOP_GAP, SCREEN_H * 0.9);
 const MINI_SHEET_H = 180;
 
+
+const mergeCustomersByName = (rows: Customer[]): Customer[] => {
+  const map = new Map<string, Customer>();
+
+  const getTime = (c: Customer) => {
+    const t = c.updated_at || c.created_at || '';
+    const d = new Date(t);
+    return isNaN(d.getTime()) ? 0 : d.getTime();
+  };
+
+  for (const c of rows) {
+    const key = (c.name || '').trim().toLowerCase();
+    if (!key) continue;
+
+    const existing = map.get(key);
+    if (!existing) {
+      map.set(key, { ...c });
+      continue;
+    }
+
+    const existingIsReal = existing.id > 0;
+    const currentIsReal = c.id > 0;
+
+    let preferred: Customer;
+
+    if (existingIsReal && !currentIsReal) {
+      preferred = existing;
+    } else if (!existingIsReal && currentIsReal) {
+      preferred = c;
+    } else {
+      // both real or both temp → prefer newer
+      preferred = getTime(c) >= getTime(existing) ? c : existing;
+    }
+
+    map.set(key, {
+      ...preferred,
+      // keep nicer phone/address from either row
+      phone: existing.phone || c.phone || null,
+      address: existing.address || c.address || null,
+      // ❗ balances come ONLY from preferred, no summing
+      amount_due: preferred.amount_due,
+      amount_due_usd: preferred.amount_due_usd,
+      amount_due_native: preferred.amount_due_native,
+      amount_paid: preferred.amount_paid,
+    });
+  }
+
+  return Array.from(map.values());
+};
+
+
 export default function CustomersList() {
   const { token, user } = useAuth();
   const router = useRouter();
@@ -253,7 +304,7 @@ export default function CustomersList() {
 
         console.log('[CustomersList] getCustomersLocal returned', data.length, 'rows');
 
-        // 🔹 NEW: apply pending offline payments so balances match CustomerInvoicesPage
+        // 🔹 apply pending offline payments so balances match CustomerInvoicesPage
         let adjusted = data;
         try {
           const pending = getPendingPaymentsLocal(user.id, 500);
@@ -292,27 +343,12 @@ export default function CustomersList() {
           );
         }
 
-        // 🔹 NEW: de-duplicate customers by (name + phone) so offline + server rows merge
-        const dedupMap = new Map<string, Customer>();
-        for (const c of adjusted) {
-          const key =
-            `${(c.name || '').trim().toLowerCase()}|${(c.phone || '').trim()}`;
-          // newest row wins (later rows overwrite earlier)
-          dedupMap.set(key, c);
-        }
-        const deduped = Array.from(dedupMap.values());
+        // 🔹 merge duplicate customers by NAME so offline + server rows collapse
+        const dedupedPage = mergeCustomersByName(adjusted);
 
         setCustomers((prev) => {
-          if (reset) return deduped;
-          // when loading more, still dedupe with existing ones
-          const combined = [...prev, ...deduped];
-          const outMap = new Map<string, Customer>();
-          for (const c of combined) {
-            const key =
-              `${(c.name || '').trim().toLowerCase()}|${(c.phone || '').trim()}`;
-            outMap.set(key, c);
-          }
-          return Array.from(outMap.values());
+          if (reset) return dedupedPage;
+          return mergeCustomersByName([...prev, ...dedupedPage]);
         });
 
         setHasMore(data.length === limit);
