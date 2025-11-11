@@ -3,75 +3,63 @@ import * as NavigationBar from 'expo-navigation-bar';
 import { Redirect, Slot, usePathname } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import * as Updates from 'expo-updates';
-// app/layout.tsx
 
-import { initIncomeStatementDb } from './offlineincomestatement/incomeStatementDb';
 
+
+import NetInfo from '@react-native-community/netinfo';
 import React, { useCallback, useEffect, useLayoutEffect } from 'react';
 import { AppState, Platform, Text, View } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
-import { initOilSellOptionsDb } from './WakaaladOffline/oilSellOptionsRepo';
 
-import { initMeProfileDb } from './profile/meProfileDb';
-import { syncMeProfile } from './profile/meProfileSync';
-
-
-import { syncPendingPayments } from './ManageInvoice/paymentOfflineRepo';
-import { syncPendingOilReprices } from './dbform/oilRepriceOfflineRepo';
-
-import { initOilModalDb } from './OilModalOffline/oilModalDb';
-import { syncPendingOilModalForms } from './OilModalOffline/oilModalSync';
-
-import { initPaymentOfflineDb } from './ManageInvoice/paymentOfflineRepo';
-
-import { syncPendingVendorPayments } from './offlinecreatevendorpayment/vendorPaymentCreateSync';
-
-
-import { getVendorBillsWithSync } from './OilPurchaseOffline/oilpurchasevendorbillsync';
-// at top
-import { syncOilSummaryAndWakaaladStats } from './OilPurchaseOffline/oilSummaryStatsSync';
-
-import { initVendorPaymentDb } from './OilPurchaseOffline/vendorPaymentDb';
-import { getWakaaladMovementScreenWithSync } from './wakaaladMovementoffline/wakaaladMovementScreenSync';
-
-import NetInfo from '@react-native-community/netinfo';
-import { initVendorPaymentsScreenDb } from './vendorPaymentTransactionsOffline/vendorPaymentsScreenDb';
-import { getVendorPaymentsScreenWithSync } from './vendorPaymentTransactionsOffline/vendorPaymentsScreenSync';
-import { initWakaaladActionsOfflineDb } from './wakaaladActionsOffline/wakaaladActionsOfflineDb';
-import { initWakaaladMovementScreenDb } from './wakaaladMovementoffline/wakaaladMovementScreenDb';
 
 import { AuthProvider, useAuth } from '../src/context/AuthContext';
 
+// 🔹 DB init imports
+import { initPaymentOfflineDb } from './ManageInvoice/paymentOfflineRepo';
+import { initOilModalDb } from './OilModalOffline/oilModalDb';
+import { initVendorPaymentDb } from './OilPurchaseOffline/vendorPaymentDb';
+import { initOilSellOptionsDb } from './WakaaladOffline/oilSellOptionsRepo';
+import { initWakaaladDb } from './WakaaladOffline/wakaaladOfflineDb';
 import { initCustomerInvoiceDb } from './db/customerinvoicedb';
 import { initCustomerLedgerDb } from './db/customerledgerdb';
 import { initDb } from './db/db';
-import { initOilSalesPageDb } from './db/oilSalesPageDb';
-
-import { syncPendingOilSales } from './dbform/invocieoilSalesOfflineRepo';
-import { initWakaaladSellOptionsDb, syncAllWakaaladSellOptions } from './dbform/wakaaladSellOptionsRepo';
-import { syncPendingOilSaleReversals } from './dbsalereverse/oilSaleReverseOfflineRepo';
-
-
-import { syncAllOilSellOptions } from './WakaaladOffline/oilSellOptionsSync';
-import { initWakaaladDb } from './WakaaladOffline/wakaaladOfflineDb';
-import { syncWakaaladFromServer } from './WakaaladOffline/wakaaladSync';
-
-import { syncIncomeStatement } from './offlineincomestatement/incomeStatementSync';
+import { initIncomeStatementDb } from './offlineincomestatement/incomeStatementDb';
+import { initOilSaleFormDb } from './oilsaleformoffline/oilSaleFormDb';
+import { initMeProfileDb } from './profile/meProfileDb';
+import { initVendorPaymentsScreenDb } from './vendorPaymentTransactionsOffline/vendorPaymentsScreenDb';
+import { initWakaaladActionsOfflineDb } from './wakaaladActionsOffline/wakaaladActionsOfflineDb';
+import { initWakaaladMovementScreenDb } from './wakaaladMovementoffline/wakaaladMovementScreenDb';
 import { initWakaaladFormDb } from './wakaaladformoffline/wakaaladFormDb';
+
+import { initExtraCostsDb } from './ExtraCostsOffline/extraCostsDb';
+import { initExtraCostCreateDb } from './FormExtraCostsOffline/extraCostCreateDb';
+
+import { initWakaaladSellOptionsDb } from './dbform/wakaaladSellOptionsRepo';
+
+import { initOilSalesDashboardDb } from './oilsalesdashboardoffline/oilsalesdashboarddb';
+
+// 🔹 Sync imports
+import { syncAllExtraCosts } from './ExtraCostsOffline/extraCostsSync';
+import { syncPendingOilExtraCosts } from './FormExtraCostsOffline/extraCostCreateSync';
+import { syncPendingPayments } from './ManageInvoice/paymentOfflineRepo';
+import { syncPendingOilModalForms } from './OilModalOffline/oilModalSync';
+import { syncOilSummaryAndWakaaladStats } from './OilPurchaseOffline/oilSummaryStatsSync';
+import { syncAllOilSellOptions } from './WakaaladOffline/oilSellOptionsSync';
+import { syncWakaaladFromServer } from './WakaaladOffline/wakaaladSync';
+import { syncAllOilSales } from './db/oilSalesPageSync';
+import { syncPendingOilReprices } from './dbform/oilRepriceOfflineRepo';
+import { syncAllWakaaladSellOptions } from './dbform/wakaaladSellOptionsRepo';
+import { syncPendingOilSaleReversals } from './dbsalereverse/oilSaleReverseOfflineRepo';
+import { syncPendingVendorPayments } from './offlinecreatevendorpayment/vendorPaymentCreateSync';
+import { syncIncomeStatement } from './offlineincomestatement/incomeStatementSync';
+import { syncMeProfile } from './profile/meProfileSync';
+import { syncPendingWakaaladActions } from './wakaaladActionsOffline/wakaaladActionsSync';
 import { syncPendingWakaaladForms } from './wakaaladformoffline/wakaaladFormSync';
 
-
-import { syncAllOilSales } from './db/oilSalesPageSync';
-
-// 🔹 NEW: offline extra-costs cache + create-queue
-import { initExtraCostsDb } from './ExtraCostsOffline/extraCostsDb';
-
-import { syncAllExtraCosts } from './ExtraCostsOffline/extraCostsSync';
-import { initExtraCostCreateDb } from './FormExtraCostsOffline/extraCostCreateDb';
-import { syncPendingWakaaladActions } from './wakaaladActionsOffline/wakaaladActionsSync';
-
-
-import { syncPendingOilExtraCosts } from './FormExtraCostsOffline/extraCostCreateSync';
+import { getVendorBillsWithSync } from './OilPurchaseOffline/oilpurchasevendorbillsync';
+import { syncPendingOilSaleForms } from './oilsaleformoffline/oilSaleFormSync';
+import { getVendorPaymentsScreenWithSync } from './vendorPaymentTransactionsOffline/vendorPaymentsScreenSync';
+import { getWakaaladMovementScreenWithSync } from './wakaaladMovementoffline/wakaaladMovementScreenSync';
 
 const BRAND_BLUE = '#0B2447';
 
@@ -81,10 +69,10 @@ export default function RootLayout() {
     initDb();
     initCustomerInvoiceDb();
     initCustomerLedgerDb();
-    initOilSalesPageDb();
-    initIncomeStatementDb(); // 👈 NEW
-    
-    // 🔹 NEW: vendor payments screen cache
+
+    initIncomeStatementDb();
+
+    // vendor payments screen cache
     initVendorPaymentsScreenDb();
 
     initWakaaladSellOptionsDb();
@@ -92,25 +80,25 @@ export default function RootLayout() {
     initOilSellOptionsDb();
     initWakaaladFormDb();
 
+     // oil sale form
+     initOilSaleFormDb();
 
-     // 🔹 wakaalad movements screen cache
-  initWakaaladMovementScreenDb();
+    // wakaalad movements screen cache
+    initWakaaladMovementScreenDb();
 
-     // 🔹 NEW: oil create offline queue
+    // oil create offline queue
     initOilModalDb();
 
-
-   
-
     initVendorPaymentDb();
-    // 🔹 NEW: extra-costs offline tables
-    initExtraCostsDb();        // cache used by ExtraCostsPage
-    initExtraCostCreateDb();   // queue for offline-created extra-costs
 
+    // extra-costs offline tables
+    initExtraCostsDb();      // cache used by ExtraCostsPage
+    initExtraCostCreateDb(); // queue for offline-created extra-costs
 
-     initWakaaladActionsOfflineDb();
-     initPaymentOfflineDb();
-      initMeProfileDb();
+    initWakaaladActionsOfflineDb();
+    initPaymentOfflineDb();
+    initMeProfileDb();
+    initOilSalesDashboardDb();
   }, []);
 
   return (
@@ -122,7 +110,7 @@ export default function RootLayout() {
       <AuthProvider>
         <OTAUpdates />
         <GlobalSync />          {/* full pull/push once after login */}
-        <OfflineOilSaleSync />  {/* pending queue sync on connectivity */}
+        <OfflineOilSaleSync />  {/* pending queue sync on connectivity + foreground */}
         <GuardedNavigator />
       </AuthProvider>
     </SafeAreaProvider>
@@ -153,10 +141,7 @@ function GlobalSync() {
       const now = new Date();
       const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
 
-      const run = async (
-        label: string,
-        fn: () => Promise<unknown> | unknown
-      ) => {
+      const run = async (label: string, fn: () => Promise<unknown> | unknown) => {
         try {
           await fn();
         } catch (e) {
@@ -166,16 +151,12 @@ function GlobalSync() {
 
       try {
         // income statement first, so it's always prefetched
-        await run('syncIncomeStatement', () =>
-          syncIncomeStatement(ownerId, token)
-        );
+        await run('syncIncomeStatement', () => syncIncomeStatement(ownerId, token));
 
         await run('syncPendingOilModalForms', () =>
           syncPendingOilModalForms(ownerId, token)
         );
-        await run('syncPendingOilSales', () =>
-          syncPendingOilSales(token, ownerId)
-        );
+    
         await run('syncPendingOilReprices', () =>
           syncPendingOilReprices(token, ownerId)
         );
@@ -206,6 +187,12 @@ function GlobalSync() {
           syncPendingWakaaladForms(ownerId, token)
         );
 
+
+
+        await run('syncPendingOilSaleForms', () =>
+          syncPendingOilSaleForms(ownerId, token)
+        ); // 👈 NEW
+
         await run('syncAllOilSales', () =>
           syncAllOilSales(ownerId, token)
         );
@@ -226,9 +213,7 @@ function GlobalSync() {
           })
         );
 
-
         await run('syncMeProfile', () => syncMeProfile(token));
-
 
         await run('getVendorBillsWithSync', () =>
           getVendorBillsWithSync({ token, ownerId, force: true })
@@ -260,10 +245,11 @@ function GlobalSync() {
   return null;
 }
 
-/* ----------------------------- Global offline queue sync on connectivity ----------------------------- */
+/* ----------------------------- Global offline queue sync on connectivity + foreground ----------------------------- */
 function OfflineOilSaleSync() {
   const { token, user } = useAuth();
   const [online, setOnline] = React.useState(true);
+  const appState = React.useRef(AppState.currentState);
 
   // track connectivity
   useEffect(() => {
@@ -274,38 +260,76 @@ function OfflineOilSaleSync() {
     return () => sub();
   }, []);
 
-  // whenever we are online + authenticated → push pending queues
-  useEffect(() => {
+  // helper that actually pushes all queues
+  const runSync = React.useCallback(() => {
     if (!online || !token || !user?.id) return;
 
-    // invoice oil sales
-    /* syncPendingOilSales(token, user.id).catch((e) =>
-      console.warn('syncPendingOilSales failed', e)
-    ); */
+    const ownerId = user.id;
 
-
-     // 🔹 NEW: offline reprices
-    syncPendingOilReprices(token, user.id).catch((e) =>
+    // 🔹 offline reprices
+    syncPendingOilReprices(token, ownerId).catch((e) =>
       console.warn('syncPendingOilReprices failed', e)
     );
 
     // 🔹 extra-costs create queue
-    syncPendingOilExtraCosts(token, user.id).catch((e) =>
+    syncPendingOilExtraCosts(token, ownerId).catch((e) =>
       console.warn('syncPendingOilExtraCosts failed', e)
     );
 
-    // 🔹 NEW: oil create modal forms (single / both)
-    syncPendingOilModalForms(user.id, token).catch((e) =>
+    // 🔹 oil create modal forms (single / both)
+    syncPendingOilModalForms(ownerId, token).catch((e) =>
       console.warn('syncPendingOilModalForms failed', e)
     );
 
-
-
-     // 💳 NEW: payments queue
-    syncPendingPayments(token, user.id).catch((e) =>
+    // 💳 payments queue
+    syncPendingPayments(token, ownerId).catch((e) =>
       console.warn('syncPendingPayments failed', e)
     );
+
+    // 🟣 wakaalad actions queue
+    syncPendingWakaaladActions(token, ownerId).catch((e) =>
+      console.warn('syncPendingWakaaladActions failed', e)
+    );
+
+    // 🟣 wakaalad forms queue
+    syncPendingWakaaladForms(ownerId, token).catch((e) =>
+      console.warn('syncPendingWakaaladForms failed', e)
+    );
+
+    // 🟣 vendor payments queue
+    syncPendingVendorPayments(token, ownerId).catch((e) =>
+      console.warn('syncPendingVendorPayments failed', e)
+    );
+
+    // 🟣 oil sale reversals (if created offline)
+    syncPendingOilSaleReversals(token, ownerId).catch((e) =>
+      console.warn('syncPendingOilSaleReversals failed', e)
+    );
+
+    // 🟣 NEW: offline oil sale forms (cashsale/invoice)
+    syncPendingOilSaleForms(ownerId, token).catch((e) =>
+      console.warn('syncPendingOilSaleForms failed', e)
+    );
   }, [online, token, user?.id]);
+
+  // ✅ when connectivity becomes online → sync
+  useEffect(() => {
+    if (online) runSync();
+  }, [online, runSync]);
+
+  // when app comes to foreground → sync again
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (nextState) => {
+      const prev = appState.current;
+      appState.current = nextState;
+
+      if (prev.match(/inactive|background/) && nextState === 'active') {
+        runSync();
+      }
+    });
+
+    return () => sub.remove();
+  }, [runSync]);
 
   return null;
 }
@@ -416,7 +440,9 @@ class Boundary extends React.Component<{ children: React.ReactNode }, { err?: an
     console.error('Render error componentStack:\n', info?.componentStack);
   }
   render() {
-    if (this.state.err) return <Text style={{ padding: 12, color: 'red' }}>Render error</Text>;
+    if (this.state.err) {
+      return <Text style={{ padding: 12, color: 'red' }}>Render error</Text>;
+    }
     return this.props.children;
   }
 }

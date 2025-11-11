@@ -166,7 +166,25 @@ export function getWakaaladSellOptionsLocal(
     params
   );
 
-  return rows.map((r) => ({
+  // 🔹 DEDUPE: group by (oil_type, wakaalad_name, truck_plate), keep newest updated_at
+  const map = new Map<string, WakaaladSellOptionRow>();
+
+  for (const r of rows) {
+    const key = `${(r.oil_type || '').toLowerCase()}|${(r.wakaalad_name || '').toLowerCase()}|${(r.truck_plate || '').toLowerCase()}`;
+    const existing = map.get(key);
+    if (!existing) {
+      map.set(key, r);
+      continue;
+    }
+
+    if (new Date(r.updated_at).getTime() > new Date(existing.updated_at).getTime()) {
+      map.set(key, r);
+    }
+  }
+
+  const deduped = Array.from(map.values());
+
+  return deduped.map((r) => ({
     wakaalad_id: r.wakaalad_id,
     oil_id: r.oil_id,
     oil_type: r.oil_type,
@@ -183,7 +201,7 @@ export function getWakaaladSellOptionsLocal(
 }
 
 /**
- * 🔹 NEW: Insert/Upsert a single wakaalad sell-option locally.
+ * 🔹 Insert/Upsert a single wakaalad sell-option locally.
  * Use this right after creating a wakaalad (online or offline) so
  * getWakaaladSellOptionsLocal() can see it immediately.
  */

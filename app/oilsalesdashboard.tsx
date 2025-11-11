@@ -1,16 +1,17 @@
+// oilsalesdashboard.tsx
 
-//oilsalespage.tsx
-
-import {
-  getOilSalesSummaryLocal,
-  upsertOilSalesFromServer,
-  type OilSaleRead,
-  type OilSaleSummaryResponse,
-  type TotalsPayload,
-} from '@/app/db/oilSalesPageRepo';
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 import { AntDesign, Feather, MaterialCommunityIcons } from '@expo/vector-icons';
+
+import {
+  getOilSalesSummaryLocal,
+  getPendingOilSalesLocalForDisplay,
+  type OilSaleRead,
+  type OilSaleWithMeta,
+  type TotalsPayload,
+} from './oilsalesdashboardoffline/oilsalesdashboardrepo';
+
 import DateTimePicker from '@react-native-community/datetimepicker';
 import NetInfo from '@react-native-community/netinfo';
 import dayjs from 'dayjs';
@@ -28,7 +29,6 @@ import {
   ActivityIndicator,
   Alert,
   BackHandler,
-  Dimensions,
   FlatList,
   Modal,
   Platform,
@@ -41,7 +41,8 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { getPendingOilSalesLocalForDisplay, type PendingOilSaleLocal, } from './dbform/invocieoilSalesOfflineRepo';
+import { syncOilSalesSummaryFromServer } from './oilsalesdashboardoffline/oilsalesdashboardsync';
+
 import EditOilSaleModal from './Shidaal/editoilsalemodal';
 import ReverseOilSaleModal from './Shidaal/oilsalerevemodal';
 
@@ -92,13 +93,10 @@ const unitCapacity = (
   return 1;
 };
 
-/* Extra type: normal sale + optional pending meta */
-type OilSaleWithMeta = OilSaleRead & { pending?: boolean; local_id?: number };
-
 /* ======================= Visual helpers ======================= */
 const getTypeVisuals = (
-  oil: string,
-  status: OilSaleRead['payment_status']
+  oil?: string | null,
+  status?: string | null
 ) => {
   const o = (oil || '').toLowerCase();
   const base = {
@@ -141,10 +139,11 @@ const getTypeVisuals = (
     : o.includes('petrol')
     ? base.petrol
     : base.default;
+  const s = (status || '').toLowerCase();
   const amountColor =
-    status === 'paid'
+    s === 'paid'
       ? '#10B981'
-      : status === 'partial'
+      : s === 'partial'
       ? '#F59E0B'
       : '#111827';
   return { ...tone, amountColor };
@@ -198,7 +197,7 @@ function ReceiptModal({
 }: {
   visible: boolean;
   onClose: () => void;
-  sale: OilSaleRead | null;
+  sale: OilSaleWithMeta | null;
   onEdit: () => void;
   onAskDelete: () => void;
   onOpenReverse: () => void;
@@ -216,9 +215,7 @@ function ReceiptModal({
       ? sale.price_per_l * unitCapacity(unitName, sale.liters_sold)
       : null);
   const subTotal =
-    (sale.total_native ?? 0) -
-    (sale.tax_native ?? 0) +
-    (sale.discount_native ?? 0);
+    (sale.total_native ?? 0) - (sale.tax_native ?? 0) + (sale.discount_native ?? 0);
   const subtotalUSD =
     !isUSD && sale.fx_rate_to_usd && sale.fx_rate_to_usd > 0
       ? subTotal / sale.fx_rate_to_usd
@@ -765,7 +762,6 @@ function ExportModal({
 }
 
 /* ======================= Main Page ======================= */
-const { width } = Dimensions.get('window');
 
 export default function OilSalesPage() {
   const insets = useSafeAreaInsets();
@@ -782,7 +778,7 @@ export default function OilSalesPage() {
 
   const [items, setItems] = useState<OilSaleRead[]>([]);
   const [totals, setTotals] = useState<TotalsPayload | null>(null);
-  const [pendingItems, setPendingItems] = useState<PendingOilSaleLocal[]>([]);
+  const [pendingItems, setPendingItems] = useState<OilSaleWithMeta[]>([]);
 
   const [selected, setSelected] = useState<OilSaleWithMeta | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -814,7 +810,6 @@ export default function OilSalesPage() {
 
   const pathname = usePathname();
   const router = useRouter();
-  const API_DATE_FMT = 'YYYY-MM-DD';
 
   // Connectivity
   useEffect(() => {
@@ -833,15 +828,6 @@ export default function OilSalesPage() {
     setError(null);
     setLoading(true);
 
-    // same logical date range for both API + local
-    const startApi = dayjs(dateRange.startDate)
-      .startOf('day')
-      .format(API_DATE_FMT);
-    const endApi = dayjs(dateRange.endDate)
-      .add(1, 'day')
-      .startOf('day')
-      .format(API_DATE_FMT);
-
     const fromISO = dayjs(dateRange.startDate)
       .startOf('day')
       .toISOString();
@@ -850,79 +836,55 @@ export default function OilSalesPage() {
       .toISOString();
 
     try {
-      // ONLINE → API + cache to SQLite
+      // 1) If online, pull summary from server and cache locally
       if (online && token) {
-        const res = await api.get<OilSaleSummaryResponse>(
-          '/oilsale/summary',
-          {
-            headers: authHeader,
-            params: {
-              limit: 200,
-              order: 'created_desc',
-              start: `${startApi}T00:00:00`,
-              end: `${endApi}T00:00:00`,
-            },
-          }
-        );
-
-        const data = res.data;
-        setItems(Array.isArray(data?.items) ? data.items : []);
-        setTotals(data?.totals || null);
-
-        // cache to local DB for offline use
-        upsertOilSalesFromServer(data, user.id);
-      } else {
-        // OFFLINE (or no token) → purely local
-        const local = getOilSalesSummaryLocal(user.id, {
-          fromISO,
-          toISO,
-          limit: 200,
-        });
-        setItems(local.items);
-        setTotals(local.totals);
+        try {
+          await syncOilSalesSummaryFromServer({
+            token,
+            ownerId: user.id,
+            startDate: dateRange.startDate,
+            endDate: dateRange.endDate,
+          });
+        } catch (e) {
+          console.warn(
+            'syncOilSalesSummaryFromServer failed',
+            e
+          );
+        }
       }
-    } catch (e: any) {
-      // Any error: fallback to local cache
-      try {
-        const local = getOilSalesSummaryLocal(user.id, {
-          fromISO,
-          toISO,
-          limit: 200,
-        });
-        setItems(local.items);
-        setTotals(local.totals);
-        setError(null);
-      } catch (err: any) {
-        setError(
-          err?.message ||
-            e?.response?.data?.detail ||
-            'Failed to load oil sales from local DB.'
-        );
-      }
-    }
 
-    // Always also pull any pending offline sales for this range.
-    try {
-      const pending = getPendingOilSalesLocalForDisplay(user.id, {
-        startISO: fromISO,
-        endISO: toISO,
+      // 2) Always read from local DB
+      const local = getOilSalesSummaryLocal(user.id, {
+        fromISO,
+        toISO,
         limit: 200,
       });
-      setPendingItems(pending);
-    } catch (e) {
-      console.warn('getPendingOilSalesLocalForDisplay failed', e);
+      setItems(local.items);
+      setTotals(local.totals);
+      setError(null);
+
+      // 3) Pending offline sales (still unsynced)
+      try {
+        const pending = await getPendingOilSalesLocalForDisplay(
+          user.id
+        );
+        setPendingItems(pending);
+      } catch (e) {
+        console.warn(
+          'getPendingOilSalesLocalForDisplay failed',
+          e
+        );
+        setPendingItems([]);
+      }
+    } catch (e: any) {
+      setError(
+        e?.message || 'Failed to load oil sales from local DB.'
+      );
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [
-    authHeader,
-    dateRange,
-    online,
-    token,
-    user?.id,
-    API_DATE_FMT,
-  ]);
+  }, [user?.id, token, dateRange, online]);
 
   useEffect(() => {
     fetchSummary();
@@ -937,11 +899,13 @@ export default function OilSalesPage() {
     }
   }, [fetchSummary]);
 
-  // Combine normal + pending offline items for display
   const combinedItems: OilSaleWithMeta[] = useMemo(() => {
     const base: OilSaleWithMeta[] = items.map((it) => ({ ...it }));
-    const pend: OilSaleWithMeta[] = pendingItems.map((p) => ({ ...p }));
-    const all = [...pend, ...base];
+    const pend: OilSaleWithMeta[] = pendingItems.map((p) => ({
+      ...p,
+      pending: true,
+    }));
+    const all = [...base, ...pend];
 
     all.sort((a, b) => {
       const aTime = new Date(a.created_at).getTime();
@@ -1040,7 +1004,9 @@ export default function OilSalesPage() {
         lot: 0,
       };
     filteredItems.forEach((r) => {
-      if (counts[r.unit_type] != null) counts[r.unit_type] += 1;
+      if (counts[r.unit_type as 'liters' | 'fuusto' | 'caag' | 'lot'] != null) {
+        counts[r.unit_type as 'liters' | 'fuusto' | 'caag' | 'lot'] += 1;
+      }
     });
     const labels: string[] = [];
     (['liters', 'fuusto', 'caag', 'lot'] as const).forEach(
@@ -1865,11 +1831,10 @@ export default function OilSalesPage() {
         visible={editOpen}
         onClose={() => setEditOpen(false)}
         token={token}
-        
         sale={selected}
         onSuccess={(updated) => {
           setEditOpen(false);
-          setSelected(updated);
+          setSelected(updated as OilSaleWithMeta);
           fetchSummary();
         }}
       />
@@ -1878,7 +1843,7 @@ export default function OilSalesPage() {
         visible={reverseOpen}
         onClose={() => setReverseOpen(false)}
         token={token}
-        ownerId={user?.id ?? undefined}  
+        ownerId={user?.id ?? undefined}
         sale={selected}
         onSuccess={async () => {
           setReverseOpen(false);

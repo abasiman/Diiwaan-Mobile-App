@@ -25,6 +25,7 @@ import {
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { useFocusEffect } from '@react-navigation/native';
 import CreateWakaaladModal from '../Wakaladmodels/createwakaladmodal';
 import WakaaladActionsModal, { WakaaladActionMode } from '../Wakaladmodels/wakaaladactions';
 
@@ -190,10 +191,16 @@ export default function WakaaladDashboard() {
     [ownerId, online, token, dateRange.startDate, dateRange.endDate]
   );
 
+
+  useFocusEffect(
+  useCallback(() => {
+    // when screen gains focus, just reload from local DB
+    // (no need for full spinner)
+    loadAndMaybeSync(false);
+  }, [loadAndMaybeSync])
+);
+
   // Initial load and re-load when owner/date-range/online changes
-  useEffect(() => {
-    loadAndMaybeSync(true);
-  }, [loadAndMaybeSync]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);

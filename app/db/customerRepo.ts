@@ -80,6 +80,29 @@ export function upsertCustomersFromServer(customers: ApiCustomer[], ownerId: num
 
   db.withTransactionSync(() => {
     for (const c of customers) {
+      // 🔹 Look up any existing local row (server or offline) to preserve phone/address/status
+      let existing =
+        db.getFirstSync<CustomerRow>('SELECT * FROM customers WHERE id = ?;', [c.id]) || null;
+
+      if (!existing && c.name) {
+        existing =
+          db.getFirstSync<CustomerRow>(
+            `
+            SELECT *
+            FROM customers
+            WHERE owner_id = ?
+              AND LOWER(name) = LOWER(?)
+            ORDER BY datetime(updated_at) DESC, id DESC
+            LIMIT 1;
+          `,
+            [ownerId, c.name]
+          ) || null;
+      }
+
+      const mergedPhone = c.phone ?? existing?.phone ?? null;
+      const mergedAddress = c.address ?? existing?.address ?? null;
+      const mergedStatus = c.status ?? existing?.status ?? 'active';
+
       db.runSync(
         `
         INSERT INTO customers (
@@ -110,9 +133,9 @@ export function upsertCustomersFromServer(customers: ApiCustomer[], ownerId: num
           c.id,
           ownerId,
           c.name ?? '',
-          c.phone ?? null,
-          c.address ?? null,
-          c.status ?? 'active',
+          mergedPhone,
+          mergedAddress,
+          mergedStatus,
           c.amount_due ?? 0,
           c.amount_due_usd ?? 0,
           c.amount_due_native ?? 0,
@@ -122,17 +145,16 @@ export function upsertCustomersFromServer(customers: ApiCustomer[], ownerId: num
         ]
       );
 
-      // 🔹 NEW: remove any offline temp duplicates for same owner + name (+ phone)
+      // 🔹 Now that server row is in, drop any temp (-id) duplicates with same name
       if (c.name) {
         db.runSync(
           `
           DELETE FROM customers
           WHERE owner_id = ?
             AND id < 0
-            AND LOWER(name) = LOWER(?)
-            AND (phone IS NULL OR phone = ?);
+            AND LOWER(name) = LOWER(?);
         `,
-          [ownerId, c.name, c.phone ?? null]
+          [ownerId, c.name]
         );
       }
     }

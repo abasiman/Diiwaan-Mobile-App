@@ -70,7 +70,7 @@ export default function Menu() {
       title: "Oil Sales",
       icon: <MaterialCommunityIcons name="gas-station" size={20} color={COLORS.blue} />,
       tint: COLORS.blue,
-      path: "/oilsalespage",
+      path: "/oilsalesdashboard",
       priority: 1,
     },
     {

@@ -1,3 +1,5 @@
+//oilSalesPageSync.ts
+
 import {
   upsertOilSalesFromServer,
   type OilSaleSummaryResponse,
@@ -6,16 +8,7 @@ import {
 import api from '@/services/api';
 import { syncPendingOilSales } from '../dbform/invocieoilSalesOfflineRepo';
 
-/**
- * Full sync for OilSalesPage: page through /oilsale/summary and
- * persist all rows into oilsales_all.
- *
- * Also flushes any locally queued oil sales before pulling the summary,
- * so offline-created sales are pushed to the server and then pulled back
- * into the main oilsales_all table.
- *
- * Call this from your global sync, e.g. after login or pull-to-refresh.
- */
+
 export async function syncAllOilSales(ownerId: number, token: string) {
   if (!ownerId || !token) return;
 

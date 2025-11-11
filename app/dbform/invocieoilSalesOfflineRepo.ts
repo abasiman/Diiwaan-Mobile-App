@@ -1,4 +1,4 @@
-// app/db/oilSalesOfflineRepo.ts
+// app/db/invocieoilSalesOfflineRepo.ts
 import { applyLocalCustomerBalanceDeltaByName } from '@/app/db/customerRepo';
 import {
   upsertOilSalesFromServer,
@@ -10,6 +10,7 @@ import {
 } from '@/app/dbform/wakaaladSellOptionsRepo';
 import api from '@/services/api';
 import { db } from '../db/db';
+import { initOilSalesPageDb } from '../db/oilSalesPageDb';
 
 type SaleUnitType = 'liters' | 'fuusto' | 'caag';
 type SaleType = 'cashsale' | 'invoice';
@@ -106,8 +107,7 @@ function computeOfflineTotalsForPayload(
         (o) =>
           o.wakaalad_id === payload.wakaalad_id &&
           o.oil_id === payload.oil_id
-      ) ??
-      options.find((o) => o.oil_id === payload.oil_id);
+      ) ?? options.find((o) => o.oil_id === payload.oil_id);
   } catch {
     opt = undefined;
   }
@@ -198,25 +198,51 @@ export async function queueOilSaleForSync(
  * Call this whenever we go online.
  */
 
-
-// app/dbform/invocieoilSalesOfflineRepo.ts
-
-
-
 let syncingOilSales = false;
+
+
 
 export async function syncPendingOilSales(
   token: string,
   ownerId: number
 ): Promise<void> {
-  // 🔐 prevent overlapping syncs (GlobalSync + OfflineOilSaleSync + forms)
-  if (syncingOilSales) return;
+  if (!token || !ownerId) {
+    console.warn('[oil-sync] syncPendingOilSales called without token/ownerId', {
+      hasToken: !!token,
+      ownerId,
+    });
+    return;
+  }
+
+  if (syncingOilSales) {
+    console.log('[oil-sync] syncPendingOilSales: already running, skipping');
+    return;
+  }
   syncingOilSales = true;
 
+  console.log('[oil-sync] === syncPendingOilSales START ===', {
+    ownerId,
+  });
+
   try {
+    initOilSalesPageDb();
     ensureQueueTable();
 
-    const rows = db.getAllSync<QueueRow>(
+    // Attach any orphan rows (owner_id NULL/0) to this owner
+    console.log('[oil-sync] normalizing orphan queue rows to owner', {
+      ownerId,
+    });
+    db.runSync(
+      `
+        UPDATE oil_sale_queue
+        SET owner_id = ?
+        WHERE owner_id IS NULL
+           OR owner_id = 0;
+      `,
+      [ownerId]
+    );
+
+    let rows = db.getAllSync<QueueRow>(
       `
         SELECT local_id, owner_id, payload_json, sync_status, last_error, created_at
         FROM oil_sale_queue
@@ -227,16 +253,63 @@ export async function syncPendingOilSales(
       [ownerId]
     );
 
-    if (!rows.length) return;
+    console.log('[oil-sync] pending rows for owner', {
+      ownerId,
+      count: rows.length,
+    });
+
+    // Safety fallback: look at all pending rows if none found for this owner
+    if (!rows.length) {
+      const all = db.getAllSync<QueueRow>(
+        `
+          SELECT local_id, owner_id, payload_json, sync_status, last_error, created_at
+          FROM oil_sale_queue
+          WHERE sync_status = 'pending'
+          ORDER BY local_id ASC;
+        `,
+        []
+      );
+
+      if (all.length) {
+        console.warn(
+          '[oil-sync] no pending rows for owner, but found global pending rows – will attempt to sync them',
+          {
+            ownerId,
+            globalCount: all.length,
+          }
+        );
+      }
+
+      rows = all;
+    }
+
+    if (!rows.length) {
+      console.log('[oil-sync] no pending oil sales to sync');
+      return;
+    }
 
     const authHeader = { Authorization: `Bearer ${token}` };
 
     for (const row of rows) {
+      console.log('[oil-sync] processing queue row', {
+        local_id: row.local_id,
+        rowOwnerId: row.owner_id,
+        created_at: row.created_at,
+        last_error: row.last_error,
+      });
+
       let payload: CreateSalePayload;
 
       try {
         payload = JSON.parse(row.payload_json);
-      } catch {
+      } catch (parseErr) {
+        console.warn(
+          '[oil-sync] invalid JSON payload in oil_sale_queue, marking as failed',
+          {
+            local_id: row.local_id,
+            error: String(parseErr),
+          }
+        );
         db.runSync(
           `
             UPDATE oil_sale_queue
@@ -248,15 +321,31 @@ export async function syncPendingOilSales(
         continue;
       }
 
+      // Small log with key fields (no huge body spam)
+      console.log('[oil-sync] posting /oilsale for row', {
+        local_id: row.local_id,
+        rowOwnerId: row.owner_id,
+        oil_id: payload.oil_id,
+        wakaalad_id: payload.wakaalad_id,
+        sale_type: payload.sale_type,
+        unit_type: payload.unit_type,
+        unit_qty: payload.unit_qty,
+        liters_sold: payload.liters_sold,
+        currency: payload.currency,
+        fx_rate_to_usd: payload.fx_rate_to_usd,
+      });
+
       try {
         const res = await api.post<OilSalePageRead>('/oilsale', payload, {
           headers: authHeader,
         });
 
-        // Upsert the created sale into the main oilsales_all table so it
-        // appears in local queries even if we go offline again.
-        upsertOilSalesFromServer({ items: [res.data] }, ownerId);
+        console.log('[oil-sync] /oilsale success', {
+          local_id: row.local_id,
+          server_id: res.data?.id,
+        });
 
+        // Mark queue row as synced
         db.runSync(
           `
             UPDATE oil_sale_queue
@@ -265,21 +354,55 @@ export async function syncPendingOilSales(
           `,
           [row.local_id]
         );
+
+        // Best-effort local cache write
+        try {
+          const effectiveOwnerId = row.owner_id || ownerId;
+          upsertOilSalesFromServer({ items: [res.data] }, effectiveOwnerId);
+          console.log('[oil-sync] upsertOilSalesFromServer done', {
+            local_id: row.local_id,
+            server_id: res.data?.id,
+            effectiveOwnerId,
+          });
+        } catch (cacheErr) {
+          console.warn(
+            '[oil-sync] upsertOilSalesFromServer failed; will be corrected by next summary sync',
+            {
+              local_id: row.local_id,
+              error: String(cacheErr),
+            }
+          );
+        }
       } catch (e: any) {
-        const msg = e?.response?.data?.detail || e?.message || 'Sync failed';
+        const msg =
+          e?.response?.data?.detail ||
+          e?.message ||
+          'Sync failed';
+
+        console.warn('[oil-sync] post /oilsale failed', {
+          local_id: row.local_id,
+          rowOwnerId: row.owner_id,
+          message: msg,
+          status: e?.response?.status,
+          responseData: e?.response?.data,
+        });
+
+        // Keep as 'pending' but record last_error for visibility
         db.runSync(
           `
             UPDATE oil_sale_queue
-            SET sync_status = 'failed', last_error = ?
+            SET last_error = ?
             WHERE local_id = ?;
           `,
           [String(msg), row.local_id]
         );
-        // optional: break on first failure to avoid hammering server
-        break;
+
+        // Do NOT break; continue with other rows
+        continue;
       }
     }
   } finally {
+    console.log('[oil-sync] === syncPendingOilSales END ===');
     syncingOilSales = false;
   }
 }

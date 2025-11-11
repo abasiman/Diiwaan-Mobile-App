@@ -19,6 +19,10 @@ import {
   View,
 } from 'react-native';
 
+
+import { applyLocalWakaaladSale } from '../WakaaladOffline/wakaaladRepo';
+
+
 import {
   createOrUpdateCustomerLocal,
   getCustomersLocal,
@@ -90,6 +94,50 @@ type Customer = {
   contact?: string | null;
   phone?: string | null;
 };
+
+
+
+
+const mergeCustomersByName = (rows: Customer[]): Customer[] => {
+  const map = new Map<string, Customer>();
+
+  for (const c of rows) {
+    const key = (c.name || '').trim().toLowerCase();
+    if (!key) continue;
+
+    const existing = map.get(key);
+    if (!existing) {
+      map.set(key, { ...c });
+      continue;
+    }
+
+    const existingIsReal = existing.id > 0;
+    const currentIsReal = c.id > 0;
+
+    let preferred = existing;
+
+    // Prefer real (server) ID over temp negative ID
+    if (!existingIsReal && currentIsReal) {
+      preferred = c;
+    } else if (
+      (c.contact || c.phone) && // new one has contact
+      !(existing.contact || existing.phone) // existing has none
+    ) {
+      preferred = c;
+    }
+
+    map.set(key, {
+      ...preferred,
+      // keep best contact info from either row
+      contact: preferred.contact || existing.contact || c.contact || null,
+      phone: preferred.phone || existing.phone || c.phone || null,
+    });
+  }
+
+  return Array.from(map.values());
+};
+
+
 
 // Fallback capacities
 const DEFAULT_FUUSTO_L = 240;
@@ -721,50 +769,51 @@ export default function OilSaleInvoiceForm() {
         let data: Customer[] = [];
 
         if (online && token) {
-          // ONLINE → hit API
-          const res = await api.get('/diiwaancustomers', {
-            params: {
-              q: search || undefined,
-              offset: localOffset,
-              limit,
-            },
-            headers: { Authorization: `Bearer ${token}` },
-          });
+  // ONLINE → hit API, then ALWAYS read from local DB so we keep merged phone/address
+  const res = await api.get('/diiwaancustomers', {
+    params: {
+      q: search || undefined,
+      offset: localOffset,
+      limit,
+    },
+    headers: { Authorization: `Bearer ${token}` },
+  });
 
-          const raw: any = res.data;
-          const list: any[] = Array.isArray(raw?.items)
-            ? raw.items
-            : Array.isArray(raw)
-            ? raw
-            : [];
+  const raw: any = res.data;
+  const list: any[] = Array.isArray(raw?.items)
+    ? raw.items
+    : Array.isArray(raw)
+    ? raw
+    : [];
 
-          // optional: keep local cache up to date
-          if (list.length) {
-            upsertCustomersFromServer(list, user.id);
-          }
+  // Update local cache (this merges server + existing offline phone/address)
+  if (list.length) {
+    upsertCustomersFromServer(list, user.id);
+  }
 
-          data = list.map((c: any) => ({
-            id: c.id,
-            name: c.name,
-            contact: c.contact ?? c.phone ?? null,
-            phone: c.phone ?? null,
-          }));
-        } else {
-          // OFFLINE (or no token) → purely local SQLite
-          const rows = getCustomersLocal(search, limit, localOffset, user.id);
-          data = rows.map((c) => ({
-            id: c.id,
-            name: c.name || '',
-            contact: c.phone ?? null,
-            phone: c.phone ?? null,
-          }));
-        }
+  // ✅ Now build UI list from LOCAL DB, which has the merged phone
+  const rows = getCustomersLocal(search, limit, localOffset, user.id);
+  data = rows.map((c) => ({
+    id: c.id,
+    name: c.name || '',
+    contact: c.phone ?? null,
+    phone: c.phone ?? null,
+  }));
+} else {
+  // OFFLINE (or no token) → purely local SQLite
+  const rows = getCustomersLocal(search, limit, localOffset, user.id);
+  data = rows.map((c) => ({
+    id: c.id,
+    name: c.name || '',
+    contact: c.phone ?? null,
+    phone: c.phone ?? null,
+  }));
+}
 
-        setCustomers((prev) => {
-          if (reset) return data;
-          const map = new Map(prev.map((c) => [c.id, c]));
-          data.forEach((c) => map.set(c.id, { ...map.get(c.id), ...c }));
-          return Array.from(map.values());
+
+          setCustomers((prev) => {
+          if (reset) return mergeCustomersByName(data);
+          return mergeCustomersByName([...prev, ...data]);
         });
 
         setHasMore(data.length === limit);
@@ -784,7 +833,10 @@ export default function OilSaleInvoiceForm() {
             phone: c.phone ?? null,
           }));
 
-          setCustomers((prev) => (reset ? data : [...prev, ...data]));
+              setCustomers((prev) =>
+            reset ? mergeCustomersByName(data) : mergeCustomersByName([...prev, ...data])
+          );
+
           setHasMore(data.length === limit);
           offsetRef.current = localOffset + data.length;
           setError(null);
@@ -994,93 +1046,152 @@ export default function OilSaleInvoiceForm() {
   };
 
   const confirmAndCreate = async (pickedCurrencyKey: CurrencyKey, fxRateStr: string) => {
-    if (!selected) return;
-    if (!user?.id) {
-      openValidation('Missing user', 'User ID is required to create sales.');
-      return;
-    }
+  if (!selected) return;
+  if (!user?.id) {
+    openValidation('Missing user', 'User ID is required to create sales.');
+    return;
+  }
 
-    const saleCurrency = saleCurrencyFromKey(pickedCurrencyKey);
-    const fxRaw = parseFloat((fxRateStr || '').replace(',', '.'));
-    const fxValid = !isNaN(fxRaw) && fxRaw > 0 ? fxRaw : undefined;
+  const saleCurrency = saleCurrencyFromKey(pickedCurrencyKey);
+  const fxRaw = parseFloat((fxRateStr || '').replace(',', '.'));
+  const fxValid = !isNaN(fxRaw) && fxRaw > 0 ? fxRaw : undefined;
 
-    const perL_sale = convertPerL(lotCurrency, saleCurrency, perLInLotCurrency, fxValid);
+  const perL_sale = convertPerL(
+    lotCurrency,
+    saleCurrency,
+    perLInLotCurrency,
+    fxValid
+  );
 
-    if (lotCurrency !== saleCurrency && !fxValid) {
-      openValidation('FX required', 'Please provide a valid exchange rate.');
-      return;
-    }
+  if (lotCurrency !== saleCurrency && !fxValid) {
+    openValidation('FX required', 'Please provide a valid exchange rate.');
+    return;
+  }
 
-    const payload: CreateSalePayload = {
-      oil_id: selected.oil_id,
-      wakaalad_id: selected.wakaalad_id,
-      unit_type: unitType,
-      sale_type: SALE_TYPE,
-      liters_sold: unitType === 'liters' ? qtyNum : undefined,
-      unit_qty: unitType === 'fuusto' || unitType === 'caag' ? qtyNum : undefined,
-      price_per_l: perL_sale || undefined,
-      customer: custName?.trim() ? custName.trim() : undefined,
-      customer_contact: custContact?.trim() ? custContact.trim() : undefined,
-      currency: saleCurrency,
-      fx_rate_to_usd: saleCurrency === 'USD' ? undefined : fxValid,
-    };
+  const payload: CreateSalePayload = {
+    oil_id: selected.oil_id,
+    wakaalad_id: selected.wakaalad_id,
+    unit_type: unitType,
+    sale_type: SALE_TYPE,
+    liters_sold: unitType === 'liters' ? qtyNum : undefined,
+    unit_qty: unitType === 'fuusto' || unitType === 'caag' ? qtyNum : undefined,
+    price_per_l: perL_sale || undefined,
+    customer: custName?.trim() ? custName.trim() : undefined,
+    customer_contact: custContact?.trim() ? custContact.trim() : undefined,
+    currency: saleCurrency,
+    fx_rate_to_usd: saleCurrency === 'USD' ? undefined : fxValid,
+  };
 
-    setSubmitting(true);
-    setFinalOpen(false);
+  setSubmitting(true);
+  setFinalOpen(false);
 
-    try {
-      if (online && token) {
-        // ONLINE: normal API flow
-        const res = await api.post<OilSaleRead>('/oilsale', payload, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        setReceipt(res.data);
-        setReceiptOpen(true);
-        showToast('Invoice created successfully');
-      } else {
-        // OFFLINE: enqueue to local SQLite queue
-        await queueOilSaleForSync(user.id, payload);
+  try {
+    if (online && token) {
+      // ONLINE: normal API flow
+      const res = await api.post<OilSaleRead>('/oilsale', payload, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setReceipt(res.data);
+      setReceiptOpen(true);
+      showToast('Invoice created successfully');
+    } else {
+      // 🔴 OFFLINE: enqueue to local SQLite queue
+      await queueOilSaleForSync(user.id, payload);
 
-        // 🔹 NEW: record local income-statement delta so tenant-accounts
-        // will show this invoice immediately while offline.
-        try {
-          const createdAt = new Date().toISOString();
-          const totalNativeSale = billedLiters * (perL_sale || 0);
+      // 🔹 Record local income-statement delta
+      try {
+        const createdAt = new Date().toISOString();
+        const totalNativeSale = billedLiters * (perL_sale || 0);
 
-          let totalUsd = 0;
-          if (saleCurrency === 'USD') {
-            totalUsd = totalNativeSale;
-          } else if (saleCurrency === 'SOS' && fxValid) {
-            totalUsd = totalNativeSale / fxValid;
-          }
-
-          if (totalNativeSale > 0 && totalUsd > 0 && Number.isFinite(totalUsd)) {
-            registerOfflineOilInvoiceDelta({
-              ownerId: user.id,
-              createdAt,
-              truckPlate: selected.truck_plate || null,
-              currency: saleCurrency,
-              totalNative: totalNativeSale,
-              totalUsd,
-            });
-          }
-        } catch (e) {
-          console.warn('registerOfflineOilInvoiceDelta failed', e);
+        let totalUsd = 0;
+        if (saleCurrency === 'USD') {
+          totalUsd = totalNativeSale;
+        } else if (saleCurrency === 'SOS' && fxValid) {
+          totalUsd = totalNativeSale / fxValid;
         }
 
-        showToast('Invoice saved offline – will sync when online');
+        if (totalNativeSale > 0 && totalUsd > 0 && Number.isFinite(totalUsd)) {
+          registerOfflineOilInvoiceDelta({
+            ownerId: user.id,
+            createdAt,
+            truckPlate: selected.truck_plate || null,
+            currency: saleCurrency,
+            totalNative: totalNativeSale,
+            totalUsd,
+          });
+        }
+      } catch (e) {
+        console.warn('registerOfflineOilInvoiceDelta failed', e);
       }
 
-      goToInvoices();
-    } catch (e: any) {
-      openValidation(
-        'Create failed',
-        String(e?.response?.data?.detail || e?.message || 'Unable to create invoice sale.')
-      );
-    } finally {
-      setSubmitting(false);
+      // 🔹 NEW: update local wakaalad sell-option + wakaalad dashboard stock
+      try {
+        const stockLiters = estimatedLiters; // physical liters removed from stock
+
+        if (stockLiters > 0) {
+          const newStock = Math.max(
+            0,
+            (selected.in_stock_l ?? 0) - stockLiters
+          );
+
+          // 1) Update local wakaalad_sell_options row
+          await upsertLocalWakaaladSellOption({
+            ownerId: user.id,
+            wakaalad_id: selected.wakaalad_id,
+            oil_id: selected.oil_id,
+            oil_type: selected.oil_type,
+            wakaalad_name: selected.wakaalad_name,
+            truck_plate: selected.truck_plate,
+            currency: selected.currency,
+            in_stock_l: newStock,
+            liter_price: selected.liter_price,
+            fuusto_price: selected.fuusto_price,
+            caag_price: selected.caag_price,
+            fuusto_capacity_l: selected.fuusto_capacity_l,
+            caag_capacity_l: selected.caag_capacity_l,
+          });
+
+          // 2) Update in-memory options for this screen
+          setOptions((prev) =>
+            prev.map((o) =>
+              o.wakaalad_id === selected.wakaalad_id
+                ? { ...o, in_stock_l: newStock }
+                : o
+            )
+          );
+
+          // 3) Update wakaalad dashboard offline DB so stock/sold reflect the sale
+          await applyLocalWakaaladSale(
+            user.id,
+            selected.wakaalad_id,
+            stockLiters
+          );
+        }
+      } catch (e) {
+        console.warn(
+          'Failed to apply local wakaalad stock/sale change',
+          e
+        );
+      }
+
+      showToast('Invoice saved offline – will sync when online');
     }
-  };
+
+    goToInvoices();
+  } catch (e: any) {
+    openValidation(
+      'Create failed',
+      String(
+        e?.response?.data?.detail ||
+          e?.message ||
+          'Unable to create invoice sale.'
+      )
+    );
+  } finally {
+    setSubmitting(false);
+  }
+};
+
 
   const amountUSD: number | null = useMemo(() => {
     if (lineTotal <= 0) return null;

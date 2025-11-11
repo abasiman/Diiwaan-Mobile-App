@@ -136,13 +136,6 @@ export async function getWakaaladLocal({
 
 
 
-
-/**
- * Apply a SALE locally (decrease stock, increase sold) so the
- * wakaalad dashboard reflects it immediately while offline.
- *
- * liters is PHYSICAL liters taken from stock (estimatedLiters).
- */
 export async function applyLocalWakaaladSale(
   ownerId: number,
   wakaaladId: number,
