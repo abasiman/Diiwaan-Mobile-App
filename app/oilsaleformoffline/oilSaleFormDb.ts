@@ -2,24 +2,31 @@
 import { db } from '../db/db';
 
 export type OilSaleFormStatus = 'pending' | 'syncing' | 'failed' | 'synced';
-export type OilSaleFormUnitType = 'liters' | 'fuusto' | 'caag';
+export type OilSaleFormUnitType = 'liters' | 'fuusto' | 'caag' | 'lot';
 export type OilSaleFormSaleType = 'cashsale' | 'invoice';
 
 export type OilSaleFormRow = {
-  id: number;                // local row id
+  id: number; // local row id
   owner_id: number;
   oil_id: number;
   wakaalad_id: number;
+
   unit_type: OilSaleFormUnitType;
   unit_qty?: number | null;
   liters_sold?: number | null;
   price_per_l?: number | null;
+
   customer?: string | null;
   customer_contact?: string | null;
   currency?: string | null;
   fx_rate_to_usd?: number | null;
+
   sale_type: OilSaleFormSaleType;
   payment_method?: 'cash' | 'bank' | null;
+
+  // NEW
+  oil_type?: string | null;
+  truck_plate?: string | null;
 
   status: OilSaleFormStatus;
   error?: string | null;
@@ -40,16 +47,22 @@ export function initOilSaleFormDb() {
       owner_id         INTEGER NOT NULL,
       oil_id           INTEGER NOT NULL,
       wakaalad_id      INTEGER NOT NULL,
+
       unit_type        TEXT    NOT NULL,
       unit_qty         REAL,
       liters_sold      REAL,
       price_per_l      REAL,
+
       customer         TEXT,
       customer_contact TEXT,
       currency         TEXT,
       fx_rate_to_usd   REAL,
+
       sale_type        TEXT    NOT NULL,
       payment_method   TEXT,
+
+      oil_type         TEXT,           -- new
+      truck_plate      TEXT,           -- new
 
       status           TEXT    NOT NULL DEFAULT 'pending', -- pending|syncing|failed|synced
       error            TEXT,

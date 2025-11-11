@@ -1101,6 +1101,8 @@ export default function OilSaleCashSaleForm() {
           fx_rate_to_usd: saleCurrency === 'USD' ? undefined : fxValid,
           sale_type: SALE_TYPE,
           payment_method: paymentMethodServer,
+            oil_type: selected.oil_type,              // 👈 add
+  truck_plate: selected.truck_plate || null // 👈 add
         });
       } catch (e) {
         console.warn('queueOilSaleForSync failed', e);

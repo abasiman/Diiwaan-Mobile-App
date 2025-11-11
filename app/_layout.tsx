@@ -307,9 +307,15 @@ function OfflineOilSaleSync() {
     );
 
     // 🟣 NEW: offline oil sale forms (cashsale/invoice)
-    syncPendingOilSaleForms(ownerId, token).catch((e) =>
-      console.warn('syncPendingOilSaleForms failed', e)
-    );
+    // 🟣 offline oil sale forms (cashsale/invoice) → then refresh dashboard cache
+syncPendingOilSaleForms(ownerId, token)
+  .then(() =>
+    syncAllOilSales(ownerId, token)
+  )
+  .catch((e) =>
+    console.warn('syncPendingOilSaleForms / syncAllOilSales failed', e)
+  );
+
   }, [online, token, user?.id]);
 
   // ✅ when connectivity becomes online → sync

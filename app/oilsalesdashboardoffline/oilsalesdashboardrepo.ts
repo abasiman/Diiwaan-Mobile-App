@@ -1,8 +1,11 @@
-// app/oilsalesdashboardrepo.ts
+// app/oilsalesdashboardoffline/oilsalesdashboardrepo.ts
 
 import { db } from '../db/db';
 
-import type { OilSaleFormRow } from '../oilsaleformoffline/oilSaleFormDb';
+import {
+  initOilSaleFormDb,
+  type OilSaleFormRow,
+} from '../oilsaleformoffline/oilSaleFormDb';
 import { listOilSalesRows, upsertOilSalesRows } from './oilsalesdashboarddb';
 
 export type OilSaleRead = {
@@ -49,6 +52,17 @@ export type OilSaleSummaryResponse = {
 };
 
 export type OilSaleWithMeta = OilSaleRead & { pending?: boolean };
+
+/* Fallback capacities for pending (offline) rows */
+const DEFAULT_FUUSTO_L = 240;
+const DEFAULT_CAAG_L = 20;
+
+const billableFuustoLiters = (row: OilSaleFormRow): number => {
+  const physical = DEFAULT_FUUSTO_L;
+  const isPetrol = (row.oil_type || '').toLowerCase() === 'petrol';
+  // same idea as the form: petrol fuusto is short by ~10L
+  return isPetrol ? Math.max(0, physical - 10) : physical;
+};
 
 /**
  * Upsert server summary into local DB.
@@ -131,59 +145,61 @@ export function getOilSalesSummaryLocal(
 
 /**
  * Show pending offline sales (created from oil_sale_forms) in the dashboard.
- * We only include cash sales that are not yet synced (no remote_id).
+ * We only include cash sales that are not yet synced.
  */
 export async function getPendingOilSalesLocalForDisplay(
   ownerId: number
 ): Promise<OilSaleWithMeta[]> {
   if (!ownerId) return [];
 
+  initOilSaleFormDb();
+
   const forms = db.getAllSync<OilSaleFormRow>(
     `
-    SELECT *
-    FROM oil_sale_forms
-    WHERE owner_id = ?
-      AND sale_type = 'cashsale'
-      AND status IN ('pending','failed','syncing')
-      AND remote_id IS NULL
-    ORDER BY datetime(created_at) DESC
+      SELECT *
+      FROM oil_sale_forms
+      WHERE owner_id = ?
+        AND sale_type = 'cashsale'
+        AND status IN ('pending','failed','syncing')
+      ORDER BY datetime(created_at) DESC
+      LIMIT 200;
     `,
     [ownerId]
   ) as OilSaleFormRow[];
 
   return forms.map((f) => {
     const currency = (f.currency || 'USD').toUpperCase();
-    const unit_type = f.unit_type as OilSaleRead['unit_type'];
+    const unit_type = (f.unit_type || 'liters') as OilSaleRead['unit_type'];
 
     const unitQty =
       f.unit_qty != null ? Number(f.unit_qty) : null;
-    const litersSold =
+    let litersSold =
       f.liters_sold != null ? Number(f.liters_sold) : null;
 
     const pricePerL =
       f.price_per_l != null ? Number(f.price_per_l) : null;
-    const pricePerUnit =
-      (f as any).price_per_unit_type != null
-        ? Number((f as any).price_per_unit_type)
-        : null;
     const fxRate =
       f.fx_rate_to_usd != null ? Number(f.fx_rate_to_usd) : null;
 
-    // More robust local total calculation (server will recalc after sync)
-    let total_native: number | null = null;
+    // Approximate billed liters similar to the form logic
+    let billedLiters = 0;
+    if (unit_type === 'liters') {
+      billedLiters = litersSold ?? unitQty ?? 0;
+    } else if (unit_type === 'fuusto') {
+      const perFuusto = billableFuustoLiters(f);
+      billedLiters = (unitQty ?? 0) * perFuusto;
+      if (litersSold == null) litersSold = billedLiters;
+    } else if (unit_type === 'caag') {
+      billedLiters = (unitQty ?? 0) * DEFAULT_CAAG_L;
+      if (litersSold == null) litersSold = billedLiters;
+    } else if (unit_type === 'lot') {
+      billedLiters = litersSold ?? 0;
+    }
 
-    // Prefer any explicit total from the form row if it exists
-    if ((f as any).total_native != null) {
-      total_native = Number((f as any).total_native);
-    } else {
-      // liters-based
-      if (pricePerL != null && litersSold != null) {
-        total_native = pricePerL * litersSold;
-      }
-      // unit-based (fuusto / caag / lot)
-      if (total_native == null && pricePerUnit != null && unitQty != null) {
-        total_native = pricePerUnit * unitQty;
-      }
+    // Local total (server will recalc after sync anyway)
+    let total_native: number | null = null;
+    if (pricePerL != null && billedLiters > 0) {
+      total_native = pricePerL * billedLiters;
     }
 
     let total_usd: number | null = null;
@@ -195,38 +211,49 @@ export async function getPendingOilSalesLocalForDisplay(
       }
     }
 
+    // Rough "price per unit" for display (fuusto/caag)
+    let price_per_unit_type: number | null = null;
+    if (unit_type === 'liters') {
+      price_per_unit_type = pricePerL ?? null;
+    } else if (unit_type === 'fuusto' && unitQty && unitQty > 0 && total_native != null) {
+      price_per_unit_type = total_native / unitQty;
+    } else if (unit_type === 'caag' && unitQty && unitQty > 0 && total_native != null) {
+      price_per_unit_type = total_native / unitQty;
+    } else if (unit_type === 'lot' && total_native != null) {
+      price_per_unit_type = total_native;
+    }
+
     const created_at =
       typeof f.created_at === 'string'
         ? f.created_at
         : new Date().toISOString();
 
     const row: OilSaleWithMeta = {
-      id: -Number(f.id), // negative to avoid clashing with server IDs
+      id: -Number(f.id) || 0, // negative so we don't clash with server IDs
       created_at,
 
-      // fill oil + plate so offline row looks like a normal sale
-      oil_type: (f as any).oil_type ?? (f as any).oil_name ?? 'Oil sale',
+      oil_type: f.oil_type ?? 'Oil sale',
       customer: f.customer ?? null,
       customer_contact: f.customer_contact ?? null,
-      truck_plate: (f as any).truck_plate ?? null,
+      truck_plate: f.truck_plate ?? null,
 
       currency,
       unit_type,
       unit_qty: unitQty,
       liters_sold: litersSold,
 
-      price_per_unit_type: pricePerUnit,
+      price_per_unit_type,
       price_per_l: pricePerL,
       fx_rate_to_usd: fxRate,
 
       total_native,
       total_usd,
-      tax_native: (f as any).tax_native ?? null,
-      discount_native: (f as any).discount_native ?? null,
+      tax_native: null,
+      discount_native: null,
 
       payment_method: f.payment_method ?? 'cash',
-      payment_status: null,
-      note: (f as any).note ?? null,
+      payment_status: null, // dashboard treats pending separately
+      note: null,
 
       pending: true,
     };
