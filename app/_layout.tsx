@@ -52,6 +52,7 @@ import { syncAllWakaaladSellOptions } from './dbform/wakaaladSellOptionsRepo';
 import { syncPendingOilSaleReversals } from './dbsalereverse/oilSaleReverseOfflineRepo';
 import { syncPendingVendorPayments } from './offlinecreatevendorpayment/vendorPaymentCreateSync';
 import { syncIncomeStatement } from './offlineincomestatement/incomeStatementSync';
+import { syncOilSalesSummaryFromServer } from './oilsalesdashboardoffline/oilsalesdashboardsync';
 import { syncMeProfile } from './profile/meProfileSync';
 import { syncPendingWakaaladActions } from './wakaaladActionsOffline/wakaaladActionsSync';
 import { syncPendingWakaaladForms } from './wakaaladformoffline/wakaaladFormSync';
@@ -196,6 +197,16 @@ function GlobalSync() {
         await run('syncAllOilSales', () =>
           syncAllOilSales(ownerId, token)
         );
+
+
+        await run('syncOilSalesSummaryFromServer', () =>
+  syncOilSalesSummaryFromServer({
+    token,
+    ownerId,
+    startDate: ninetyDaysAgo,
+    endDate: now,
+  })
+);
         await run('syncAllWakaaladSellOptions', () =>
           syncAllWakaaladSellOptions(ownerId, token)
         );
@@ -266,6 +277,10 @@ function OfflineOilSaleSync() {
 
     const ownerId = user.id;
 
+      const now = new Date();
+  const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+
+
     // 🔹 offline reprices
     syncPendingOilReprices(token, ownerId).catch((e) =>
       console.warn('syncPendingOilReprices failed', e)
@@ -308,13 +323,23 @@ function OfflineOilSaleSync() {
 
     // 🟣 NEW: offline oil sale forms (cashsale/invoice)
     // 🟣 offline oil sale forms (cashsale/invoice) → then refresh dashboard cache
-syncPendingOilSaleForms(ownerId, token)
-  .then(() =>
-    syncAllOilSales(ownerId, token)
-  )
-  .catch((e) =>
-    console.warn('syncPendingOilSaleForms / syncAllOilSales failed', e)
-  );
+ syncPendingOilSaleForms(ownerId, token)
+    .then(async () => {
+      // keep old legacy cache if you still use it
+      await syncAllOilSales(ownerId, token);
+
+      // 🔥 IMPORTANT: refresh oil_sales_dashboard, so the new sale
+      // is visible even if the user never opened the dashboard online before
+      await syncOilSalesSummaryFromServer({
+        token,
+        ownerId,
+        startDate: ninetyDaysAgo,
+        endDate: now,
+      });
+    })
+    .catch((e) =>
+      console.warn('syncPendingOilSaleForms / syncAllOilSales / syncOilSalesSummary failed', e)
+    );
 
   }, [online, token, user?.id]);
 

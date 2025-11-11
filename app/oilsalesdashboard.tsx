@@ -13,6 +13,8 @@ import {
 } from './oilsalesdashboardoffline/oilsalesdashboardrepo';
 
 
+import { syncPendingOilSaleForms } from './oilsaleformoffline/oilSaleFormSync';
+
 
 import DateTimePicker from '@react-native-community/datetimepicker';
 import NetInfo from '@react-native-community/netinfo';
@@ -825,68 +827,62 @@ export default function OilSalesPage() {
   }, []);
 
   const fetchSummary = useCallback(async () => {
-    if (!user?.id) return;
+  if (!user?.id) return;
 
-    setError(null);
-    setLoading(true);
+  setError(null);
+  setLoading(true);
 
-    const fromISO = dayjs(dateRange.startDate)
-      .startOf('day')
-      .toISOString();
-    const toISO = dayjs(dateRange.endDate)
-      .endOf('day')
-      .toISOString();
+  const fromISO = dayjs(dateRange.startDate).startOf('day').toISOString();
+  const toISO   = dayjs(dateRange.endDate).endOf('day').toISOString();
 
-    try {
-      // 1) If online, pull summary from server and cache locally
-      if (online && token) {
-        try {
-          await syncOilSalesSummaryFromServer({
-            token,
-            ownerId: user.id,
-            startDate: dateRange.startDate,
-            endDate: dateRange.endDate,
-          });
-        } catch (e) {
-          console.warn(
-            'syncOilSalesSummaryFromServer failed',
-            e
-          );
-        }
-      }
+  try {
+    if (online && token) {
+      const ownerId = user.id;
 
-      // 2) Always read from local DB
-      const local = getOilSalesSummaryLocal(user.id, {
-        fromISO,
-        toISO,
-        limit: 200,
-      });
-      setItems(local.items);
-      setTotals(local.totals);
-      setError(null);
-
-      // 3) Pending offline sales (still unsynced)
+      // 1) FIRST: push any offline sales
       try {
-        const pending = await getPendingOilSalesLocalForDisplay(
-          user.id
-        );
-        setPendingItems(pending);
+        await syncPendingOilSaleForms(ownerId, token);
       } catch (e) {
-        console.warn(
-          'getPendingOilSalesLocalForDisplay failed',
-          e
-        );
-        setPendingItems([]);
+        console.warn('syncPendingOilSaleForms (dashboard) failed', e);
       }
-    } catch (e: any) {
-      setError(
-        e?.message || 'Failed to load oil sales from local DB.'
-      );
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
+
+      // 2) THEN: pull the server summary into oil_sales_dashboard
+      try {
+        await syncOilSalesSummaryFromServer({
+          token,
+          ownerId,
+          startDate: dateRange.startDate,
+          endDate: dateRange.endDate,
+        });
+      } catch (e) {
+        console.warn('syncOilSalesSummaryFromServer failed', e);
+      }
     }
-  }, [user?.id, token, dateRange, online]);
+
+    // 3) Read from local cache
+    const local = getOilSalesSummaryLocal(user.id, {
+      fromISO,
+      toISO,
+      limit: 200,
+    });
+    setItems(local.items);
+    setTotals(local.totals);
+
+    // 4) Pending offline rows (if any left)
+    try {
+      const pending = await getPendingOilSalesLocalForDisplay(user.id);
+      setPendingItems(pending);
+    } catch (e) {
+      console.warn('getPendingOilSalesLocalForDisplay failed', e);
+      setPendingItems([]);
+    }
+  } catch (e: any) {
+    setError(e?.message || 'Failed to load oil sales from local DB.');
+  } finally {
+    setLoading(false);
+    setRefreshing(false);
+  }
+}, [user?.id, token, dateRange, online]);
 
   useEffect(() => {
     fetchSummary();
@@ -1141,15 +1137,10 @@ export default function OilSalesPage() {
     return (
       <React.Fragment key={r.id ?? idx}>
         <TouchableOpacity
-          activeOpacity={isPending ? 1 : 0.7}
+          activeOpacity={0.7}
           onPress={() => {
-            if (isPending) {
-              Alert.alert(
-                'Pending sync',
-                'This sale was created offline and will sync automatically when you are online.'
-              );
-              return;
-            }
+            // ✅ Always open the normal detail popup,
+            // even for offline/pending sales
             setSelected(r);
             setDetailOpen(true);
           }}
