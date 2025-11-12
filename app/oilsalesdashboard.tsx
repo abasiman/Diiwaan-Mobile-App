@@ -13,7 +13,9 @@ import {
 } from './oilsalesdashboardoffline/oilsalesdashboardrepo';
 
 
-import { syncPendingOilSaleForms } from './oilsaleformoffline/oilSaleFormSync';
+
+
+
 
 
 import DateTimePicker from '@react-native-community/datetimepicker';
@@ -21,7 +23,7 @@ import NetInfo from '@react-native-community/netinfo';
 import dayjs from 'dayjs';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Print from 'expo-print';
-import { useFocusEffect, usePathname, useRouter } from 'expo-router';
+import { usePathname, useRouter } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import React, {
   useCallback,
@@ -815,6 +817,22 @@ export default function OilSalesPage() {
   const pathname = usePathname();
   const router = useRouter();
 
+    // Hardware back → always go to /menu
+  useEffect(() => {
+    const onHardwareBackPress = () => {
+      router.replace('/menu');
+      return true;
+    };
+
+    const sub = BackHandler.addEventListener(
+      'hardwareBackPress',
+      onHardwareBackPress
+    );
+
+    return () => sub.remove();
+  }, [router]);
+
+
   // Connectivity
   useEffect(() => {
     const sub = NetInfo.addEventListener((state) => {
@@ -826,31 +844,25 @@ export default function OilSalesPage() {
     return () => sub();
   }, []);
 
-  const fetchSummary = useCallback(async () => {
+const fetchSummary = useCallback(async () => {
   if (!user?.id) return;
 
   setError(null);
   setLoading(true);
 
   const fromISO = dayjs(dateRange.startDate).startOf('day').toISOString();
-  const toISO   = dayjs(dateRange.endDate).endOf('day').toISOString();
+  const toISO = dayjs(dateRange.endDate).endOf('day').toISOString();
 
   try {
+    // 0) Always *attempt* to push queue if we have a token.
+  
+    // 1) Always try to refresh from server if we have a token.
+      // 1) ✅ only refresh snapshot from server (like wakaalad)
     if (online && token) {
-      const ownerId = user.id;
-
-      // 1) FIRST: push any offline sales
-      try {
-        await syncPendingOilSaleForms(ownerId, token);
-      } catch (e) {
-        console.warn('syncPendingOilSaleForms (dashboard) failed', e);
-      }
-
-      // 2) THEN: pull the server summary into oil_sales_dashboard
       try {
         await syncOilSalesSummaryFromServer({
           token,
-          ownerId,
+          ownerId: user.id,
           startDate: dateRange.startDate,
           endDate: dateRange.endDate,
         });
@@ -859,7 +871,7 @@ export default function OilSalesPage() {
       }
     }
 
-    // 3) Read from local cache
+    // 2) Read from local summary
     const local = getOilSalesSummaryLocal(user.id, {
       fromISO,
       toISO,
@@ -868,21 +880,17 @@ export default function OilSalesPage() {
     setItems(local.items);
     setTotals(local.totals);
 
-    // 4) Pending offline rows (if any left)
-    try {
-      const pending = await getPendingOilSalesLocalForDisplay(user.id);
-      setPendingItems(pending);
-    } catch (e) {
-      console.warn('getPendingOilSalesLocalForDisplay failed', e);
-      setPendingItems([]);
-    }
+    // 3) Read pending offline rows
+    const pending = await getPendingOilSalesLocalForDisplay(user.id);
+    setPendingItems(pending);
   } catch (e: any) {
     setError(e?.message || 'Failed to load oil sales from local DB.');
   } finally {
     setLoading(false);
     setRefreshing(false);
   }
-}, [user?.id, token, dateRange, online]);
+}, [user?.id, token, dateRange]);
+
 
   useEffect(() => {
     fetchSummary();
@@ -1040,64 +1048,7 @@ export default function OilSalesPage() {
     return { top, distinct: map.size };
   }, [filteredItems]);
 
-  useFocusEffect(
-    React.useCallback(() => {
-      const onBackPress = () => {
-        if (
-          detailOpen ||
-          editOpen ||
-          confirmOpen ||
-          exportOpen ||
-          platePickerOpen ||
-          newSaleOpen ||
-          reverseOpen ||
-          showFilters ||
-          showDatePicker !== null
-        ) {
-          setDetailOpen(false);
-          setEditOpen(false);
-          setConfirmOpen(false);
-          setExportOpen(false);
-          setPlatePickerOpen(false);
-          setNewSaleOpen(false);
-          setReverseOpen(false);
-          setShowFilters(false);
-          setShowDatePicker(null);
-          return true;
-        }
 
-        if (router.canGoBack()) {
-          router.back();
-          return true;
-        }
-
-        if (pathname !== '/menu') {
-          router.replace('/menu');
-          return true;
-        }
-
-        return true;
-      };
-
-      const sub = BackHandler.addEventListener(
-        'hardwareBackPress',
-        onBackPress
-      );
-      return () => sub.remove();
-    }, [
-      router,
-      pathname,
-      detailOpen,
-      editOpen,
-      confirmOpen,
-      exportOpen,
-      platePickerOpen,
-      newSaleOpen,
-      reverseOpen,
-      showFilters,
-      showDatePicker,
-    ])
-  );
 
   /* ===== Row Renderer ===== */
   const getSaleTypeBadge = (
@@ -1647,45 +1598,20 @@ export default function OilSalesPage() {
               gap: 10,
             }}
           >
-            <TouchableOpacity
-              onPress={() => {
-                if (
-                  detailOpen ||
-                  editOpen ||
-                  confirmOpen ||
-                  exportOpen ||
-                  platePickerOpen ||
-                  newSaleOpen ||
-                  reverseOpen ||
-                  showFilters ||
-                  showDatePicker !== null
-                ) {
-                  setDetailOpen(false);
-                  setEditOpen(false);
-                  setConfirmOpen(false);
-                  setExportOpen(false);
-                  setPlatePickerOpen(false);
-                  setNewSaleOpen(false);
-                  setReverseOpen(false);
-                  setShowFilters(false);
-                  setShowDatePicker(null);
-                  return;
-                }
-                if (router.canGoBack()) {
-                  router.back();
-                } else if (pathname !== '/menu') {
-                  router.replace('/menu');
-                }
-              }}
-              style={styles.backBtn}
-              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-            >
-              <Feather
-                name="arrow-left"
-                size={16}
-                color="#E0E7FF"
-              />
-            </TouchableOpacity>
+           <TouchableOpacity
+  onPress={() => {
+    router.replace('/menu');
+  }}
+  style={styles.backBtn}
+  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+>
+  <Feather
+    name="arrow-left"
+    size={16}
+    color="#E0E7FF"
+  />
+</TouchableOpacity>
+
           </View>
 
           <View

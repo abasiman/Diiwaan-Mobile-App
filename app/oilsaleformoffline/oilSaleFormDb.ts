@@ -41,6 +41,7 @@ export type OilSaleFormRow = {
  * Call once on app startup (RootLayout) to ensure the table exists.
  */
 export function initOilSaleFormDb() {
+  // Base table (new installs get full schema)
   db.execSync(`
     CREATE TABLE IF NOT EXISTS oil_sale_forms (
       id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,8 +62,8 @@ export function initOilSaleFormDb() {
       sale_type        TEXT    NOT NULL,
       payment_method   TEXT,
 
-      oil_type         TEXT,           -- new
-      truck_plate      TEXT,           -- new
+      oil_type         TEXT,
+      truck_plate      TEXT,
 
       status           TEXT    NOT NULL DEFAULT 'pending', -- pending|syncing|failed|synced
       error            TEXT,
@@ -72,7 +73,21 @@ export function initOilSaleFormDb() {
       updated_at       TEXT    NOT NULL,
       last_attempt_at  TEXT
     );
+  `);
 
+  // Migration for older DBs that don't have oil_type/truck_plate yet
+  try {
+    db.execSync(`SELECT oil_type, truck_plate FROM oil_sale_forms LIMIT 1;`);
+  } catch {
+    try {
+      db.execSync(`ALTER TABLE oil_sale_forms ADD COLUMN oil_type TEXT;`);
+    } catch {}
+    try {
+      db.execSync(`ALTER TABLE oil_sale_forms ADD COLUMN truck_plate TEXT;`);
+    } catch {}
+  }
+
+  db.execSync(`
     CREATE INDEX IF NOT EXISTS idx_oil_sale_forms_owner_status
       ON oil_sale_forms(owner_id, status);
 

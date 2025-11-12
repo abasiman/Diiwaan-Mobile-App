@@ -1,19 +1,12 @@
 // app/dbform/wakaaladFormSync.ts
 import api from '@/services/api';
 import {
-    getPendingWakaaladForms,
-    updateWakaaladFormStatus,
-    type WakaaladFormCreatePayload,
+  getPendingWakaaladForms,
+  updateWakaaladFormStatus,
+  type WakaaladFormCreatePayload,
 } from './wakaaladFormRepo';
 
-/**
- * Pushes all pending/failed wakaalad forms for a given owner to the backend.
- *
- * Call this:
- *  - when the app comes online (NetInfo)
- *  - after login
- *  - on pull-to-refresh, if you want
- */
+
 export async function syncPendingWakaaladForms(ownerId: number, token: string) {
   if (!ownerId || !token) return;
 

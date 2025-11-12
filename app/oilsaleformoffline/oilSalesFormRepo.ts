@@ -1,4 +1,4 @@
-// app/oilsaleformoffline/oilSaleFormRepo.ts
+// app/oilsaleformoffline/oilSalesFormRepo.ts
 import { db } from '../db/db';
 import {
   initOilSaleFormDb,
@@ -21,6 +21,10 @@ export type OilSaleFormCreatePayload = {
   fx_rate_to_usd?: number;
   sale_type: OilSaleFormSaleType;
   payment_method?: 'cash' | 'bank';
+
+  // keep these in the queue row
+  oil_type?: string | null;
+  truck_plate?: string | null;
 };
 
 /**
@@ -31,6 +35,14 @@ export async function queueOilSaleForSync(
   ownerId: number,
   payload: OilSaleFormCreatePayload
 ): Promise<number> {
+  console.log('[OilSaleQueue] queueOilSaleForSync called', {
+    ownerId,
+    oil_id: payload.oil_id,
+    wakaalad_id: payload.wakaalad_id,
+    unit_type: payload.unit_type,
+    sale_type: payload.sale_type,
+  });
+
   if (!ownerId) throw new Error('ownerId is required');
   if (!payload.oil_id) throw new Error('oil_id is required');
   if (!payload.wakaalad_id) throw new Error('wakaalad_id is required');
@@ -57,11 +69,13 @@ export async function queueOilSaleForSync(
         fx_rate_to_usd,
         sale_type,
         payment_method,
+        oil_type,
+        truck_plate,
         status,
         created_at,
         updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?);
     `,
     [
       ownerId,
@@ -77,6 +91,8 @@ export async function queueOilSaleForSync(
       payload.fx_rate_to_usd ?? null,
       payload.sale_type,
       payload.payment_method ?? null,
+      payload.oil_type ?? null,
+      payload.truck_plate ?? null,
       now,
       now,
     ]
@@ -88,7 +104,10 @@ export async function queueOilSaleForSync(
     res?.insertId ??
     0;
 
-  return Number(lastId) || 0;
+  const idNum = Number(lastId) || 0;
+  console.log('[OilSaleQueue] inserted local oil_sale_forms row', { lastId, idNum });
+
+  return idNum;
 }
 
 /**
@@ -98,10 +117,13 @@ export function getPendingOilSaleForms(
   ownerId: number,
   limit = 100
 ): OilSaleFormRow[] {
-  if (!ownerId) return [];
+  if (!ownerId) {
+    console.log('[OilFormRepo] getPendingOilSaleForms → ownerId missing (0 rows)');
+    return [];
+  }
   initOilSaleFormDb();
 
-  return db.getAllSync<OilSaleFormRow>(
+  const rows = db.getAllSync<OilSaleFormRow>(
     `
       SELECT
         id,
@@ -118,6 +140,8 @@ export function getPendingOilSaleForms(
         fx_rate_to_usd,
         sale_type,
         payment_method,
+        oil_type,
+        truck_plate,
         status,
         error,
         remote_id,
@@ -126,12 +150,30 @@ export function getPendingOilSaleForms(
         last_attempt_at
       FROM oil_sale_forms
       WHERE owner_id = ?
-        AND status IN ('pending', 'failed')
+        AND status IN ('pending','failed','syncing')
       ORDER BY datetime(created_at) ASC
       LIMIT ?;
     `,
     [ownerId, limit]
+  ) as OilSaleFormRow[];
+
+  const counts = rows.reduce(
+    (acc, r) => {
+      acc.total += 1;
+      acc[r.status] = (acc[r.status] || 0) + 1;
+      return acc;
+    },
+    { total: 0 } as Record<string, number>
   );
+
+  console.log('[OilFormRepo] getPendingOilSaleForms →', {
+    ownerId,
+    limit,
+    count: rows.length,
+    byStatus: counts,
+  });
+
+  return rows;
 }
 
 /**
@@ -142,7 +184,10 @@ export function updateOilSaleFormStatus(
   status: OilSaleFormStatus,
   opts: { error?: string | null; remote_id?: number | null } = {}
 ) {
-  if (!id) return;
+  if (!id) {
+    console.warn('[OilFormRepo] updateOilSaleFormStatus → missing id');
+    return;
+  }
   initOilSaleFormDb();
 
   const now = new Date().toISOString();
@@ -161,13 +206,23 @@ export function updateOilSaleFormStatus(
     `,
     [status, error, remote_id, now, now, id]
   );
+
+  console.log('[OilFormRepo] updateOilSaleFormStatus → updated', {
+    id,
+    status,
+    hasError: !!error,
+    remote_id,
+  });
 }
 
 /**
  * Optional: purge old synced rows to keep DB small.
  */
 export function purgeSyncedOilSaleForms(ownerId: number, olderThanIso?: string) {
-  if (!ownerId) return;
+  if (!ownerId) {
+    console.log('[OilFormRepo] purgeSyncedOilSaleForms → ownerId missing (no-op)');
+    return;
+  }
   initOilSaleFormDb();
 
   const params: any[] = [ownerId];
@@ -178,11 +233,18 @@ export function purgeSyncedOilSaleForms(ownerId: number, olderThanIso?: string) 
     params.push(olderThanIso);
   }
 
-  db.runSync(
+  const res = db.runSync(
     `
       DELETE FROM oil_sale_forms
       WHERE ${where};
     `,
     params
-  );
+  ) as any;
+
+  const changes = res?.changes ?? res?.rowsAffected ?? res?.rowCount ?? 0;
+  console.log('[OilFormRepo] purgeSyncedOilSaleForms → done', {
+    ownerId,
+    olderThanIso: olderThanIso ?? null,
+    deleted: changes,
+  });
 }

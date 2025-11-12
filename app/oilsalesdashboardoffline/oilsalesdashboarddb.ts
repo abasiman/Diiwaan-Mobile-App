@@ -8,6 +8,7 @@ const TABLE_NAME = 'oil_sales_dashboard';
  * Call once at app startup (RootLayout) to ensure table + index exist.
  */
 export function initOilSalesDashboardDb() {
+  // Base schema (new installs get full schema)
   db.execSync(`
     CREATE TABLE IF NOT EXISTS ${TABLE_NAME} (
       id INTEGER PRIMARY KEY NOT NULL,
@@ -33,6 +34,30 @@ export function initOilSalesDashboardDb() {
       note TEXT
     );
   `);
+
+  // Migration for older installs: add oil_type + truck_plate if missing
+  try {
+    // Will throw if columns do not exist on older DBs
+    db.execSync(
+      `SELECT oil_type, truck_plate FROM ${TABLE_NAME} LIMIT 1;`
+    );
+  } catch (_err) {
+    // Try to add columns one by one (ALTER TABLE is additive)
+    try {
+      db.execSync(
+        `ALTER TABLE ${TABLE_NAME} ADD COLUMN oil_type TEXT;`
+      );
+    } catch (_) {
+      // ignore if it already exists
+    }
+    try {
+      db.execSync(
+        `ALTER TABLE ${TABLE_NAME} ADD COLUMN truck_plate TEXT;`
+      );
+    } catch (_) {
+      // ignore if it already exists
+    }
+  }
 
   db.execSync(`
     CREATE INDEX IF NOT EXISTS idx_oil_sales_dashboard_owner_date

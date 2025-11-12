@@ -46,7 +46,7 @@ import { syncPendingOilModalForms } from './OilModalOffline/oilModalSync';
 import { syncOilSummaryAndWakaaladStats } from './OilPurchaseOffline/oilSummaryStatsSync';
 import { syncAllOilSellOptions } from './WakaaladOffline/oilSellOptionsSync';
 import { syncWakaaladFromServer } from './WakaaladOffline/wakaaladSync';
-import { syncAllOilSales } from './db/oilSalesPageSync';
+
 import { syncPendingOilReprices } from './dbform/oilRepriceOfflineRepo';
 import { syncAllWakaaladSellOptions } from './dbform/wakaaladSellOptionsRepo';
 import { syncPendingOilSaleReversals } from './dbsalereverse/oilSaleReverseOfflineRepo';
@@ -126,9 +126,17 @@ function GlobalSync() {
 
   useEffect(() => {
     const sub = NetInfo.addEventListener((state) => {
-      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      const ok = Boolean(state.isConnected && (state.isInternetReachable ?? true));
+
       setOnline(ok);
     });
+
+
+     // seed once
+  NetInfo.fetch().then((state) => {
+    const ok = Boolean(state.isConnected && (state.isInternetReachable ?? true));
+    setOnline(ok);
+  });
     return () => sub();
   }, []);
 
@@ -188,15 +196,13 @@ function GlobalSync() {
           syncPendingWakaaladForms(ownerId, token)
         );
 
+      console.log('[OilFormSync] about to run, online=', online, 'hasToken=', !!token, 'uid=', user?.id);
 
 
         await run('syncPendingOilSaleForms', () =>
           syncPendingOilSaleForms(ownerId, token)
         ); // 👈 NEW
 
-        await run('syncAllOilSales', () =>
-          syncAllOilSales(ownerId, token)
-        );
 
 
         await run('syncOilSalesSummaryFromServer', () =>
@@ -320,22 +326,21 @@ function OfflineOilSaleSync() {
     syncPendingOilSaleReversals(token, ownerId).catch((e) =>
       console.warn('syncPendingOilSaleReversals failed', e)
     );
+   console.log('[OilFormSync] about to run, online=', online, 'hasToken=', !!token, 'uid=', user?.id);
 
-    // 🟣 NEW: offline oil sale forms (cashsale/invoice)
     // 🟣 offline oil sale forms (cashsale/invoice) → then refresh dashboard cache
  syncPendingOilSaleForms(ownerId, token)
     .then(async () => {
-      // keep old legacy cache if you still use it
-      await syncAllOilSales(ownerId, token);
-
-      // 🔥 IMPORTANT: refresh oil_sales_dashboard, so the new sale
-      // is visible even if the user never opened the dashboard online before
+  
       await syncOilSalesSummaryFromServer({
         token,
         ownerId,
         startDate: ninetyDaysAgo,
         endDate: now,
       });
+
+      console.log('[OfflineOilSaleSync] online=', online, 'token=', !!token, 'uid=', user?.id);
+
     })
     .catch((e) =>
       console.warn('syncPendingOilSaleForms / syncAllOilSales / syncOilSalesSummary failed', e)
