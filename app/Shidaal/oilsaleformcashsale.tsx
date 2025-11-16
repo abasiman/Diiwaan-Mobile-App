@@ -3,11 +3,11 @@
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 import { Feather } from '@expo/vector-icons';
+import NetInfo from '@react-native-community/netinfo';
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import { upsertSingleCustomerInvoiceFromSale } from '../db/CustomerInvoicesPagerepo';
 import { queueOilRepriceForSync } from '../dbform/oilRepriceOfflineRepo';
 import { queueOilSaleOffline, QueueOilSalePayload } from '../oilSalesfOfflineRepo/oilSalesformOfflineRepo';
-
-import NetInfo from '@react-native-community/netinfo';
 
 
 
@@ -1404,6 +1404,57 @@ const confirmAndCreate = async (
           { userId: user.id, rowsCount: 1 }
         );
         await upsertOilSalesFromServer([offlineRow], user.id);
+
+
+              if (user?.id && payload.customer && payload.customer.trim()) {
+        try {
+          const offlineInvoiceSale: OilSaleRead = {
+            id: tempId,
+            oil_id: payload.oil_id,
+            owner_id: user.id,
+            customer: payload.customer ?? null,
+            customer_contact: payload.customer_contact ?? null,
+            oil_type: selected.oil_type,
+            unit_type: payload.unit_type,
+            unit_qty:
+              payload.unit_qty ??
+              (payload.unit_type === 'liters' ? qtyNum : 0),
+            unit_capacity_l: null,
+            liters_sold:
+              payload.liters_sold ??
+              (payload.unit_type === 'liters' ? qtyNum : billedLiters),
+            currency: saleCurrency,
+            price_per_l: payload.price_per_l ?? null,
+            subtotal_native: totalNative,
+            discount_native: null,
+            tax_native: null,
+            total_native: totalNative,
+            fx_rate_to_usd:
+              saleCurrency === 'USD' ? null : fxValid ?? null,
+            total_usd: totalUsd,
+            payment_status: 'paid',
+            payment_method: payload.payment_method ?? null,
+            paid_native: totalNative,
+            note:
+              (payload as any).note ??
+              'Cash sale (offline; pending sync)',
+            created_at: nowIso,
+            updated_at: nowIso,
+          };
+
+          upsertSingleCustomerInvoiceFromSale(user.id, offlineInvoiceSale);
+          console.log(
+            `${LOG_TAG} upsertSingleCustomerInvoiceFromSale() [OFFLINE] SUCCESS`,
+            { ownerId: user.id, saleId: tempId }
+          );
+        } catch (err) {
+          console.warn(
+            `${LOG_TAG} Failed to upsert into customer-invoices DB (offline cash sale)`,
+            err
+          );
+        }
+      }
+
         console.log(
           `${LOG_TAG} upsertOilSalesFromServer() [OFFLINE] → SUCCESS`,
           { userId: user.id, rowsCount: 1 }
@@ -1505,6 +1556,31 @@ const confirmAndCreate = async (
         }
       );
     }
+
+
+        // 🔹 Also mirror into customer-invoices DB *if* there is a customer
+    try {
+      if (user?.id && res.data?.customer && res.data.customer.trim()) {
+        upsertSingleCustomerInvoiceFromSale(user.id, {
+          ...res.data,
+          // Ensure paid_native is at least the total, since this is a cash sale
+          paid_native:
+            res.data.paid_native ??
+            (res.data.total_native ?? null),
+          payment_status: 'paid',
+        });
+        console.log(
+          `${LOG_TAG} upsertSingleCustomerInvoiceFromSale() [ONLINE] SUCCESS`,
+          { ownerId: user.id, saleId: res.data.id }
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `${LOG_TAG} Failed to upsert into customer-invoices DB (online cash sale)`,
+        err
+      );
+    }
+
 
     setReceipt(res.data);
     setReceiptOpen(true);

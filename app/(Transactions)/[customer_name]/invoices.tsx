@@ -4,8 +4,9 @@ import { useAuth } from '@/src/context/AuthContext';
 import {
   getCustomerDetailsLocalByName,
   getCustomerInvoiceReportLocal,
+  getOfflineInvoiceDueByCustomerLocal,
   getSaleLocal,
-  upsertCustomerInvoicesFromServer,
+  upsertCustomerInvoicesFromServer
 } from '@/app/db/CustomerInvoicesPagerepo';
 import { getPendingOilSalesLocalForDisplay } from '@/app/dbform/invocieoilSalesOfflineRepo';
 
@@ -140,14 +141,17 @@ function applyPendingPaymentsToCustomer(
   if (!base || !ownerId || !base.id) return base;
 
   let extraPaid = 0;
+  let extraOfflineDue = 0;
 
   try {
+    // 1) Pending payments queue → extraPaid
     const rows = getPendingPaymentsLocal(ownerId, 500);
     for (const row of rows) {
       try {
         const payload = JSON.parse(
           row.payload_json
         ) as CreatePaymentPayload;
+
         if (
           payload.customer_id === base.id &&
           row.sync_status === 'pending'
@@ -158,18 +162,40 @@ function applyPendingPaymentsToCustomer(
         // ignore malformed rows
       }
     }
+
+    // 2) Offline invoices (id < 0) → extraOfflineDue
+    try {
+      const offlineDueRows = getOfflineInvoiceDueByCustomerLocal(ownerId);
+      const key = (base.name || '').trim().toLowerCase();
+
+      const match = offlineDueRows.find(
+        (r) => r.customer_key === key
+      );
+
+      if (match) {
+        extraOfflineDue = match.extra_due_usd;
+      }
+    } catch {
+      // ignore local DB errors for offline due
+    }
   } catch {
-    // ignore local DB errors
+    // ignore local DB errors for payments
   }
 
-  if (!extraPaid) return base;
+  if (!extraPaid && !extraOfflineDue) return base;
 
   return {
     ...base,
+    // offline payments add to amount_paid
     amount_paid: (base.amount_paid || 0) + extraPaid,
-    amount_due: Math.max(0, (base.amount_due || 0) - extraPaid),
+    // base due + extra due from offline invoices - offline payments
+    amount_due: Math.max(
+      0,
+      (base.amount_due || 0) + extraOfflineDue - extraPaid
+    ),
   };
 }
+
 
 /* ----------------------------- Theme ----------------------------- */
 const BRAND_BLUE = '#0B2447';

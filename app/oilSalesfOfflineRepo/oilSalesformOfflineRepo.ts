@@ -1,8 +1,9 @@
+// app/oilSalesfOfflineRepo/oilSalesformOfflineRepo.ts
 import api from '@/services/api';
+import { deleteCustomerInvoiceLocal } from '../db/CustomerInvoicesPagerepo';
 import { db } from '../db/db'; // ✅ shared DB instance (openDatabaseSync)
 import { getRealWakaaladId } from '../wakaaladformoffline/wakaaladIdMapRepo';
 import { deleteLocalOilSale, upsertOilSalesFromServer } from './oilSalesRepo';
-
 // Make sure this matches all possible unit types in your app
 export type SaleUnitType = 'liters' | 'fuusto' | 'caag' | 'lot';
 export type SaleType = 'cashsale' | 'invoice';
@@ -214,6 +215,22 @@ export async function syncQueuedOilSales(ownerId: number, token: string) {
           console.warn(
             'Failed to delete local temp oil sale',
             row.temp_local_id,
+            e
+          );
+        }
+
+
+
+         // 🔹 NEW: also clean the temp invoice row from customer-invoices DB
+        try {
+          deleteCustomerInvoiceLocal(ownerId, row.temp_local_id);
+        } catch (e) {
+          console.warn(
+            'Failed to delete local temp customer invoice sale',
+            {
+              ownerId,
+              tempLocalId: row.temp_local_id,
+            },
             e
           );
         }

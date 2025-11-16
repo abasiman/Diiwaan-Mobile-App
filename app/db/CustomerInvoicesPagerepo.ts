@@ -489,6 +489,86 @@ export function getSaleLocal(
   return ensureTotalUsd(row);
 }
 
+
+
+
+
+// Extra due from OFFLINE invoices that are not synced yet (id < 0).
+export type OfflineInvoiceDueRow = {
+  customer_key: string;      // lower-cased customer name
+  extra_due_usd: number;     // amount to add to amount_due (USD)
+};
+
+export function getOfflineInvoiceDueByCustomerLocal(
+  ownerId: number
+): OfflineInvoiceDueRow[] {
+  console.log('[getOfflineInvoiceDueByCustomerLocal] START', { ownerId });
+
+  let rows: { customer_lower: string; extra_due_usd: number }[] = [];
+
+  try {
+    rows = db.getAllSync<{
+      customer_lower: string;
+      extra_due_usd: number;
+    }>(
+      `
+        SELECT
+          LOWER(customer) AS customer_lower,
+          SUM(
+            COALESCE(
+              CASE
+                WHEN UPPER(currency) = 'USD'
+                  THEN COALESCE(total_native, 0)
+                ELSE COALESCE(total_usd, 0)
+              END,
+              0
+            )
+            -
+            COALESCE(
+              CASE
+                WHEN UPPER(currency) = 'USD'
+                  THEN COALESCE(paid_native, 0)
+                ELSE 0
+              END,
+              0
+            )
+          ) AS extra_due_usd
+        FROM oilsales
+        WHERE owner_id = ?
+          AND deleted = 0
+          AND id < 0                           -- still offline / temp
+          AND payment_status IN ('unpaid','partial')
+          AND customer IS NOT NULL
+          AND TRIM(customer) <> ''
+        GROUP BY LOWER(customer);
+      `,
+      [ownerId]
+    );
+  } catch (err) {
+    console.error(
+      '[getOfflineInvoiceDueByCustomerLocal] DB query failed',
+      { ownerId },
+      err
+    );
+    throw err;
+  }
+
+  const result: OfflineInvoiceDueRow[] = rows
+    .map((r) => ({
+      customer_key: r.customer_lower,
+      extra_due_usd: safeNum(r.extra_due_usd),
+    }))
+    .filter((r) => r.extra_due_usd !== 0);
+
+  console.log('[getOfflineInvoiceDueByCustomerLocal] DONE', {
+    ownerId,
+    rows: result.length,
+  });
+
+  return result;
+}
+
+
 /* ----------------------------- Customer KPIs from local customers table ----------------------------- */
 
 /**

@@ -4,7 +4,7 @@ import NetInfo from '@react-native-community/netinfo';
 import { useFocusEffect } from '@react-navigation/native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
-
+import { getOfflineInvoiceDueByCustomerLocal } from '../db/CustomerInvoicesPagerepo';
 import { createOrUpdateCustomer } from '../db/customerCreateUpdate';
 
 import {
@@ -306,8 +306,10 @@ export default function CustomersList() {
 
         console.log('[CustomersList] getCustomersLocal returned', data.length, 'rows');
 
-        // 🔹 apply pending offline payments so balances match CustomerInvoicesPage
+        // Start with raw data
         let adjusted = data;
+
+        // 🔹 1) apply pending offline payments (reduce amount_due)
         try {
           const pending = getPendingPaymentsLocal(user.id, 500);
           if (pending.length) {
@@ -318,7 +320,10 @@ export default function CustomersList() {
                 const payload = JSON.parse(row.payload_json) as CreatePaymentPayload;
                 if (payload.customer_id) {
                   const prev = extraByCustomer.get(payload.customer_id) || 0;
-                  extraByCustomer.set(payload.customer_id, prev + (payload.amount || 0));
+                  extraByCustomer.set(
+                    payload.customer_id,
+                    prev + (payload.amount || 0)
+                  );
                 }
               } catch {
                 // ignore bad rows
@@ -326,7 +331,7 @@ export default function CustomersList() {
             }
 
             if (extraByCustomer.size) {
-              adjusted = data.map((c) => {
+              adjusted = adjusted.map((c) => {
                 if (typeof c.id !== 'number') return c;
                 const extra = extraByCustomer.get(c.id) || 0;
                 if (!extra) return c;
@@ -345,8 +350,38 @@ export default function CustomersList() {
           );
         }
 
+        // 🔹 2) apply OFFLINE invoice amounts (increase amount_due) – match invoices page
+        try {
+          const offlineDeltas = getOfflineInvoiceDueByCustomerLocal(user.id);
+          if (offlineDeltas.length) {
+            const extraByName = new Map<string, number>();
+            for (const d of offlineDeltas) {
+              const key = d.customer_key;
+              const prev = extraByName.get(key) || 0;
+              extraByName.set(key, prev + (d.extra_due_usd || 0));
+            }
+
+            adjusted = adjusted.map((c) => {
+              const key = (c.name || '').trim().toLowerCase();
+              if (!key) return c;
+              const extra = extraByName.get(key) || 0;
+              if (!extra) return c;
+              return {
+                ...c,
+                amount_due: (c.amount_due || 0) + extra,
+              };
+            });
+          }
+        } catch (e: any) {
+          console.log(
+            '[CustomersList] applying offline invoice balances failed',
+            e?.message || e
+          );
+        }
+
         // 🔹 merge duplicate customers by NAME so offline + server rows collapse
         const dedupedPage = mergeCustomersByName(adjusted);
+
 
         setCustomers((prev) => {
           if (reset) return dedupedPage;

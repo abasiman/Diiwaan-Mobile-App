@@ -6,7 +6,6 @@ import { Feather } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 
 import NetInfo from '@react-native-community/netinfo';
-
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -22,6 +21,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import { upsertSingleCustomerInvoiceFromSale } from '../db/CustomerInvoicesPagerepo';
 
 import { queueOilRepriceForSync } from '../dbform/oilRepriceOfflineRepo';
 import {
@@ -1533,7 +1533,7 @@ export default function OilSaleInvoiceForm() {
           currency: offlineRow.currency,
         });
 
-        if (user?.id) {
+                if (user?.id) {
           console.log(
             `${LOG_TAG} upsertOilSalesFromServer() [OFFLINE] START`,
             { userId: user.id, rowsCount: 1 }
@@ -1543,11 +1543,59 @@ export default function OilSaleInvoiceForm() {
             `${LOG_TAG} upsertOilSalesFromServer() [OFFLINE] SUCCESS`,
             { userId: user.id, rowsCount: 1 }
           );
+
+          // 🔹 NEW: also write to customer-invoices DB so it shows on the invoices page immediately
+          try {
+            const offlineInvoiceSale = {
+              id: tempId,
+              oil_id: payload.oil_id,
+              owner_id: user.id,
+              customer: payload.customer ?? null,
+              customer_contact: payload.customer_contact ?? null,
+              oil_type: selected.oil_type,
+              unit_type: payload.unit_type,
+              unit_qty:
+                payload.unit_qty ??
+                (payload.unit_type === 'liters' ? qtyNum : 0),
+              unit_capacity_l: null,
+              liters_sold:
+                payload.liters_sold ??
+                (payload.unit_type === 'liters' ? qtyNum : billedLiters),
+              currency: saleCurrency,
+              price_per_l: payload.price_per_l ?? null,
+              subtotal_native: totalNative,
+              discount_native: null,
+              tax_native: null,
+              total_native: totalNative,
+              fx_rate_to_usd:
+                saleCurrency === 'USD' ? null : fxValid ?? null,
+              total_usd: totalUsd,
+              payment_status: 'unpaid' as const,
+              payment_method: (payload.payment_method ??
+                'credit') as 'cash' | 'bank' | 'mobile' | 'credit' | null,
+              paid_native: null,
+              note: (payload as any).note ?? 'Offline sale (pending sync)',
+              created_at: nowIso,
+              updated_at: nowIso,
+            };
+
+            upsertSingleCustomerInvoiceFromSale(user.id, offlineInvoiceSale);
+            console.log(
+              `${LOG_TAG} upsertSingleCustomerInvoiceFromSale() [OFFLINE] SUCCESS`,
+              { ownerId: user.id, saleId: tempId }
+            );
+          } catch (err) {
+            console.warn(
+              `${LOG_TAG} Failed to upsert into customer-invoices DB (offline)`,
+              err
+            );
+          }
         } else {
           console.warn(
             `${LOG_TAG} Skipped local upsert in OFFLINE branch: missing user.id`
           );
         }
+
 
         showToast('Invoice saved offline – will sync when online');
         console.log(`${LOG_TAG} Offline invoice completed; navigate`);
