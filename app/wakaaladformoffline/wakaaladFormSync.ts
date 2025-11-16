@@ -6,6 +6,7 @@ import {
   type WakaaladFormCreatePayload,
 } from './wakaaladFormRepo';
 
+import { saveWakaaladIdMapping } from '../wakaaladformoffline/wakaaladIdMapRepo';
 
 export async function syncPendingWakaaladForms(ownerId: number, token: string) {
   if (!ownerId || !token) return;
@@ -29,6 +30,12 @@ export async function syncPendingWakaaladForms(ownerId: number, token: string) {
 
       const res = await api.post('/wakaalad_diiwaan', payload, { headers });
       const remoteId = Number(res?.data?.id ?? 0) || null;
+
+      // 🔹 If this wakaalad was created offline with a temp (negative) id,
+      //     persist the mapping temp_id -> real_id for this owner.
+      if (remoteId && row.temp_wakaalad_id && row.temp_wakaalad_id < 0) {
+        saveWakaaladIdMapping(ownerId, row.temp_wakaalad_id, remoteId);
+      }
 
       updateWakaaladFormStatus(row.id, 'synced', {
         remote_id: remoteId ?? undefined,

@@ -4,6 +4,9 @@ import NetInfo from '@react-native-community/netinfo';
 import { useFocusEffect } from '@react-navigation/native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
+
+import { createOrUpdateCustomer } from '../db/customerCreateUpdate';
+
 import {
   useCallback,
   useEffect,
@@ -34,13 +37,12 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAuth } from '../../src/context/AuthContext';
 import {
-  createOrUpdateCustomerLocal,
   getCustomersLocal,
   hardDeleteCustomerLocal,
   markCustomerDeletedLocal,
   syncCustomersWithServer,
   upsertCustomersFromServer,
-  type CustomerRow as Customer,
+  type CustomerRow as Customer
 } from '../db/customerRepo';
 
 // 🔹 NEW: pending payments helper
@@ -506,79 +508,60 @@ export default function CustomersList() {
       maximumFractionDigits: 2,
     }).format(n || 0);
 
-  const handleCreateOrUpdate = useCallback(async () => {
-    if (!formName.trim()) {
-      Alert.alert('Fadlan geli magaca macaamiilka');
-      return;
-    }
-    if (!user?.id) {
-      Alert.alert('Error', 'No tenant selected.');
-      return;
-    }
+ const handleCreateOrUpdate = useCallback(async () => {
+  if (!formName.trim()) {
+    Alert.alert('Fadlan geli magaca macaamiilka');
+    return;
+  }
+  if (!user?.id) {
+    Alert.alert('Error', 'No tenant selected.');
+    return;
+  }
 
-    const payload = {
-      name: formName.trim(),
-      phone: formPhone.trim() || null,
-      address: formAddress.trim() || null,
-      status: formStatus || 'active',
-    };
+  const payload = {
+    name: formName.trim(),
+    phone: formPhone.trim() || null,
+    address: formAddress.trim() || null,
+    status: formStatus || 'active',
+  } as const;
 
-    console.log('[CustomersList] handleCreateOrUpdate', {
-      mode: formMode,
-      online,
-      hasToken: !!token,
+  setSubmitting(true);
+  try {
+    await createOrUpdateCustomer({
+      formMode,
       payload,
-      selectedId: selectedCustomer?.id,
+      online,
+      token,
+      userId: user.id,
+      selectedCustomer,
     });
 
-    setSubmitting(true);
-    try {
-      if (online && token) {
-        // Online: hit API, then cache into SQLite
-        if (formMode === 'add') {
-          const res = await api.post('/diiwaancustomers', payload);
-          upsertCustomersFromServer([res.data], user.id);
-          console.log('[CustomersList] created customer on server', res.data?.id);
-        } else if (formMode === 'edit' && selectedCustomer) {
-          const res = await api.patch(
-            `/diiwaancustomers/${selectedCustomer.id}`,
-            payload
-          );
-          upsertCustomersFromServer([res.data], user.id);
-          console.log('[CustomersList] updated customer on server', res.data?.id);
-        }
-      } else {
-        // Offline: write to SQLite only; server will get it on next sync
-        if (formMode === 'add') {
-          const row = createOrUpdateCustomerLocal(payload, user.id);
-          console.log('[CustomersList] created customer locally (offline)', row.id);
-        } else if (formMode === 'edit' && selectedCustomer) {
-          const row = createOrUpdateCustomerLocal(payload, user.id, selectedCustomer);
-          console.log('[CustomersList] updated customer locally (offline)', row.id);
-        }
-      }
+    // UI bits stay here
+    closeAdd();
+    loadPage(true);
+  } catch (e: any) {
+    console.log(
+      '[CustomersList] handleCreateOrUpdate error',
+      e?.response?.data || e?.message || e
+    );
+    Alert.alert('Error', e?.response?.data?.detail || e?.message || 'Operation failed.');
+  } finally {
+    setSubmitting(false);
+  }
+}, [
+  formName,
+  formPhone,
+  formAddress,
+  formStatus,
+  formMode,
+  selectedCustomer,
+  closeAdd,
+  online,
+  token,
+  loadPage,
+  user?.id,
+]);
 
-      closeAdd();
-      loadPage(true);
-    } catch (e: any) {
-      console.log('[CustomersList] handleCreateOrUpdate error', e?.response?.data || e?.message);
-      Alert.alert('Error', e?.response?.data?.detail || 'Operation failed.');
-    } finally {
-      setSubmitting(false);
-    }
-  }, [
-    formName,
-    formPhone,
-    formAddress,
-    formStatus,
-    formMode,
-    selectedCustomer,
-    closeAdd,
-    online,
-    token,
-    loadPage,
-    user?.id,
-  ]);
 
   const handleDelete = useCallback(() => {
     if (!selectedCustomer) return;

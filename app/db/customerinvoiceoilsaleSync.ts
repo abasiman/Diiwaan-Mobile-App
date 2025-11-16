@@ -11,7 +11,15 @@ type CustomerRow = {
 };
 
 export async function syncAllCustomerInvoices(ownerId: number, token: string) {
-  if (!ownerId || !token) return;
+  if (!ownerId || !token) {
+    console.warn('[syncAllCustomerInvoices] Missing ownerId or token', {
+      ownerId,
+      hasToken: !!token,
+    });
+    return;
+  }
+
+  console.log('[syncAllCustomerInvoices] START', { ownerId });
 
   const headers = { Authorization: `Bearer ${token}` };
 
@@ -20,21 +28,39 @@ export async function syncAllCustomerInvoices(ownerId: number, token: string) {
   let hasMore = true;
 
   while (hasMore) {
-    // 1) page through customers
+    console.log('[syncAllCustomerInvoices] Fetching customers page', {
+      offset,
+      limit,
+    });
+
     const res = await api.get<CustomerRow[]>('/diiwaancustomers', {
       headers,
       params: { offset, limit },
     });
 
     const customers = res.data || [];
+    console.log('[syncAllCustomerInvoices] Got customers', {
+      count: customers.length,
+    });
+
     if (!customers.length) break;
 
     // 2) for each customer, fetch their invoices summary & cache to SQLite
     for (const c of customers) {
       const name = (c.name || '').trim();
-      if (!name) continue;
+      if (!name) {
+        console.log(
+          '[syncAllCustomerInvoices] Skipping customer with empty name',
+          c
+        );
+        continue;
+      }
 
       try {
+        console.log('[syncAllCustomerInvoices] Fetching report for', {
+          customerName: name,
+        });
+
         const repRes = await api.get<OilSaleCustomerReport>(
           '/oilsale/summary/by-customer-name',
           {
@@ -50,9 +76,19 @@ export async function syncAllCustomerInvoices(ownerId: number, token: string) {
           }
         );
 
+        const itemsCount = repRes.data?.items?.length ?? 0;
+        console.log('[syncAllCustomerInvoices] Upserting report', {
+          customerName: name,
+          itemsCount,
+        });
+
         upsertCustomerInvoicesFromServer(repRes.data, ownerId);
       } catch (err) {
-        console.warn('syncAllCustomerInvoices error for', name, err);
+        console.warn(
+          '[syncAllCustomerInvoices] error for customer',
+          name,
+          err
+        );
         // continue with next customer
       }
     }
@@ -60,4 +96,6 @@ export async function syncAllCustomerInvoices(ownerId: number, token: string) {
     hasMore = customers.length === limit;
     offset += customers.length;
   }
+
+  console.log('[syncAllCustomerInvoices] DONE', { ownerId });
 }

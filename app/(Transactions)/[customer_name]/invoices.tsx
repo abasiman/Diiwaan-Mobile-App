@@ -8,6 +8,7 @@ import {
   upsertCustomerInvoicesFromServer,
 } from '@/app/db/CustomerInvoicesPagerepo';
 import { getPendingOilSalesLocalForDisplay } from '@/app/dbform/invocieoilSalesOfflineRepo';
+
 import PaymentCreateSheet from '@/app/ManageInvoice/PaymentCreateSheet';
 import api from '@/services/api';
 import { Feather, FontAwesome } from '@expo/vector-icons';
@@ -230,15 +231,42 @@ export default function CustomerInvoicesPage() {
   // NetInfo: track connectivity
   useEffect(() => {
     const sub = NetInfo.addEventListener((state) => {
-      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      const ok = Boolean(
+        state.isConnected && (state.isInternetReachable ?? true)
+      );
+      console.log(
+        '[CustomerInvoicesPage][NetInfo] event',
+        {
+          isConnected: state.isConnected,
+          isInternetReachable: state.isInternetReachable,
+          online: ok,
+        }
+      );
       setOnline(ok);
     });
+
+    // Seed initial value
+    NetInfo.fetch().then((state) => {
+      const ok = Boolean(
+        state.isConnected && (state.isInternetReachable ?? true)
+      );
+      console.log(
+        '[CustomerInvoicesPage][NetInfo] fetch',
+        {
+          isConnected: state.isConnected,
+          isInternetReachable: state.isInternetReachable,
+          online: ok,
+        }
+      );
+      setOnline(ok);
+    });
+
     return () => sub();
   }, []);
 
-  // Profile
+  // Profile (ok to fail offline)
   const fetchProfile = useCallback(async () => {
-    if (!token) return;
+    if (!token || !online) return; // 🔒 don't even try when offline
     try {
       const res = await api.get<MeProfile>('/diiwaan/me', {
         headers: authHeader,
@@ -247,13 +275,16 @@ export default function CustomerInvoicesPage() {
     } catch {
       setMeProfile(null);
     }
-  }, [token, authHeader]);
+  }, [token, authHeader, online]);
 
   // inside CustomerInvoicesPage.tsx
   const fetchReport = useCallback(
     async (name: string) => {
       const trimmed = name.trim();
-      if (!trimmed) return;
+      if (!trimmed || !user?.id) {
+        setLoading(false);
+        return;
+      }
 
       setError(null);
       setLoading(true);
@@ -377,7 +408,7 @@ export default function CustomerInvoicesPage() {
 
       try {
         // ONLINE → API + cache to sqlite
-        if (online && token && user?.id) {
+        if (online && token) {
           const res = await api.get<OilSaleCustomerReport>(
             '/oilsale/summary/by-customer-name',
             {
@@ -438,23 +469,18 @@ export default function CustomerInvoicesPage() {
         }
 
         // OFFLINE (or no token) → local-only + pending offline queue
-        if (user?.id) {
-          const localReport = buildLocalReportWithPending(user.id);
-          setReport(localReport);
+        const localReport = buildLocalReportWithPending(user.id);
+        setReport(localReport);
 
-          const localCustomer = getCustomerDetailsLocalByName(
-            user.id,
-            localReport.customer_name
-          );
-          const withPending = applyPendingPaymentsToCustomer(
-            localCustomer,
-            user.id
-          );
-          setCustomer(withPending);
-        } else {
-          setReport(null);
-          setCustomer(null);
-        }
+        const localCustomer = getCustomerDetailsLocalByName(
+          user.id,
+          localReport.customer_name
+        );
+        const withPending = applyPendingPaymentsToCustomer(
+          localCustomer,
+          user.id
+        );
+        setCustomer(withPending);
       } catch (e: any) {
         // If online call fails, fallback to local cache + pending
         if (user?.id) {
@@ -573,6 +599,13 @@ export default function CustomerInvoicesPage() {
     async (saleId: number) => {
       if (!user?.id) return;
 
+      console.log('[openReceipt] START', {
+        saleId,
+        ownerId: user.id,
+        online,
+        hasToken: !!token,
+      });
+
       setReceiptOpen(true);
       setReceiptLoading(true);
       setActiveSaleId(saleId);
@@ -580,25 +613,30 @@ export default function CustomerInvoicesPage() {
 
       try {
         const isPendingLocal = saleId < 0;
+        console.log('[openReceipt] isPendingLocal', { saleId, isPendingLocal });
 
         if (!isPendingLocal && online && token) {
           // Normal remote sale
-          const res = await api.get<OilSaleRead>(
-            `/oilsale/${saleId}`,
-            {
-              headers: authHeader,
-            }
-          );
+          console.log('[openReceipt] trying API /oilsale/:id', { saleId });
+          const res = await api.get<OilSaleRead>(`/oilsale/${saleId}`, {
+            headers: authHeader,
+          });
+          console.log('[openReceipt] API success', { saleId });
           setActiveSale(res.data);
         } else if (isPendingLocal) {
           // Pending offline sale from queue
-          const pendingAll = getPendingOilSalesLocalForDisplay(
-            user.id,
-            {
-              limit: 500,
-            }
+          console.log(
+            '[openReceipt] pending local sale, loading from queue',
+            { saleId }
           );
+          const pendingAll = getPendingOilSalesLocalForDisplay(user.id, {
+            limit: 500,
+          });
           const p = pendingAll.find((row) => row.id === saleId);
+          console.log('[openReceipt] pending lookup result', {
+            saleId,
+            found: !!p,
+          });
           if (!p) {
             throw new Error('Offline sale not found in queue.');
           }
@@ -633,19 +671,40 @@ export default function CustomerInvoicesPage() {
           setActiveSale(mapped);
         } else {
           // Offline but already-synced sale – use local db
+          console.log(
+            '[openReceipt] offline or no token, using local getSaleLocal',
+            { saleId, ownerId: user.id }
+          );
           const localSale = getSaleLocal(user.id, saleId);
+          console.log('[openReceipt] getSaleLocal result', {
+            saleId,
+            found: !!localSale,
+          });
           if (!localSale)
             throw new Error('Sale not found in local cache.');
           setActiveSale(localSale);
         }
       } catch (e: any) {
+        console.log('[openReceipt] ERROR, entering fallback', {
+          saleId,
+          error: e?.message,
+        });
+
         // Fallback to local for non-pending ids
         if (saleId >= 0 && user?.id) {
           try {
             const localSale = getSaleLocal(user.id, saleId);
+            console.log('[openReceipt] fallback getSaleLocal result', {
+              saleId,
+              found: !!localSale,
+            });
             if (!localSale) throw e;
             setActiveSale(localSale);
           } catch (err: any) {
+            console.log('[openReceipt] fallback FAILED', {
+              saleId,
+              error: err?.message,
+            });
             Alert.alert(
               'Failed to load receipt',
               err?.response?.data?.detail ||
@@ -754,12 +813,6 @@ export default function CustomerInvoicesPage() {
     );
   };
 
-  /**
-   * 🔧 Build a full-length image:
-   * - capture the ScrollView (not just inner paper) so offscreen content is stitched
-   * - use snapshotContentContainer: true
-   * - adapt pixelRatio to avoid Android memory/bitmap height limits
-   */
   const buildCapture = async () => {
     const target = scrollRef.current ?? sheetRef.current;
     if (!target) throw new Error('Nothing to capture');
@@ -1024,7 +1077,7 @@ export default function CustomerInvoicesPage() {
                 )}
               </View>
 
-              {/* KPI cards from Macaamiil (amount_paid / amount_due) */}
+              {/* KPI cards (amount paid / due) */}
               <View style={styles.kpisInline}>
                 <View style={styles.kpiCardInline}>
                   <Text style={styles.kpiLabel}>Bixisay</Text>
@@ -1158,9 +1211,6 @@ export default function CustomerInvoicesPage() {
           ''
         }
       />
-
-      {/* Oil sale create modal (if you later add) */}
-      {/* <OilSaleCreateSheet visible={isSaleOpen} onClose={() => setIsSaleOpen(false)} /> */}
     </SafeAreaView>
   );
 }
@@ -1413,7 +1463,7 @@ function ReceiptModal({
           ) : (
             <Text
               style={{
-                textAlign: 'center,',
+                textAlign: 'center',
                 color: MUTED,
               }}
             >

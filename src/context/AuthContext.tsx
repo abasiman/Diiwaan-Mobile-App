@@ -4,7 +4,6 @@ import api from '@/services/api';
 import NetInfo from '@react-native-community/netinfo';
 import * as SecureStore from 'expo-secure-store';
 
-import { syncAllCustomerInvoices } from '@/app/db/oilsaleSync';
 import qs from 'qs';
 import { createContext, ReactNode, useContext, useEffect, useState } from 'react';
 
@@ -237,9 +236,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!online) return;
       if (!quickUser.id) return;
 
-      syncAllCustomerInvoices(quickUser.id, loginResp.data.access_token).catch((err) => {
-        console.warn('Initial invoice sync after signup failed', err);
-      });
+  
     });
 
     fetchProfileWithToken(loginResp.data.access_token).catch(() => {});
@@ -286,9 +283,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!online) return;
       if (!quickUser.id) return;
 
-      syncAllCustomerInvoices(quickUser.id, resp.data.access_token).catch((err) => {
-        console.warn('Initial invoice sync after login failed', err);
-      });
     });
 
     fetchProfileWithToken(resp.data.access_token).catch(() => {});

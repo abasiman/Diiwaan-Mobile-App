@@ -4,6 +4,12 @@ import { Redirect, Slot, usePathname } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import * as Updates from 'expo-updates';
 
+import { syncAllCustomerInvoices } from './db/customerinvoiceoilsaleSync';
+import { initOilSalesDb } from './oilSalesfOfflineRepo/oilSalesRepo';
+
+import { syncOilSales } from './oilSalesfOfflineRepo/oilSalesSync';
+import { initOilSalesOfflineDb, syncPendingOilSales } from './oilSalesfOfflineRepo/oilSalesformOfflineRepo';
+
 
 
 import NetInfo from '@react-native-community/netinfo';
@@ -24,7 +30,6 @@ import { initCustomerInvoiceDb } from './db/customerinvoicedb';
 import { initCustomerLedgerDb } from './db/customerledgerdb';
 import { initDb } from './db/db';
 import { initIncomeStatementDb } from './offlineincomestatement/incomeStatementDb';
-import { initOilSaleFormDb } from './oilsaleformoffline/oilSaleFormDb';
 import { initMeProfileDb } from './profile/meProfileDb';
 import { initVendorPaymentsScreenDb } from './vendorPaymentTransactionsOffline/vendorPaymentsScreenDb';
 import { initWakaaladActionsOfflineDb } from './wakaaladActionsOffline/wakaaladActionsOfflineDb';
@@ -36,7 +41,6 @@ import { initExtraCostCreateDb } from './FormExtraCostsOffline/extraCostCreateDb
 
 import { initWakaaladSellOptionsDb } from './dbform/wakaaladSellOptionsRepo';
 
-import { initOilSalesDashboardDb } from './oilsalesdashboardoffline/oilsalesdashboarddb';
 
 // 🔹 Sync imports
 import { syncAllExtraCosts } from './ExtraCostsOffline/extraCostsSync';
@@ -52,13 +56,11 @@ import { syncAllWakaaladSellOptions } from './dbform/wakaaladSellOptionsRepo';
 import { syncPendingOilSaleReversals } from './dbsalereverse/oilSaleReverseOfflineRepo';
 import { syncPendingVendorPayments } from './offlinecreatevendorpayment/vendorPaymentCreateSync';
 import { syncIncomeStatement } from './offlineincomestatement/incomeStatementSync';
-import { syncOilSalesSummaryFromServer } from './oilsalesdashboardoffline/oilsalesdashboardsync';
 import { syncMeProfile } from './profile/meProfileSync';
 import { syncPendingWakaaladActions } from './wakaaladActionsOffline/wakaaladActionsSync';
 import { syncPendingWakaaladForms } from './wakaaladformoffline/wakaaladFormSync';
 
 import { getVendorBillsWithSync } from './OilPurchaseOffline/oilpurchasevendorbillsync';
-import { syncPendingOilSaleForms } from './oilsaleformoffline/oilSaleFormSync';
 import { getVendorPaymentsScreenWithSync } from './vendorPaymentTransactionsOffline/vendorPaymentsScreenSync';
 import { getWakaaladMovementScreenWithSync } from './wakaaladMovementoffline/wakaaladMovementScreenSync';
 
@@ -81,8 +83,7 @@ export default function RootLayout() {
     initOilSellOptionsDb();
     initWakaaladFormDb();
 
-     // oil sale form
-     initOilSaleFormDb();
+     
 
     // wakaalad movements screen cache
     initWakaaladMovementScreenDb();
@@ -99,7 +100,15 @@ export default function RootLayout() {
     initWakaaladActionsOfflineDb();
     initPaymentOfflineDb();
     initMeProfileDb();
-    initOilSalesDashboardDb();
+
+      initOilSalesDb();
+
+
+
+        // ✅ oil sales cache + queue
+  initOilSalesDb();
+  initOilSalesOfflineDb();
+
   }, []);
 
   return (
@@ -119,6 +128,7 @@ export default function RootLayout() {
 }
 
 /* ----------------------------- Global sync (once per login + online) ----------------------------- */
+/* ----------------------------- Global sync (once per login + online) ----------------------------- */
 function GlobalSync() {
   const { token, user } = useAuth();
   const [online, setOnline] = React.useState(true);
@@ -127,16 +137,14 @@ function GlobalSync() {
   useEffect(() => {
     const sub = NetInfo.addEventListener((state) => {
       const ok = Boolean(state.isConnected && (state.isInternetReachable ?? true));
-
       setOnline(ok);
     });
 
-
-     // seed once
-  NetInfo.fetch().then((state) => {
-    const ok = Boolean(state.isConnected && (state.isInternetReachable ?? true));
-    setOnline(ok);
-  });
+    // seed once
+    NetInfo.fetch().then((state) => {
+      const ok = Boolean(state.isConnected && (state.isInternetReachable ?? true));
+      setOnline(ok);
+    });
     return () => sub();
   }, []);
 
@@ -148,7 +156,11 @@ function GlobalSync() {
     (async () => {
       const ownerId = user.id;
       const now = new Date();
+      
+      // Use 90 days ago for *other* syncs as you had before
       const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+      
+      
 
       const run = async (label: string, fn: () => Promise<unknown> | unknown) => {
         try {
@@ -165,7 +177,7 @@ function GlobalSync() {
         await run('syncPendingOilModalForms', () =>
           syncPendingOilModalForms(ownerId, token)
         );
-    
+
         await run('syncPendingOilReprices', () =>
           syncPendingOilReprices(token, ownerId)
         );
@@ -196,23 +208,13 @@ function GlobalSync() {
           syncPendingWakaaladForms(ownerId, token)
         );
 
-      console.log('[OilFormSync] about to run, online=', online, 'hasToken=', !!token, 'uid=', user?.id);
-
-
-        await run('syncPendingOilSaleForms', () =>
-          syncPendingOilSaleForms(ownerId, token)
-        ); // 👈 NEW
-
-
-
-        await run('syncOilSalesSummaryFromServer', () =>
-  syncOilSalesSummaryFromServer({
-    token,
-    ownerId,
-    startDate: ninetyDaysAgo,
-    endDate: now,
-  })
+       
+      await run('syncPendingOilSales', () =>
+  syncPendingOilSales(token, ownerId)
 );
+
+        
+
         await run('syncAllWakaaladSellOptions', () =>
           syncAllWakaaladSellOptions(ownerId, token)
         );
@@ -245,9 +247,25 @@ function GlobalSync() {
         await run('syncOilSummaryAndWakaaladStats', () =>
           syncOilSummaryAndWakaaladStats(token, ownerId)
         );
-        await run('syncWakaaladFromServer', () =>
-          syncWakaaladFromServer({
-            token,
+
+
+        // ✅ new: full oil sales sync (last 90 days)
+      await run('syncOilSales', () =>
+        syncOilSales({
+          token,
+          ownerId,
+          fromDate: ninetyDaysAgo.toISOString(),
+          toDate: now.toISOString(),
+        })
+      );
+
+      await run('syncAllCustomerInvoices', () =>
+  syncAllCustomerInvoices(ownerId, token)
+);
+
+      await run('syncWakaaladFromServer', () =>
+        syncWakaaladFromServer({
+          token,
             ownerId,
             startDate: ninetyDaysAgo,
             endDate: now,
@@ -261,94 +279,83 @@ function GlobalSync() {
 
   return null;
 }
-
 /* ----------------------------- Global offline queue sync on connectivity + foreground ----------------------------- */
 function OfflineOilSaleSync() {
   const { token, user } = useAuth();
   const [online, setOnline] = React.useState(true);
   const appState = React.useRef(AppState.currentState);
 
-  // track connectivity
+  // track connectivity (make it match GlobalSync)
   useEffect(() => {
     const sub = NetInfo.addEventListener((state) => {
-      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      const ok = Boolean(state.isConnected && (state.isInternetReachable ?? true));
       setOnline(ok);
     });
+
+    // 🔹 seed initial state, just like GlobalSync
+    NetInfo.fetch().then((state) => {
+      const ok = Boolean(state.isConnected && (state.isInternetReachable ?? true));
+      setOnline(ok);
+    });
+
     return () => sub();
   }, []);
 
-  // helper that actually pushes all queues
   const runSync = React.useCallback(() => {
     if (!online || !token || !user?.id) return;
 
     const ownerId = user.id;
+    const now = new Date();
+    const startDate = new Date(now.getFullYear(), now.getMonth(), 1);
 
-      const now = new Date();
-  const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
 
-
-    // 🔹 offline reprices
+    // reprices
     syncPendingOilReprices(token, ownerId).catch((e) =>
       console.warn('syncPendingOilReprices failed', e)
     );
 
-    // 🔹 extra-costs create queue
+    // extra-costs
     syncPendingOilExtraCosts(token, ownerId).catch((e) =>
       console.warn('syncPendingOilExtraCosts failed', e)
     );
 
-    // 🔹 oil create modal forms (single / both)
+    // oil create forms
     syncPendingOilModalForms(ownerId, token).catch((e) =>
       console.warn('syncPendingOilModalForms failed', e)
     );
 
-    // 💳 payments queue
+    // payments
     syncPendingPayments(token, ownerId).catch((e) =>
       console.warn('syncPendingPayments failed', e)
     );
 
-    // 🟣 wakaalad actions queue
+    // wakaalad queues
     syncPendingWakaaladActions(token, ownerId).catch((e) =>
       console.warn('syncPendingWakaaladActions failed', e)
     );
-
-    // 🟣 wakaalad forms queue
     syncPendingWakaaladForms(ownerId, token).catch((e) =>
       console.warn('syncPendingWakaaladForms failed', e)
     );
 
-    // 🟣 vendor payments queue
     syncPendingVendorPayments(token, ownerId).catch((e) =>
       console.warn('syncPendingVendorPayments failed', e)
     );
 
-    // 🟣 oil sale reversals (if created offline)
     syncPendingOilSaleReversals(token, ownerId).catch((e) =>
       console.warn('syncPendingOilSaleReversals failed', e)
     );
-   console.log('[OilFormSync] about to run, online=', online, 'hasToken=', !!token, 'uid=', user?.id);
 
-    // 🟣 offline oil sale forms (cashsale/invoice) → then refresh dashboard cache
- syncPendingOilSaleForms(ownerId, token)
-    .then(async () => {
-  
-      await syncOilSalesSummaryFromServer({
-        token,
-        ownerId,
-        startDate: ninetyDaysAgo,
-        endDate: now,
-      });
 
-      console.log('[OfflineOilSaleSync] online=', online, 'token=', !!token, 'uid=', user?.id);
+    
+  // ✅ NEW: oil sales queue
+  syncPendingOilSales(token, ownerId).catch((e) =>
+    console.warn('syncPendingOilSales failed', e)
+  );
 
-    })
-    .catch((e) =>
-      console.warn('syncPendingOilSaleForms / syncAllOilSales / syncOilSalesSummary failed', e)
-    );
-
+    
   }, [online, token, user?.id]);
 
-  // ✅ when connectivity becomes online → sync
+  // when connectivity becomes online → sync
   useEffect(() => {
     if (online) runSync();
   }, [online, runSync]);
@@ -369,6 +376,7 @@ function OfflineOilSaleSync() {
 
   return null;
 }
+
 
 
 /* ----------------------------- Inset tints ----------------------------- */

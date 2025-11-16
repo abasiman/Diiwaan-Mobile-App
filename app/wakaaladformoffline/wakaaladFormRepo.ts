@@ -1,9 +1,9 @@
 // app/dbform/wakaaladFormRepo.ts
 import { db } from '../db/db';
 import {
-    initWakaaladFormDb,
-    type WakaaladFormRow,
-    type WakaaladFormStatus,
+  initWakaaladFormDb,
+  type WakaaladFormRow,
+  type WakaaladFormStatus,
 } from './wakaaladFormDb';
 
 export type WakaaladFormCreatePayload = {
@@ -16,10 +16,15 @@ export type WakaaladFormCreatePayload = {
 /**
  * Insert a wakaalad form into the local queue for later sync.
  * Returns the local row id (useful if you want to reference it in UI).
+ *
+ * 🔹 tempWakaaladId is the negative temp wakaalad_id you used in local
+ *     wakaalad_sell_options / dropdown. This lets us later map it to the
+ *     real server ID and fix any offline oil sales that referenced it.
  */
 export function queueWakaaladFormForSync(
   ownerId: number,
-  payload: WakaaladFormCreatePayload
+  payload: WakaaladFormCreatePayload,
+  tempWakaaladId?: number | null
 ): number {
   if (!ownerId) throw new Error('ownerId is required');
   if (!payload.oil_id) throw new Error('oil_id is required');
@@ -36,11 +41,12 @@ export function queueWakaaladFormForSync(
         wakaalad_name,
         allocate_liters,
         date,
+        temp_wakaalad_id,
         status,
         created_at,
         updated_at
       )
-      VALUES (?, ?, ?, ?, ?, 'pending', ?, ?);
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?);
     `,
     [
       ownerId,
@@ -48,6 +54,7 @@ export function queueWakaaladFormForSync(
       payload.wakaalad_name.trim(),
       Number(payload.allocate_liters || 0),
       payload.date ?? null,
+      tempWakaaladId ?? null,
       now,
       now,
     ]
@@ -82,6 +89,7 @@ export function getPendingWakaaladForms(
         wakaalad_name,
         allocate_liters,
         date,
+        temp_wakaalad_id,
         status,
         error,
         remote_id,
@@ -130,7 +138,10 @@ export function updateWakaaladFormStatus(
 /**
  * Optional: purge old synced rows to keep DB small.
  */
-export function purgeSyncedWakaaladForms(ownerId: number, olderThanIso?: string) {
+export function purgeSyncedWakaaladForms(
+  ownerId: number,
+  olderThanIso?: string
+) {
   if (!ownerId) return;
   initWakaaladFormDb();
 

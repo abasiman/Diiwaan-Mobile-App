@@ -4,26 +4,24 @@ import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 import { AntDesign, Feather, MaterialCommunityIcons } from '@expo/vector-icons';
 
+
 import {
-  getOilSalesSummaryLocal,
-  getPendingOilSalesLocalForDisplay,
-  type OilSaleRead,
-  type OilSaleWithMeta,
-  type TotalsPayload,
-} from './oilsalesdashboardoffline/oilsalesdashboardrepo';
-
-
+  deleteLocalOilSale,
+  ensureOilSalesTable,
+  getOilSalesLocal,
+  upsertOilSalesFromServer
+} from './oilSalesfOfflineRepo/oilSalesRepo';
 
 
 
 
 
 import DateTimePicker from '@react-native-community/datetimepicker';
-import NetInfo from '@react-native-community/netinfo';
+import { useFocusEffect } from '@react-navigation/native';
 import dayjs from 'dayjs';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Print from 'expo-print';
-import { usePathname, useRouter } from 'expo-router';
+import { useRouter } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import React, {
   useCallback,
@@ -47,10 +45,38 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { syncOilSalesSummaryFromServer } from './oilsalesdashboardoffline/oilsalesdashboardsync';
 
 import EditOilSaleModal from './Shidaal/editoilsalemodal';
 import ReverseOilSaleModal from './Shidaal/oilsalerevemodal';
+
+/* ======================= Types ======================= */
+
+type OilUnitType = 'liters' | 'fuusto' | 'caag' | 'lot';
+
+interface OilSaleRead {
+  id?: number;
+  oil_type?: string | null;
+  payment_status?: string | null;
+  customer?: string | null;
+  customer_contact?: string | null;
+  truck_plate?: string | null;
+  unit_type: OilUnitType;
+  unit_qty?: number | null;
+  liters_sold?: number | null;
+  price_per_unit_type?: number | null;
+  price_per_l?: number | null;
+  total_native?: number | null;
+  total_usd?: number | null;
+  currency?: string | null;
+  fx_rate_to_usd?: number | null;
+  tax_native?: number | null;
+  discount_native?: number | null;
+  payment_method?: string | null;
+  note?: string | null;
+  created_at: string;
+}
+
+type OilSaleWithMeta = OilSaleRead;
 
 /* ======================= Utilities ======================= */
 const fmtNumber = (value: number | null | undefined, digits: number = 2) => {
@@ -100,44 +126,25 @@ const unitCapacity = (
 };
 
 /* ======================= Visual helpers ======================= */
-const getTypeVisuals = (
-  oil?: string | null,
-  status?: string | null
-) => {
+const getTypeVisuals = (oil?: string | null, status?: string | null) => {
   const o = (oil || '').toLowerCase();
   const base = {
     diesel: {
       bg: '#ECFDF5',
       color: '#065F46',
-      icon: (
-        <MaterialCommunityIcons
-          name="fuel"
-          size={16}
-          color="#065F46"
-        />
-      ),
+      icon: <MaterialCommunityIcons name="fuel" size={16} color="#065F46" />,
     },
     petrol: {
       bg: '#EFF6FF',
       color: '#1D4ED8',
       icon: (
-        <MaterialCommunityIcons
-          name="gas-station"
-          size={16}
-          color="#1D4ED8"
-        />
+        <MaterialCommunityIcons name="gas-station" size={16} color="#1D4ED8" />
       ),
     },
     default: {
       bg: '#F1F5F9',
       color: '#334155',
-      icon: (
-        <MaterialCommunityIcons
-          name="oil"
-          size={16}
-          color="#334155"
-        />
-      ),
+      icon: <MaterialCommunityIcons name="oil" size={16} color="#334155" />,
     },
   } as const;
   const tone = o.includes('diesel')
@@ -240,10 +247,7 @@ function ReceiptModal({
             <Text style={styles.rcBrand} allowFontScaling={false}>
               Oil Sale
             </Text>
-            <TouchableOpacity
-              onPress={onClose}
-              style={styles.rcClose}
-            >
+            <TouchableOpacity onPress={onClose} style={styles.rcClose}>
               <Feather name="x" size={14} color="#0f172a" />
             </TouchableOpacity>
           </View>
@@ -282,10 +286,7 @@ function ReceiptModal({
 
             {(sale.customer || sale.customer_contact) && (
               <View style={styles.rcBlock}>
-                <Text
-                  style={styles.rcBlockTitle}
-                  allowFontScaling={false}
-                >
+                <Text style={styles.rcBlockTitle} allowFontScaling={false}>
                   Customer
                 </Text>
                 {sale.customer ? (
@@ -303,10 +304,7 @@ function ReceiptModal({
 
             {(sale.truck_plate || '').trim().length > 0 && (
               <View style={styles.rcBlock}>
-                <Text
-                  style={styles.rcBlockTitle}
-                  allowFontScaling={false}
-                >
+                <Text style={styles.rcBlockTitle} allowFontScaling={false}>
                   Truck
                 </Text>
                 <Text style={styles.rcLine} allowFontScaling={false}>
@@ -316,10 +314,7 @@ function ReceiptModal({
             )}
 
             <View style={[styles.rcBlock, { paddingBottom: 6 }]}>
-              <Text
-                style={styles.rcBlockTitle}
-                allowFontScaling={false}
-              >
+              <Text style={styles.rcBlockTitle} allowFontScaling={false}>
                 Line
               </Text>
               <View style={styles.rcRowHead}>
@@ -330,28 +325,19 @@ function ReceiptModal({
                   Description
                 </Text>
                 <Text
-                  style={[
-                    styles.rcHeadCell,
-                    { flex: 1, textAlign: 'center' },
-                  ]}
+                  style={[styles.rcHeadCell, { flex: 1, textAlign: 'center' }]}
                   allowFontScaling={false}
                 >
                   Qty
                 </Text>
                 <Text
-                  style={[
-                    styles.rcHeadCell,
-                    { flex: 1, textAlign: 'right' },
-                  ]}
+                  style={[styles.rcHeadCell, { flex: 1, textAlign: 'right' }]}
                   allowFontScaling={false}
                 >
                   Unit
                 </Text>
                 <Text
-                  style={[
-                    styles.rcHeadCell,
-                    { flex: 1.2, textAlign: 'right' },
-                  ]}
+                  style={[styles.rcHeadCell, { flex: 1.2, textAlign: 'right' }]}
                   allowFontScaling={false}
                 >
                   Amount
@@ -368,19 +354,13 @@ function ReceiptModal({
                   {sale.oil_type} — {unitName === 'liters' ? 'L' : unitName}
                 </Text>
                 <Text
-                  style={[
-                    styles.rcCell,
-                    { flex: 1, textAlign: 'center' },
-                  ]}
+                  style={[styles.rcCell, { flex: 1, textAlign: 'center' }]}
                   allowFontScaling={false}
                 >
                   {fmtNumber(units ?? 0, 0)}
                 </Text>
                 <Text
-                  style={[
-                    styles.rcCell,
-                    { flex: 1, textAlign: 'right' },
-                  ]}
+                  style={[styles.rcCell, { flex: 1, textAlign: 'right' }]}
                   allowFontScaling={false}
                 >
                   {ppu != null ? fmtMoney(ppu, sale.currency) : '—'}
@@ -408,10 +388,7 @@ function ReceiptModal({
                     </Text>
                   ) : null}
                   {sale.total_usd != null ? (
-                    <Text
-                      style={styles.rcFxUsd}
-                      allowFontScaling={false}
-                    >
+                    <Text style={styles.rcFxUsd} allowFontScaling={false}>
                       {fmtMoney(sale.total_usd, 'USD')}
                     </Text>
                   ) : null}
@@ -421,10 +398,7 @@ function ReceiptModal({
 
             {sale.note ? (
               <View style={styles.rcBlock}>
-                <Text
-                  style={styles.rcBlockTitle}
-                  allowFontScaling={false}
-                >
+                <Text style={styles.rcBlockTitle} allowFontScaling={false}>
                   Note
                 </Text>
                 <Text style={styles.rcLine} allowFontScaling={false}>
@@ -445,20 +419,10 @@ function ReceiptModal({
               {(sale.currency || '').toUpperCase() !== 'USD' &&
               sale.fx_rate_to_usd ? (
                 <View style={styles.rcSumRow}>
-                  <Text
-                    style={[
-                      styles.rcSumLabel,
-                      { opacity: 0.9 },
-                    ]}
-                  >
+                  <Text style={[styles.rcSumLabel, { opacity: 0.9 }]}>
                     Subtotal (USD)
                   </Text>
-                  <Text
-                    style={[
-                      styles.rcSumValue,
-                      { fontWeight: '800' },
-                    ]}
-                  >
+                  <Text style={[styles.rcSumValue, { fontWeight: '800' }]}>
                     {fmtMoney(subtotalUSD, 'USD')}
                   </Text>
                 </View>
@@ -499,15 +463,8 @@ function ReceiptModal({
               style={[styles.rcBtn, styles.rcBtnGhost]}
               onPress={onEdit}
             >
-              <Feather
-                name="edit-3"
-                size={14}
-                color="#0B2447"
-              />
-              <Text
-                style={styles.rcBtnGhostTxt}
-                allowFontScaling={false}
-              >
+              <Feather name="edit-3" size={14} color="#0B2447" />
+              <Text style={styles.rcBtnGhostTxt} allowFontScaling={false}>
                 Edit
               </Text>
             </TouchableOpacity>
@@ -515,31 +472,17 @@ function ReceiptModal({
               style={[styles.rcBtn, styles.rcBtnDanger]}
               onPress={onAskDelete}
             >
-              <Feather
-                name="trash-2"
-                size={14}
-                color="#fff"
-              />
-              <Text
-                style={styles.rcBtnDangerTxt}
-                allowFontScaling={false}
-              >
+              <Feather name="trash-2" size={14} color="#fff" />
+              <Text style={styles.rcBtnDangerTxt} allowFontScaling={false}>
                 Delete
               </Text>
             </TouchableOpacity>
 
             <TouchableOpacity
-              style={[
-                styles.rcBtn,
-                { backgroundColor: '#0B2447' },
-              ]}
+              style={[styles.rcBtn, { backgroundColor: '#0B2447' }]}
               onPress={onOpenReverse}
             >
-              <Feather
-                name="rotate-ccw"
-                size={14}
-                color="#fff"
-              />
+              <Feather name="rotate-ccw" size={14} color="#fff" />
               <Text
                 style={{
                   color: '#fff',
@@ -588,28 +531,18 @@ function DeleteConfirmModal({
       <View style={styles.delBackdrop}>
         <View style={styles.delCard}>
           <View style={styles.delIconWrap}>
-            <Feather
-              name="alert-triangle"
-              size={20}
-              color="#DC2626"
-            />
+            <Feather name="alert-triangle" size={20} color="#DC2626" />
           </View>
           <Text style={styles.delTitle} allowFontScaling={false}>
             Delete this sale?
           </Text>
           <Text style={styles.delBody} allowFontScaling={false}>
-            This will revert liters to the original lot and
-            permanently remove the record.
+            This will revert liters to the original lot and permanently remove the
+            record.
           </Text>
           <View style={styles.delActions}>
-            <TouchableOpacity
-              style={styles.delCancel}
-              onPress={onCancel}
-            >
-              <Text
-                style={styles.delCancelTxt}
-                allowFontScaling={false}
-              >
+            <TouchableOpacity style={styles.delCancel} onPress={onCancel}>
+              <Text style={styles.delCancelTxt} allowFontScaling={false}>
                 Cancel
               </Text>
             </TouchableOpacity>
@@ -622,15 +555,8 @@ function DeleteConfirmModal({
                 <ActivityIndicator size="small" color="#fff" />
               ) : (
                 <>
-                  <Feather
-                    name="trash-2"
-                    size={14}
-                    color="#fff"
-                  />
-                  <Text
-                    style={styles.delConfirmTxt}
-                    allowFontScaling={false}
-                  >
+                  <Feather name="trash-2" size={14} color="#fff" />
+                  <Text style={styles.delConfirmTxt} allowFontScaling={false}>
                     Delete
                   </Text>
                 </>
@@ -714,11 +640,7 @@ function ExportModal({
             style={styles.expCloseAbsolute}
             onPress={onClose}
           >
-            <AntDesign
-              name="close"
-              size={18}
-              color="#334155"
-            />
+            <AntDesign name="close" size={18} color="#334155" />
           </TouchableOpacity>
 
           <Text style={styles.expTitle} allowFontScaling={false}>
@@ -735,10 +657,7 @@ function ExportModal({
               disabled={!pdfUri}
             >
               <Feather name="send" size={16} color="#fff" />
-              <Text
-                style={styles.expBtnPrimaryTxt}
-                allowFontScaling={false}
-              >
+              <Text style={styles.expBtnPrimaryTxt} allowFontScaling={false}>
                 Send to WhatsApp
               </Text>
             </TouchableOpacity>
@@ -748,15 +667,8 @@ function ExportModal({
               onPress={downloadShare}
               disabled={!pdfUri}
             >
-              <Feather
-                name="download"
-                size={16}
-                color="#0B2447"
-              />
-              <Text
-                style={styles.expBtnGhostTxt}
-                allowFontScaling={false}
-              >
+              <Feather name="download" size={16} color="#0B2447" />
+              <Text style={styles.expBtnGhostTxt} allowFontScaling={false}>
                 Download / Share
               </Text>
             </TouchableOpacity>
@@ -782,9 +694,7 @@ export default function OilSalesPage() {
   const [error, setError] = useState<string | null>(null);
   const [reverseOpen, setReverseOpen] = useState(false);
 
-  const [items, setItems] = useState<OilSaleRead[]>([]);
-  const [totals, setTotals] = useState<TotalsPayload | null>(null);
-  const [pendingItems, setPendingItems] = useState<OilSaleWithMeta[]>([]);
+  const [items, setItems] = useState<OilSaleWithMeta[]>([]);
 
   const [selected, setSelected] = useState<OilSaleWithMeta | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -796,9 +706,9 @@ export default function OilSalesPage() {
 
   const [search, setSearch] = useState('');
   const [showFilters, setShowFilters] = useState(false);
-  const [showDatePicker, setShowDatePicker] = useState<
-    'start' | 'end' | null
-  >(null);
+  const [showDatePicker, setShowDatePicker] = useState<'start' | 'end' | null>(
+    null
+  );
   const [dateRange, setDateRange] = useState({
     startDate: dayjs().startOf('month').toDate(),
     endDate: dayjs().endOf('day').toDate(),
@@ -806,18 +716,13 @@ export default function OilSalesPage() {
 
   const [platePickerOpen, setPlatePickerOpen] = useState(false);
   const [plateQuery, setPlateQuery] = useState('');
-  const [selectedPlate, setSelectedPlate] = useState<string | null>(
-    null
-  );
+  const [selectedPlate, setSelectedPlate] = useState<string | null>(null);
 
   const [newSaleOpen, setNewSaleOpen] = useState(false);
 
-  const [online, setOnline] = useState(true);
-
-  const pathname = usePathname();
   const router = useRouter();
 
-    // Hardware back → always go to /menu
+  // Hardware back → always go to /menu
   useEffect(() => {
     const onHardwareBackPress = () => {
       router.replace('/menu');
@@ -833,19 +738,11 @@ export default function OilSalesPage() {
   }, [router]);
 
 
-  // Connectivity
-  useEffect(() => {
-    const sub = NetInfo.addEventListener((state) => {
-      const ok = Boolean(
-        state.isConnected && state.isInternetReachable
-      );
-      setOnline(ok);
-    });
-    return () => sub();
-  }, []);
-
 const fetchSummary = useCallback(async () => {
-  if (!user?.id) return;
+  if (!user?.id) {
+    console.log('[OilSalesDashboard] No user.id → abort fetchSummary');
+    return;
+  }
 
   setError(null);
   setLoading(true);
@@ -853,48 +750,87 @@ const fetchSummary = useCallback(async () => {
   const fromISO = dayjs(dateRange.startDate).startOf('day').toISOString();
   const toISO = dayjs(dateRange.endDate).endOf('day').toISOString();
 
+  console.log('[OilSalesDashboard] fetchSummary called', {
+    ownerId: user.id,
+    fromISO,
+    toISO,
+  });
+
   try {
-    // 0) Always *attempt* to push queue if we have a token.
-  
-    // 1) Always try to refresh from server if we have a token.
-      // 1) ✅ only refresh snapshot from server (like wakaalad)
-    if (online && token) {
-      try {
-        await syncOilSalesSummaryFromServer({
-          token,
-          ownerId: user.id,
-          startDate: dateRange.startDate,
-          endDate: dateRange.endDate,
-        });
-      } catch (e) {
-        console.warn('syncOilSalesSummaryFromServer failed', e);
+    await ensureOilSalesTable();
+
+    // 1) Pull from server → local (no queue sync here anymore)
+    try {
+      const res = await api.get('/oilsale/summary', {
+        headers: authHeader,
+        params: {
+          owner_id: user.id,
+          // ⚠️ IMPORTANT: if your FastAPI endpoint uses from_date / to_date instead,
+          // change to these lines and remove from_date/to_date.
+          from_date: fromISO,
+          to_date: toISO,
+          // start_date: fromISO,
+          // end_date: toISO,
+          limit: 200,
+        },
+      });
+
+      console.log(
+        '[OilSalesDashboard] /oilsale/summary raw response:',
+        res.data
+      );
+
+      const raw = res.data;
+      const data = Array.isArray(raw?.items)
+        ? raw.items
+        : Array.isArray(raw)
+        ? raw
+        : Array.isArray(raw?.results)
+        ? raw.results
+        : [];
+
+      console.log('[OilSalesDashboard] parsed items length =', data.length);
+
+      if (data.length) {
+        await upsertOilSalesFromServer(data, user.id);
+      } else {
+        console.log(
+          '[OilSalesDashboard] No rows from server, relying on local only'
+        );
       }
+    } catch (netErr: any) {
+      console.warn(
+        '[OilSalesDashboard] Failed to sync /oilsale/summary, using local cache only',
+        netErr?.response?.data || netErr?.message || netErr
+      );
     }
 
-    // 2) Read from local summary
-    const local = getOilSalesSummaryLocal(user.id, {
-      fromISO,
-      toISO,
-      limit: 200,
+    // 2) Always read from local DB
+    const localRows = await getOilSalesLocal({
+      ownerId: user.id,
+      startDateIso: fromISO,
+      endDateIso: toISO,
     });
-    setItems(local.items);
-    setTotals(local.totals);
 
-    // 3) Read pending offline rows
-    const pending = await getPendingOilSalesLocalForDisplay(user.id);
-    setPendingItems(pending);
+    console.log('[OilSalesDashboard] localRows length =', localRows.length);
+    setItems(localRows as OilSaleWithMeta[]);
   } catch (e: any) {
-    setError(e?.message || 'Failed to load oil sales from local DB.');
+    console.error('[OilSalesDashboard] fetchSummary failed:', e);
+    setError(
+      e?.response?.data?.detail || e?.message || 'Failed to load oil sales.'
+    );
+    setItems([]);
   } finally {
     setLoading(false);
     setRefreshing(false);
   }
-}, [user?.id, token, dateRange]);
+}, [
+  user?.id,
+  authHeader,
+  dateRange.startDate,
+  dateRange.endDate,
+]);
 
-
-  useEffect(() => {
-    fetchSummary();
-  }, [fetchSummary]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -905,33 +841,21 @@ const fetchSummary = useCallback(async () => {
     }
   }, [fetchSummary]);
 
-  const combinedItems: OilSaleWithMeta[] = useMemo(() => {
-    const base: OilSaleWithMeta[] = items.map((it) => ({ ...it }));
-    const pend: OilSaleWithMeta[] = pendingItems.map((p) => ({
-      ...p,
-      pending: true,
-    }));
-    const all = [...base, ...pend];
+  useFocusEffect(
+    useCallback(() => {
+      console.log('[OilSalesDashboard] Screen focused, calling onRefresh.');
+      onRefresh();
+    }, [onRefresh])
+  );
 
-    all.sort((a, b) => {
-      const aTime = new Date(a.created_at).getTime();
-      const bTime = new Date(b.created_at).getTime();
-      if (bTime !== aTime) return bTime - aTime;
-      return (b.id ?? 0) - (a.id ?? 0);
-    });
-
-    return all;
-  }, [items, pendingItems]);
-
-  // Unique plates from items (including pending)
   const allPlates = useMemo(() => {
     const s = new Set<string>();
-    combinedItems.forEach((r) => {
+    items.forEach((r) => {
       const plate = (r.truck_plate || '').trim();
       if (plate) s.add(plate);
     });
     return Array.from(s).sort((a, b) => a.localeCompare(b));
-  }, [combinedItems]);
+  }, [items]);
 
   const filteredPlates = useMemo(() => {
     const q = plateQuery.trim().toLowerCase();
@@ -942,22 +866,18 @@ const fetchSummary = useCallback(async () => {
   // Filter items by search + selectedPlate
   const filteredItems = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return combinedItems.filter((r) => {
-      if (
-        selectedPlate &&
-        (r.truck_plate || '').trim() !== selectedPlate
-      )
+    return items.filter((r) => {
+      if (selectedPlate && (r.truck_plate || '').trim() !== selectedPlate)
         return false;
       if (!q) return true;
       const plate = (r.truck_plate || '').toLowerCase();
       const hay = `${r.oil_type ?? ''} ${plate} ${
         r.customer ?? ''
-      } ${r.unit_type ?? ''} ${(r.currency || '')
-        .toUpperCase()}`.toLowerCase();
+      } ${r.unit_type ?? ''} ${(r.currency || '').toUpperCase()}`.toLowerCase();
       const dateStr = fmtLocalDate(r.created_at).toLowerCase();
       return hay.includes(q) || dateStr.includes(q);
     });
-  }, [combinedItems, search, selectedPlate]);
+  }, [items, search, selectedPlate]);
 
   // Derived KPI: total USD + unit quantities
   const derived = useMemo(() => {
@@ -1002,24 +922,21 @@ const fetchSummary = useCallback(async () => {
 
   // Unit type COUNTS
   const unitTypeCounts = useMemo(() => {
-    const counts: Record<'liters' | 'fuusto' | 'caag' | 'lot', number> =
-      {
-        liters: 0,
-        fuusto: 0,
-        caag: 0,
-        lot: 0,
-      };
+    const counts: Record<OilUnitType, number> = {
+      liters: 0,
+      fuusto: 0,
+      caag: 0,
+      lot: 0,
+    };
     filteredItems.forEach((r) => {
-      if (counts[r.unit_type as 'liters' | 'fuusto' | 'caag' | 'lot'] != null) {
-        counts[r.unit_type as 'liters' | 'fuusto' | 'caag' | 'lot'] += 1;
+      if (counts[r.unit_type] != null) {
+        counts[r.unit_type] += 1;
       }
     });
     const labels: string[] = [];
-    (['liters', 'fuusto', 'caag', 'lot'] as const).forEach(
-      (k) => {
-        if (counts[k] > 0) labels.push(`${counts[k]} ${k}`);
-      }
-    );
+    (['liters', 'fuusto', 'caag', 'lot'] as const).forEach((k) => {
+      if (counts[k] > 0) labels.push(`${counts[k]} ${k}`);
+    });
     return { counts, labels };
   }, [filteredItems]);
 
@@ -1048,8 +965,6 @@ const fetchSummary = useCallback(async () => {
     return { top, distinct: map.size };
   }, [filteredItems]);
 
-
-
   /* ===== Row Renderer ===== */
   const getSaleTypeBadge = (
     qty?: number | null,
@@ -1063,20 +978,18 @@ const fetchSummary = useCallback(async () => {
         : u === 'lot'
         ? '1 lot'
         : `${fmtNumber(qty ?? 0, 0)} ${u}`;
-    const palette: Record<string, { bg: string; color: string }> =
-      {
-        fuusto: { bg: '#FFFBEB', color: '#92400E' },
-        caag: { bg: '#ECFDF5', color: '#065F46' },
-        liters: { bg: '#EFF6FF', color: '#1D4ED8' },
-        lot: { bg: '#F3E8FF', color: '#6B21A8' },
-        default: { bg: '#F1F5F9', color: '#334155' },
-      };
+    const palette: Record<string, { bg: string; color: string }> = {
+      fuusto: { bg: '#FFFBEB', color: '#92400E' },
+      caag: { bg: '#ECFDF5', color: '#065F46' },
+      liters: { bg: '#EFF6FF', color: '#1D4ED8' },
+      lot: { bg: '#F3E8FF', color: '#6B21A8' },
+      default: { bg: '#F1F5F9', color: '#334155' },
+    };
     const tone = palette[u] || palette.default;
     return { ...tone, label };
   };
 
   const renderRow = (r: OilSaleWithMeta, idx: number) => {
-    const isPending = (r as any).pending === true;
     const visuals = getTypeVisuals(r.oil_type, r.payment_status);
     const typeBadge = getSaleTypeBadge(
       r.unit_qty,
@@ -1090,19 +1003,12 @@ const fetchSummary = useCallback(async () => {
         <TouchableOpacity
           activeOpacity={0.7}
           onPress={() => {
-            // ✅ Always open the normal detail popup,
-            // even for offline/pending sales
             setSelected(r);
             setDetailOpen(true);
           }}
           style={styles.txnItem}
         >
-          <View
-            style={[
-              styles.txnIcon,
-              { backgroundColor: visuals.bg },
-            ]}
-          >
+          <View style={[styles.txnIcon, { backgroundColor: visuals.bg }]}>
             {visuals.icon}
           </View>
 
@@ -1153,17 +1059,6 @@ const fetchSummary = useCallback(async () => {
                 {typeBadge.label}
               </Text>
             </View>
-            {isPending && (
-              <View style={styles.offlineChip}>
-                <Feather name="wifi-off" size={10} color="#92400E" />
-                <Text
-                  style={styles.offlineChipText}
-                  allowFontScaling={false}
-                >
-                  Offline
-                </Text>
-              </View>
-            )}
           </View>
 
           <View style={styles.txnAmountWrap}>
@@ -1212,9 +1107,7 @@ const fetchSummary = useCallback(async () => {
       const nonUsdCurrencies = Array.from(
         new Set(
           filteredItems
-            .map((r) =>
-              (r.currency || 'USD').toUpperCase()
-            )
+            .map((r) => (r.currency || 'USD').toUpperCase())
             .filter((c) => c !== 'USD')
         )
       ).sort();
@@ -1241,9 +1134,7 @@ const fetchSummary = useCallback(async () => {
 
       const body = filteredItems
         .map((r) => {
-          const date = dayjs(r.created_at).format(
-            'YYYY-MM-DD HH:mm'
-          );
+          const date = dayjs(r.created_at).format('YYYY-MM-DD HH:mm');
           const oil = r.oil_type || '';
           const customer = r.customer || '';
           const unit = composeUnit(r);
@@ -1252,9 +1143,7 @@ const fetchSummary = useCallback(async () => {
               ? fmtNumber(pricePerUnit(r)!, 4)
               : '';
           const rate =
-            r.fx_rate_to_usd != null
-              ? String(r.fx_rate_to_usd)
-              : '';
+            r.fx_rate_to_usd != null ? String(r.fx_rate_to_usd) : '';
 
           const cur = (r.currency || 'USD').toUpperCase();
           const nativeCols = nonUsdCurrencies.map((c) =>
@@ -1288,11 +1177,9 @@ const fetchSummary = useCallback(async () => {
         .map((l) => `<li>${l}</li>`)
         .join('');
 
-      const title = `Oil Sales • ${dayjs(
-        dateRange.startDate
-      ).format('MMM D, YYYY')} – ${dayjs(
-        dateRange.endDate
-      ).format('MMM D, YYYY')}`;
+      const title = `Oil Sales • ${dayjs(dateRange.startDate).format(
+        'MMM D, YYYY'
+      )} – ${dayjs(dateRange.endDate).format('MMM D, YYYY')}`;
 
       const html = `
       <html>
@@ -1311,14 +1198,11 @@ const fetchSummary = useCallback(async () => {
         <body>
           <div class="card">
             <h1>${title}</h1>
-            <div class="meta">${dayjs().format(
-              'YYYY-MM-DD HH:mm'
-            )}</div>
+            <div class="meta">${dayjs().format('YYYY-MM-DD HH:mm')}</div>
             <table>
               <thead>${head}</thead>
               <tbody>${
-                body ||
-                `<tr><td style="padding:10px">No rows</td></tr>`
+                body || `<tr><td style="padding:10px">No rows</td></tr>`
               }</tbody>
             </table>
           </div>
@@ -1345,13 +1229,23 @@ const fetchSummary = useCallback(async () => {
     }
   };
 
-  // Delete call (still online-only)
-  const doDelete = useCallback(async () => {
-    if (!selected?.id) return;
+  // Delete call (online-only)
+   const doDelete = useCallback(async () => {
+    if (!selected?.id || !user?.id) return;
     try {
+      // 1) Delete on server
       await api.delete(`/oilsale/${selected.id}`, {
         headers: authHeader,
       });
+
+      // 2) Delete local copy
+      try {
+        await deleteLocalOilSale(user.id, selected.id);
+      } catch (e: any) {
+        console.warn('Failed to delete local oil sale row', e?.message || e);
+      }
+
+      // 3) Refresh UI
       setConfirmOpen(false);
       setDetailOpen(false);
       setSelected(null);
@@ -1362,7 +1256,8 @@ const fetchSummary = useCallback(async () => {
         e?.response?.data?.detail || 'Could not delete sale.'
       );
     }
-  }, [selected, authHeader, fetchSummary]);
+  }, [selected, authHeader, fetchSummary, user?.id]);
+
 
   /* ======================= Dates & Filters ======================= */
   const todayStart = dayjs().startOf('day');
@@ -1377,10 +1272,8 @@ const fetchSummary = useCallback(async () => {
     s2: dayjs.Dayjs,
     e2: dayjs.Dayjs
   ) =>
-    dayjs(s).startOf('day').valueOf() ===
-      s2.startOf('day').valueOf() &&
-    dayjs(e).endOf('day').valueOf() ===
-      e2.endOf('day').valueOf();
+    dayjs(s).startOf('day').valueOf() === s2.startOf('day').valueOf() &&
+    dayjs(e).endOf('day').valueOf() === e2.endOf('day').valueOf();
   const isTodayActive = sameRange(
     dateRange.startDate,
     dateRange.endDate,
@@ -1444,11 +1337,7 @@ const fetchSummary = useCallback(async () => {
           style={styles.errorBanner}
           onPress={() => Alert.alert('Error', error)}
         >
-          <Feather
-            name="alert-triangle"
-            size={12}
-            color="#991b1b"
-          />
+          <Feather name="alert-triangle" size={12} color="#991b1b" />
           <Text style={styles.errorText} allowFontScaling={false}>
             {error}
           </Text>
@@ -1467,10 +1356,7 @@ const fetchSummary = useCallback(async () => {
               />
             </View>
             <View style={{ flex: 1 }}>
-              <Text
-                style={styles.kpiLabelSm}
-                allowFontScaling={false}
-              >
+              <Text style={styles.kpiLabelSm} allowFontScaling={false}>
                 Revenue (USD)
               </Text>
               <Text
@@ -1495,44 +1381,26 @@ const fetchSummary = useCallback(async () => {
             <View style={{ flex: 1 }}>
               <View style={styles.unitLines}>
                 <View style={styles.unitLineRow}>
-                  <Text
-                    style={styles.unitLineLabel}
-                    allowFontScaling={false}
-                  >
+                  <Text style={styles.unitLineLabel} allowFontScaling={false}>
                     Fuusto
                   </Text>
-                  <Text
-                    style={styles.unitLineValue}
-                    allowFontScaling={false}
-                  >
+                  <Text style={styles.unitLineValue} allowFontScaling={false}>
                     {unitTypeCounts.counts.fuusto || 0}
                   </Text>
                 </View>
                 <View style={styles.unitLineRow}>
-                  <Text
-                    style={styles.unitLineLabel}
-                    allowFontScaling={false}
-                  >
+                  <Text style={styles.unitLineLabel} allowFontScaling={false}>
                     Caag
                   </Text>
-                  <Text
-                    style={styles.unitLineValue}
-                    allowFontScaling={false}
-                  >
+                  <Text style={styles.unitLineValue} allowFontScaling={false}>
                     {unitTypeCounts.counts.caag || 0}
                   </Text>
                 </View>
                 <View style={styles.unitLineRow}>
-                  <Text
-                    style={styles.unitLineLabel}
-                    allowFontScaling={false}
-                  >
+                  <Text style={styles.unitLineLabel} allowFontScaling={false}>
                     Liters
                   </Text>
-                  <Text
-                    style={styles.unitLineValue}
-                    allowFontScaling={false}
-                  >
+                  <Text style={styles.unitLineValue} allowFontScaling={false}>
                     {unitTypeCounts.counts.liters || 0}
                   </Text>
                 </View>
@@ -1545,11 +1413,7 @@ const fetchSummary = useCallback(async () => {
       {/* Search */}
       <View style={styles.searchRow}>
         <View style={styles.searchBox}>
-          <Feather
-            name="search"
-            size={14}
-            color="#64748B"
-          />
+          <Feather name="search" size={14} color="#64748B" />
           <TextInput
             placeholder="Search sales (oil, plate, customer, date)..."
             placeholderTextColor="#94A3B8"
@@ -1560,11 +1424,7 @@ const fetchSummary = useCallback(async () => {
           />
           {search.length > 0 && (
             <TouchableOpacity onPress={() => setSearch('')}>
-              <Feather
-                name="x"
-                size={14}
-                color="#64748B"
-              />
+              <Feather name="x" size={14} color="#64748B" />
             </TouchableOpacity>
           )}
         </View>
@@ -1598,20 +1458,15 @@ const fetchSummary = useCallback(async () => {
               gap: 10,
             }}
           >
-           <TouchableOpacity
-  onPress={() => {
-    router.replace('/menu');
-  }}
-  style={styles.backBtn}
-  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
->
-  <Feather
-    name="arrow-left"
-    size={16}
-    color="#E0E7FF"
-  />
-</TouchableOpacity>
-
+            <TouchableOpacity
+              onPress={() => {
+                router.replace('/menu');
+              }}
+              style={styles.backBtn}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
+              <Feather name="arrow-left" size={16} color="#E0E7FF" />
+            </TouchableOpacity>
           </View>
 
           <View
@@ -1625,15 +1480,8 @@ const fetchSummary = useCallback(async () => {
               onPress={() => setShowFilters(true)}
               style={styles.headerBtn}
             >
-              <Feather
-                name="filter"
-                size={14}
-                color="#0B2447"
-              />
-              <Text
-                style={styles.headerBtnTxt}
-                allowFontScaling={false}
-              >
+              <Feather name="filter" size={14} color="#0B2447" />
+              <Text style={styles.headerBtnTxt} allowFontScaling={false}>
                 Filter
               </Text>
             </TouchableOpacity>
@@ -1647,10 +1495,7 @@ const fetchSummary = useCallback(async () => {
             { top: Math.max(insets.top + 8, 20) },
           ]}
         >
-          <Text
-            style={styles.headerTitle}
-            allowFontScaling={false}
-          >
+          <Text style={styles.headerTitle} allowFontScaling={false}>
             Oil Sales
           </Text>
           <Text
@@ -1658,10 +1503,7 @@ const fetchSummary = useCallback(async () => {
             numberOfLines={1}
             allowFontScaling={false}
           >
-            {dayjs(dateRange.startDate).format(
-              'MMM D, YYYY'
-            )}{' '}
-            –{' '}
+            {dayjs(dateRange.startDate).format('MMM D, YYYY')} –{' '}
             {dayjs(dateRange.endDate).format('MMM D, YYYY')}
           </Text>
         </View>
@@ -1685,9 +1527,7 @@ const fetchSummary = useCallback(async () => {
           <FlatList
             data={filteredItems}
             keyExtractor={(r, i) => String(r.id ?? i)}
-            renderItem={({ item, index }) =>
-              renderRow(item, index)
-            }
+            renderItem={({ item, index }) => renderRow(item, index)}
             style={{ flex: 1 }}
             contentContainerStyle={{ paddingVertical: 4 }}
             refreshing={refreshing}
@@ -1701,11 +1541,7 @@ const fetchSummary = useCallback(async () => {
                   alignItems: 'center',
                 }}
               >
-                <Feather
-                  name="package"
-                  size={28}
-                  color="#6b7280"
-                />
+                <Feather name="package" size={28} color="#6b7280" />
                 <Text
                   style={{
                     marginTop: 6,
@@ -1795,20 +1631,11 @@ const fetchSummary = useCallback(async () => {
           >
             <View style={styles.grabber} />
             <View style={styles.modalHeader}>
-              <Text
-                style={styles.modalTitle}
-                allowFontScaling={false}
-              >
+              <Text style={styles.modalTitle} allowFontScaling={false}>
                 Filters
               </Text>
-              <TouchableOpacity
-                onPress={() => setShowFilters(false)}
-              >
-                <AntDesign
-                  name="close"
-                  size={18}
-                  color="#1F2937"
-                />
+              <TouchableOpacity onPress={() => setShowFilters(false)}>
+                <AntDesign name="close" size={18} color="#1F2937" />
               </TouchableOpacity>
             </View>
 
@@ -1820,10 +1647,7 @@ const fetchSummary = useCallback(async () => {
               showsVerticalScrollIndicator
             >
               <View style={styles.filterSection}>
-                <Text
-                  style={styles.filterLabel}
-                  allowFontScaling={false}
-                >
+                <Text style={styles.filterLabel} allowFontScaling={false}>
                   Date Range
                 </Text>
                 <View style={styles.dateRangeContainer}>
@@ -1831,43 +1655,22 @@ const fetchSummary = useCallback(async () => {
                     style={styles.dateBtn}
                     onPress={() => setShowDatePicker('start')}
                   >
-                    <Text
-                      style={styles.dateBtnText}
-                      allowFontScaling={false}
-                    >
-                      {dayjs(dateRange.startDate).format(
-                        'MMM D, YYYY'
-                      )}
+                    <Text style={styles.dateBtnText} allowFontScaling={false}>
+                      {dayjs(dateRange.startDate).format('MMM D, YYYY')}
                     </Text>
-                    <Feather
-                      name="calendar"
-                      size={14}
-                      color="#0B2447"
-                    />
+                    <Feather name="calendar" size={14} color="#0B2447" />
                   </TouchableOpacity>
-                  <Text
-                    style={styles.rangeSep}
-                    allowFontScaling={false}
-                  >
+                  <Text style={styles.rangeSep} allowFontScaling={false}>
                     to
                   </Text>
                   <TouchableOpacity
                     style={styles.dateBtn}
                     onPress={() => setShowDatePicker('end')}
                   >
-                    <Text
-                      style={styles.dateBtnText}
-                      allowFontScaling={false}
-                    >
-                      {dayjs(dateRange.endDate).format(
-                        'MMM D, YYYY'
-                      )}
+                    <Text style={styles.dateBtnText} allowFontScaling={false}>
+                      {dayjs(dateRange.endDate).format('MMM D, YYYY')}
                     </Text>
-                    <Feather
-                      name="calendar"
-                      size={14}
-                      color="#0B2447"
-                    />
+                    <Feather name="calendar" size={14} color="#0B2447" />
                   </TouchableOpacity>
                 </View>
 
@@ -1879,11 +1682,7 @@ const fetchSummary = useCallback(async () => {
                         : dateRange.endDate
                     }
                     mode="date"
-                    display={
-                      Platform.OS === 'ios'
-                        ? 'spinner'
-                        : 'default'
-                    }
+                    display={Platform.OS === 'ios' ? 'spinner' : 'default'}
                     onChange={(_: any, sel?: Date) =>
                       handleDateChange(_, sel)
                     }
@@ -1892,10 +1691,7 @@ const fetchSummary = useCallback(async () => {
 
                 {/* Truck Plate selection */}
                 <View style={{ marginTop: 10 }}>
-                  <Text
-                    style={styles.filterLabel}
-                    allowFontScaling={false}
-                  >
+                  <Text style={styles.filterLabel} allowFontScaling={false}>
                     Truck Plate
                   </Text>
                   <TouchableOpacity
@@ -1906,33 +1702,17 @@ const fetchSummary = useCallback(async () => {
                     }}
                     activeOpacity={0.9}
                   >
-                    <Feather
-                      name="truck"
-                      size={14}
-                      color="#0B2447"
-                    />
-                    <Text
-                      style={styles.plateBtnTxt}
-                      allowFontScaling={false}
-                    >
-                      {selectedPlate
-                        ? selectedPlate
-                        : 'All plates'}
+                    <Feather name="truck" size={14} color="#0B2447" />
+                    <Text style={styles.plateBtnTxt} allowFontScaling={false}>
+                      {selectedPlate ? selectedPlate : 'All plates'}
                     </Text>
-                    <Feather
-                      name="chevron-down"
-                      size={16}
-                      color="#0B2447"
-                    />
+                    <Feather name="chevron-down" size={16} color="#0B2447" />
                   </TouchableOpacity>
                 </View>
 
                 {/* Degso Xisaab */}
                 <View style={{ marginTop: 10 }}>
-                  <Text
-                    style={styles.filterLabel}
-                    allowFontScaling={false}
-                  >
+                  <Text style={styles.filterLabel} allowFontScaling={false}>
                     Degso Xisaab
                   </Text>
                   <TouchableOpacity
@@ -1953,20 +1733,13 @@ const fetchSummary = useCallback(async () => {
                     style={styles.resetBtn}
                     onPress={() => {
                       setDateRange({
-                        startDate: dayjs()
-                          .startOf('month')
-                          .toDate(),
-                        endDate: dayjs()
-                          .endOf('day')
-                          .toDate(),
+                        startDate: dayjs().startOf('month').toDate(),
+                        endDate: dayjs().endOf('day').toDate(),
                       });
                       setSelectedPlate(null);
                     }}
                   >
-                    <Text
-                      style={styles.resetTxt}
-                      allowFontScaling={false}
-                    >
+                    <Text style={styles.resetTxt} allowFontScaling={false}>
                       Reset
                     </Text>
                   </TouchableOpacity>
@@ -1977,10 +1750,7 @@ const fetchSummary = useCallback(async () => {
                       fetchSummary();
                     }}
                   >
-                    <Text
-                      style={styles.applyTxt}
-                      allowFontScaling={false}
-                    >
+                    <Text style={styles.applyTxt} allowFontScaling={false}>
                       Apply
                     </Text>
                   </TouchableOpacity>
@@ -2010,29 +1780,18 @@ const fetchSummary = useCallback(async () => {
                 ]}
               >
                 <View style={styles.modalHeader}>
-                  <Text
-                    style={styles.modalTitle}
-                    allowFontScaling={false}
-                  >
+                  <Text style={styles.modalTitle} allowFontScaling={false}>
                     Select Truck Plate
                   </Text>
                   <TouchableOpacity
                     onPress={() => setPlatePickerOpen(false)}
                   >
-                    <AntDesign
-                      name="close"
-                      size={18}
-                      color="#1F2937"
-                    />
+                    <AntDesign name="close" size={18} color="#1F2937" />
                   </TouchableOpacity>
                 </View>
 
                 <View style={styles.plateSearchBox}>
-                  <Feather
-                    name="search"
-                    size={12}
-                    color="#64748B"
-                  />
+                  <Feather name="search" size={12} color="#64748B" />
                   <TextInput
                     value={plateQuery}
                     onChangeText={setPlateQuery}
@@ -2059,23 +1818,15 @@ const fetchSummary = useCallback(async () => {
                   <TouchableOpacity
                     style={[
                       styles.plateItem,
-                      !selectedPlate &&
-                        styles.plateItemActive,
+                      !selectedPlate && styles.plateItemActive,
                     ]}
                     onPress={() => {
                       setSelectedPlate(null);
                       setPlatePickerOpen(false);
                     }}
                   >
-                    <Feather
-                      name="globe"
-                      size={12}
-                      color="#0B2447"
-                    />
-                    <Text
-                      style={styles.plateItemTxt}
-                      allowFontScaling={false}
-                    >
+                    <Feather name="globe" size={12} color="#0B2447" />
+                    <Text style={styles.plateItemTxt} allowFontScaling={false}>
                       All plates
                     </Text>
                   </TouchableOpacity>
@@ -2086,19 +1837,14 @@ const fetchSummary = useCallback(async () => {
                         key={pl}
                         style={[
                           styles.plateItem,
-                          selectedPlate === pl &&
-                            styles.plateItemActive,
+                          selectedPlate === pl && styles.plateItemActive,
                         ]}
                         onPress={() => {
                           setSelectedPlate(pl);
                           setPlatePickerOpen(false);
                         }}
                       >
-                        <Feather
-                          name="truck"
-                          size={12}
-                          color="#0B2447"
-                        />
+                        <Feather name="truck" size={12} color="#0B2447" />
                         <Text
                           style={styles.plateItemTxt}
                           allowFontScaling={false}
@@ -2109,10 +1855,7 @@ const fetchSummary = useCallback(async () => {
                     ))
                   ) : (
                     <View style={styles.plateEmpty}>
-                      <Text
-                        style={styles.plateEmptyTxt}
-                        allowFontScaling={false}
-                      >
+                      <Text style={styles.plateEmptyTxt} allowFontScaling={false}>
                         No matches
                       </Text>
                     </View>
@@ -2138,38 +1881,25 @@ const fetchSummary = useCallback(async () => {
             <TouchableWithoutFeedback onPress={() => {}}>
               <View style={styles.newSaleCard}>
                 <View style={styles.newSaleHeader}>
-                  <Text
-                    style={styles.newSaleTitle}
-                    allowFontScaling={false}
-                  >
+                  <Text style={styles.newSaleTitle} allowFontScaling={false}>
                     Dooro Nooca Iibka
                   </Text>
                   <TouchableOpacity
                     onPress={() => setNewSaleOpen(false)}
                     style={styles.newSaleClose}
                   >
-                    <AntDesign
-                      name="close"
-                      size={16}
-                      color="#1F2937"
-                    />
+                    <AntDesign name="close" size={16} color="#1F2937" />
                   </TouchableOpacity>
                 </View>
 
-                <Text
-                  style={styles.newSaleSub}
-                  allowFontScaling={false}
-                >
+                <Text style={styles.newSaleSub} allowFontScaling={false}>
                   Please choose the sale type
                 </Text>
 
                 <View style={styles.newSaleActions}>
                   <TouchableOpacity
                     activeOpacity={0.9}
-                    style={[
-                      styles.chooseBtn,
-                      styles.choosePrimary,
-                    ]}
+                    style={[styles.chooseBtn, styles.choosePrimary]}
                     onPress={() => {
                       setNewSaleOpen(false);
                       router.push({
@@ -2177,11 +1907,7 @@ const fetchSummary = useCallback(async () => {
                       });
                     }}
                   >
-                    <Feather
-                      name="file-text"
-                      size={16}
-                      color="#fff"
-                    />
+                    <Feather name="file-text" size={16} color="#fff" />
                     <Text
                       style={styles.choosePrimaryTxt}
                       allowFontScaling={false}
@@ -2192,10 +1918,7 @@ const fetchSummary = useCallback(async () => {
 
                   <TouchableOpacity
                     activeOpacity={0.9}
-                    style={[
-                      styles.chooseBtn,
-                      styles.chooseGhost,
-                    ]}
+                    style={[styles.chooseBtn, styles.chooseGhost]}
                     onPress={() => {
                       setNewSaleOpen(false);
                       router.push({
@@ -2203,15 +1926,8 @@ const fetchSummary = useCallback(async () => {
                       });
                     }}
                   >
-                    <Feather
-                      name="dollar-sign"
-                      size={16}
-                      color="#0B2447"
-                    />
-                    <Text
-                      style={styles.chooseGhostTxt}
-                      allowFontScaling={false}
-                    >
+                    <Feather name="dollar-sign" size={16} color="#0B2447" />
+                    <Text style={styles.chooseGhostTxt} allowFontScaling={false}>
                       Cash Sale
                     </Text>
                   </TouchableOpacity>
@@ -2464,23 +2180,6 @@ const styles = StyleSheet.create({
     height: 1,
     backgroundColor: '#F3F4F6',
     marginVertical: 2,
-  },
-
-  offlineChip: {
-    marginTop: 4,
-    alignSelf: 'center',
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 999,
-    backgroundColor: '#FEF3C7',
-  },
-  offlineChipText: {
-    marginLeft: 4,
-    fontSize: 9,
-    fontWeight: '800',
-    color: '#92400E',
   },
 
   // Re-used plate/export buttons

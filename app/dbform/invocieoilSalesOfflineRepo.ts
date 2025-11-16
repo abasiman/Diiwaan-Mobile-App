@@ -1,9 +1,5 @@
-// app/db/invocieoilSalesOfflineRepo.ts
 import { applyLocalCustomerBalanceDeltaByName } from '@/app/db/customerRepo';
-import {
-  upsertOilSalesFromServer,
-  type OilSaleRead as OilSalePageRead,
-} from '@/app/db/oilSalesPageRepo';
+
 import {
   getWakaaladSellOptionsLocal,
   type WakaaladSellOption,
@@ -71,16 +67,6 @@ function billableFuustoL(opt?: WakaaladSellOption): number {
   const isPetrol = (opt?.oil_type || '').toLowerCase() === 'petrol';
   return isPetrol ? Math.max(0, physical - 10) : physical;
 }
-
-/**
- * Extended shape used by the sales page to show pending offline rows.
- * These look like normal OilSaleRead rows but have a negative id and
- * carry the original local_id + pending flag.
- */
-export type PendingOilSaleLocal = OilSalePageRead & {
-  pending: true;
-  local_id: number;
-};
 
 /**
  * Helper to compute total_usd from a CreateSalePayload so we can:
@@ -199,8 +185,6 @@ export async function queueOilSaleForSync(
  */
 
 let syncingOilSales = false;
-
-
 
 export async function syncPendingOilSales(
   token: string,
@@ -336,13 +320,13 @@ export async function syncPendingOilSales(
       });
 
       try {
-        const res = await api.post<OilSalePageRead>('/oilsale', payload, {
+        const res = await api.post('/oilsale', payload, {
           headers: authHeader,
         });
 
         console.log('[oil-sync] /oilsale success', {
           local_id: row.local_id,
-          server_id: res.data?.id,
+          server_id: (res.data as any)?.id,
         });
 
         // Mark queue row as synced
@@ -358,10 +342,11 @@ export async function syncPendingOilSales(
         // Best-effort local cache write
         try {
           const effectiveOwnerId = row.owner_id || ownerId;
-          upsertOilSalesFromServer({ items: [res.data] }, effectiveOwnerId);
-          console.log('[oil-sync] upsertOilSalesFromServer done', {
+          // If you want to update local cache, re-enable this and import:
+          // upsertOilSalesFromServer({ items: [res.data] }, effectiveOwnerId);
+          console.log('[oil-sync] upsertOilSalesFromServer done (placeholder log)', {
             local_id: row.local_id,
-            server_id: res.data?.id,
+            server_id: (res.data as any)?.id,
             effectiveOwnerId,
           });
         } catch (cacheErr) {
@@ -415,9 +400,11 @@ export async function syncPendingOilSales(
 export function getPendingOilSalesLocalForDisplay(
   ownerId: number,
   opts?: { startISO?: string; endISO?: string; limit?: number }
-): PendingOilSaleLocal[] {
-  ensureQueueTable();
+) {
   if (!ownerId) return [];
+
+  // ✅ ensure table exists even if no queue has ever been written
+  ensureQueueTable();
 
   const where: string[] = ['owner_id = ?', "sync_status = 'pending'"];
   const params: any[] = [ownerId];
@@ -465,7 +452,7 @@ export function getPendingOilSalesLocalForDisplay(
       (o) => o.wakaalad_id === wakaaladId && o.oil_id === oilId
     ) ?? options.find((o) => o.oil_id === oilId);
 
-  const results: PendingOilSaleLocal[] = [];
+  const results: any[] = [];
 
   for (const row of rows) {
     let payload: CreateSalePayload;
@@ -512,7 +499,7 @@ export function getPendingOilSalesLocalForDisplay(
 
     const timestamp = row.created_at || new Date().toISOString();
 
-    const base: OilSalePageRead = {
+    const base = {
       id: -row.local_id, // negative id to avoid clashing with server ids
       owner_id: row.owner_id,
       oil_id: payload.oil_id,
@@ -524,34 +511,34 @@ export function getPendingOilSalesLocalForDisplay(
       oil_type: oilType,
 
       truck_plate: truckPlate,
-      truck_type: null,
-      truck_plate_extra: null,
+      truck_type: null as string | null,
+      truck_plate_extra: null as string | null,
 
       unit_type,
       unit_qty,
-      unit_capacity_l: null,
+      unit_capacity_l: null as number | null,
       liters_sold,
 
       currency,
       price_per_l,
-      price_per_unit_type: null,
+      price_per_unit_type: null as number | null,
       subtotal_native,
-      discount_native: null,
-      tax_native: null,
+      discount_native: null as number | null,
+      tax_native: null as number | null,
       total_native,
       fx_rate_to_usd: fx ?? null,
       total_usd,
 
-      payment_status: 'unpaid',
-      payment_method: null,
-      paid_native: null,
+      payment_status: 'unpaid' as 'unpaid',
+      payment_method: null as string | null,
+      paid_native: null as number | null,
       note: 'Offline sale (pending sync)',
 
       created_at: timestamp,
       updated_at: timestamp,
     };
 
-    results.push({ ...base, pending: true, local_id: row.local_id });
+    results.push({ ...base, pending: true as const, local_id: row.local_id });
   }
 
   return results;

@@ -407,7 +407,7 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
     return Math.floor((count * CAAG_L) / fCap);
   }, [allocAmt, unit, selected?.oil_type, allocLiters]);
 
-  async function handleSaveOpenExtras() {
+async function handleSaveOpenExtras() {
   if (!selected || !canSubmit || creating) return;
 
   if (!user?.id) {
@@ -440,9 +440,7 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
       wakaaladId = Number(res?.data?.id || 0) || null;
       showToast('Wakaalad saved');
     } else {
-      // 🔴 OFFLINE → queue for sync + create local shadow wakaalad in offline DB
-      await queueWakaaladFormForSync(user.id, payload);
-
+      // 🔴 OFFLINE → create local wakaalad first to get a NEGATIVE temp id
       const localWakaaladId = await insertLocalWakaaladFromForm({
         ownerId: user.id,
         oil_id: payload.oil_id,
@@ -451,6 +449,9 @@ export default function CreateWakaaladModal({ visible, onClose, onCreated }: Pro
         allocate_liters: payload.allocate_liters,
         date: new Date(),
       });
+
+      // queue form for sync, storing the temp wakaalad id
+      queueWakaaladFormForSync(user.id, payload, localWakaaladId);
 
       wakaaladId = localWakaaladId;
       showToast('Wakaalad saved offline – will sync when online');

@@ -1,7 +1,11 @@
+// app/Shidaal/oilsaleforminvoicesale.tsx (or whatever the path/file is)
+
 import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 import { Feather } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter } from 'expo-router';
+
+import NetInfo from '@react-native-community/netinfo';
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -19,47 +23,34 @@ import {
   View,
 } from 'react-native';
 
-
-import { applyLocalWakaaladSale } from '../WakaaladOffline/wakaaladRepo';
-
+import { queueOilRepriceForSync } from '../dbform/oilRepriceOfflineRepo';
+import {
+  queueOilSaleOffline,
+  QueueOilSalePayload,
+} from '../oilSalesfOfflineRepo/oilSalesformOfflineRepo';
+import { upsertOilSalesFromServer } from '../oilSalesfOfflineRepo/oilSalesRepo';
 
 import {
-  createOrUpdateCustomerLocal,
   getCustomersLocal,
-  upsertCustomersFromServer
+  upsertCustomersFromServer,
 } from '../db/customerRepo';
-import { queueOilRepriceForSync } from '../dbform/oilRepriceOfflineRepo';
-import { getWakaaladSellOptionsLocal, upsertLocalWakaaladSellOption, type WakaaladSellOption } from '../dbform/wakaaladSellOptionsRepo';
 
-import NetInfo from '@react-native-community/netinfo';
+import {
+  getWakaaladSellOptionsLocal,
+  upsertLocalWakaaladSellOption,
+  type WakaaladSellOption,
+} from '../dbform/wakaaladSellOptionsRepo';
 
-import { queueOilSaleForSync } from '../dbform/invocieoilSalesOfflineRepo';
+import { createOrUpdateCustomer } from '../db/customerCreateUpdate';
+
 import SaleCurrencyModal, { CurrencyKey } from './SaleCurrencyModal';
-import CustomerCreateModal from './customercreate';
-
-
-import { registerOfflineOilInvoiceDelta } from '../offlineincomestatement/incomeStatementRepo';
-
-
 
 const BORDER = '#CBD5E1';
 
 type SaleUnitType = 'liters' | 'fuusto' | 'caag';
 type SaleType = 'cashsale' | 'invoice';
 
-type CreateSalePayload = {
-  oil_id: number;
-  wakaalad_id: number;
-  unit_type: SaleUnitType;
-  unit_qty?: number;
-  liters_sold?: number;
-  price_per_l?: number;
-  customer?: string | null;
-  customer_contact?: string | null;
-  currency?: string;
-  fx_rate_to_usd?: number;
-  sale_type: SaleType;
-};
+type CreateSalePayload = QueueOilSalePayload;
 
 type OilSaleRead = {
   id: number;
@@ -95,9 +86,7 @@ type Customer = {
   phone?: string | null;
 };
 
-
-
-
+/** Merge customers by name (server + local), keep real IDs & best contact */
 const mergeCustomersByName = (rows: Customer[]): Customer[] => {
   const map = new Map<string, Customer>();
 
@@ -128,7 +117,6 @@ const mergeCustomersByName = (rows: Customer[]): Customer[] => {
 
     map.set(key, {
       ...preferred,
-      // keep best contact info from either row
       contact: preferred.contact || existing.contact || c.contact || null,
       phone: preferred.phone || existing.phone || c.phone || null,
     });
@@ -137,30 +125,34 @@ const mergeCustomersByName = (rows: Customer[]): Customer[] => {
   return Array.from(map.values());
 };
 
-
-
 // Fallback capacities
 const DEFAULT_FUUSTO_L = 240;
 const DEFAULT_CAAG_L = 20;
 
 const DISPLAY_SYMBOL: Record<'USD' | 'SOS', string> = { USD: '$', SOS: 'Sh' };
-const CURRENCY_FROM_KEY: Record<CurrencyKey, 'USD' | 'SOS'> = { USD: 'USD', shimaal: 'SOS' };
+const CURRENCY_FROM_KEY: Record<CurrencyKey, 'USD' | 'SOS'> = {
+  USD: 'USD',
+  shimaal: 'SOS',
+};
 const SALE_TYPE: SaleType = 'invoice';
 
 const fmtNum = (n: number, d = 2) => Number(n).toFixed(d);
 const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 const symbolFor = (cur?: string | null) =>
-  (cur || 'USD').toUpperCase() === 'USD' ? DISPLAY_SYMBOL.USD : DISPLAY_SYMBOL.SOS;
+  (cur || 'USD').toUpperCase() === 'USD'
+    ? DISPLAY_SYMBOL.USD
+    : DISPLAY_SYMBOL.SOS;
 
-// Helper: resolve capacity in liters for a unit & option
+// capacity from server (fallbacks)
 function capacityL(unit: SaleUnitType, opt?: WakaaladSellOption): number {
   if (unit === 'fuusto') return opt?.fuusto_capacity_l ?? DEFAULT_FUUSTO_L;
   if (unit === 'caag') return opt?.caag_capacity_l ?? DEFAULT_CAAG_L;
-  return 1;
+  return 1; // liter
 }
 
+// billable liters for fuusto (petrol: 10L shorts)
 function billableFuustoL(opt?: WakaaladSellOption): number {
-  const physical = capacityL('fuusto', opt);
+  const physical = capacityL('fuusto', opt); // usually 240
   const isPetrol = (opt?.oil_type || '').toLowerCase() === 'petrol';
   return isPetrol ? Math.max(0, physical - 10) : physical;
 }
@@ -172,9 +164,17 @@ function useToast() {
 
   const show = (msg: string, duration = 2000) => {
     setMessage(msg);
-    Animated.timing(anim, { toValue: 1, duration: 180, useNativeDriver: true }).start(() => {
+    Animated.timing(anim, {
+      toValue: 1,
+      duration: 180,
+      useNativeDriver: true,
+    }).start(() => {
       setTimeout(() => {
-        Animated.timing(anim, { toValue: 0, duration: 160, useNativeDriver: true }).start(() => {
+        Animated.timing(anim, {
+          toValue: 0,
+          duration: 160,
+          useNativeDriver: true,
+        }).start(() => {
           setMessage(null);
         });
       }, duration);
@@ -189,7 +189,14 @@ function useToast() {
           styles.toast,
           {
             opacity: anim,
-            transform: [{ translateY: anim.interpolate({ inputRange: [0, 1], outputRange: [12, 0] }) }],
+            transform: [
+              {
+                translateY: anim.interpolate({
+                  inputRange: [0, 1],
+                  outputRange: [12, 0],
+                }),
+              },
+            ],
           },
         ]}
       >
@@ -231,7 +238,7 @@ function ValidationModal({
   );
 }
 
-/* ---------- Receipt modal ---------- */
+/* ---------- Receipt modal (Invoice) ---------- */
 function ReceiptModal({
   visible,
   receipt,
@@ -241,14 +248,20 @@ function ReceiptModal({
   receipt: OilSaleRead | null;
   onClose: () => void;
 }) {
-  const symbol = receipt?.currency?.toUpperCase() === 'USD' ? DISPLAY_SYMBOL.USD : DISPLAY_SYMBOL.SOS;
+  const symbol =
+    receipt?.currency?.toUpperCase() === 'USD'
+      ? DISPLAY_SYMBOL.USD
+      : DISPLAY_SYMBOL.SOS;
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
       <View style={styles.modalBackdrop}>
         <View style={[styles.modalCard, { maxWidth: 520 }]}>
           <View style={styles.modalHeaderRow}>
             <Text style={styles.modalBigTitle}>Invoice Receipt</Text>
-            <TouchableOpacity onPress={onClose} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+            <TouchableOpacity
+              onPress={onClose}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
               <Feather name="x" size={18} color="#0B1221" />
             </TouchableOpacity>
           </View>
@@ -258,29 +271,57 @@ function ReceiptModal({
               {!!receipt.customer && (
                 <Row
                   label="Customer"
-                  value={`${receipt.customer}${receipt.customer_contact ? ` • ${receipt.customer_contact}` : ''}`}
+                  value={`${receipt.customer}${
+                    receipt.customer_contact ? ` • ${receipt.customer_contact}` : ''
+                  }`}
                 />
               )}
               <Row label="Sale ID" value={`#${receipt.id}`} />
-              <Row label="Oil" value={receipt.oil_type.toUpperCase()} />
+              <Row label="Oil" value={`${receipt.oil_type.toUpperCase()}`} />
               <Row label="Unit Type" value={capitalize(receipt.unit_type)} />
               <Row label="Unit Qty" value={`${receipt.unit_qty}`} />
               <Row label="Liters Sold" value={`${fmtNum(receipt.liters_sold, 2)} L`} />
               <Row label="Currency" value={receipt.currency} />
               <Row
                 label="Price / L"
-                value={receipt.price_per_l != null ? `${symbol}${fmtNum(receipt.price_per_l, 4)}` : '—'}
+                value={
+                  receipt.price_per_l != null
+                    ? `${symbol}${fmtNum(receipt.price_per_l, 4)}`
+                    : '—'
+                }
               />
               <Row
                 label="Subtotal"
-                value={receipt.subtotal_native != null ? `${symbol}${fmtNum(receipt.subtotal_native, 2)}` : '—'}
+                value={
+                  receipt.subtotal_native != null
+                    ? `${symbol}${fmtNum(receipt.subtotal_native, 2)}`
+                    : '—'
+                }
               />
               <Row
                 label="Total (Native)"
-                value={receipt.total_native != null ? `${symbol}${fmtNum(receipt.total_native, 2)}` : '—'}
+                value={
+                  receipt.total_native != null
+                    ? `${symbol}${fmtNum(receipt.total_native, 2)}`
+                    : '—'
+                }
               />
-              <Row label="Rate" value={receipt.fx_rate_to_usd != null ? String(receipt.fx_rate_to_usd) : '—'} />
-              <Row label="Total (USD)" value={receipt.total_usd != null ? `$${fmtNum(receipt.total_usd, 2)}` : '—'} />
+              <Row
+                label="Rate"
+                value={
+                  receipt.fx_rate_to_usd != null
+                    ? String(receipt.fx_rate_to_usd)
+                    : '—'
+                }
+              />
+              <Row
+                label="Total (USD)"
+                value={
+                  receipt.total_usd != null
+                    ? `$${fmtNum(receipt.total_usd, 2)}`
+                    : '—'
+                }
+              />
               <View style={{ marginTop: 8 }}>
                 <Text style={{ fontSize: 11, color: '#6B7280' }}>
                   Created: {new Date(receipt.created_at).toLocaleString()}
@@ -289,7 +330,11 @@ function ReceiptModal({
             </View>
           ) : null}
 
-          <TouchableOpacity style={[styles.modalBtn, { marginTop: 14 }]} onPress={onClose} activeOpacity={0.92}>
+          <TouchableOpacity
+            style={[styles.modalBtn, { marginTop: 14 }]}
+            onPress={onClose}
+            activeOpacity={0.92}
+          >
             <Text style={styles.modalBtnText}>Close</Text>
           </TouchableOpacity>
         </View>
@@ -355,7 +400,7 @@ function FloatingInput({
   );
 }
 
-/** Mini modal to change lot price (per liter / fuusto / caag). */
+/** ---------- Change Price mini modal with OFFLINE support ---------- */
 function ChangePriceMiniModal({
   visible,
   onClose,
@@ -377,7 +422,6 @@ function ChangePriceMiniModal({
   online: boolean;
   ownerId?: number;
 }) {
-
   const [basis, setBasis] = useState<SaleUnitType>(initialBasis);
   const [amount, setAmount] = useState<string>(initialAmount || '');
   const [busy, setBusy] = useState(false);
@@ -409,7 +453,7 @@ function ChangePriceMiniModal({
         payload.sell_price_per_caag = round(value, 2);
       }
 
-      // 🔹 OFFLINE (or no token): queue reprice + local update
+      // OFFLINE (or no token): queue + local update
       if (!online || !authToken) {
         if (ownerId) {
           try {
@@ -423,7 +467,7 @@ function ChangePriceMiniModal({
         return;
       }
 
-      // 🔹 ONLINE: hit API now
+      // ONLINE
       await api.post(`/diiwaanoil/${oilId}/reprice`, payload, {
         headers: { Authorization: `Bearer ${authToken}` },
       });
@@ -459,8 +503,17 @@ function ChangePriceMiniModal({
                   activeOpacity={0.9}
                   style={[styles.segmentBtn, active && styles.segmentBtnActive]}
                 >
-                  <Text style={[styles.segmentText, active && styles.segmentTextActive]}>
-                    {b === 'liters' ? 'Per liter' : b === 'fuusto' ? 'Per fuusto' : 'Per caag'}
+                  <Text
+                    style={[
+                      styles.segmentText,
+                      active && styles.segmentTextActive,
+                    ]}
+                  >
+                    {b === 'liters'
+                      ? 'Per liter'
+                      : b === 'fuusto'
+                      ? 'Per fuusto'
+                      : 'Per caag'}
                   </Text>
                 </TouchableOpacity>
               );
@@ -468,13 +521,21 @@ function ChangePriceMiniModal({
           </View>
 
           <FloatingInput
-            label={`New price (${basis === 'liters' ? 'per liter' : basis === 'fuusto' ? 'per fuusto' : 'per caag'})`}
+            label={`New price (${
+              basis === 'liters'
+                ? 'per liter'
+                : basis === 'fuusto'
+                ? 'per fuusto'
+                : 'per caag'
+            })`}
             value={amount}
             onChangeText={(t) => {
               let cleaned = t.replace(/[^0-9.]/g, '');
               const firstDot = cleaned.indexOf('.');
               if (firstDot !== -1) {
-                cleaned = cleaned.slice(0, firstDot + 1) + cleaned.slice(firstDot + 1).replace(/\./g, '');
+                cleaned =
+                  cleaned.slice(0, firstDot + 1) +
+                  cleaned.slice(firstDot + 1).replace(/\./g, '');
               }
               setAmount(cleaned);
             }}
@@ -491,12 +552,20 @@ function ChangePriceMiniModal({
             </TouchableOpacity>
 
             <TouchableOpacity
-              style={[styles.modalActionBtn, styles.modalSave, (!valid || busy) && { opacity: 0.6 }]}
+              style={[
+                styles.modalActionBtn,
+                styles.modalSave,
+                (!valid || busy) && { opacity: 0.6 },
+              ]}
               onPress={save}
               disabled={!valid || busy}
               activeOpacity={0.92}
             >
-              {busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.modalSaveText}>Save</Text>}
+              {busy ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.modalSaveText}>Save</Text>
+              )}
             </TouchableOpacity>
           </View>
         </View>
@@ -539,7 +608,12 @@ function CustomerPickerModal({
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <View style={styles.modalBackdrop}>
-        <View style={[styles.modalCard, { width: '100%', maxWidth: 480, paddingTop: 10 }]}>
+        <View
+          style={[
+            styles.modalCard,
+            { width: '100%', maxWidth: 480, paddingTop: 10 },
+          ]}
+        >
           <View style={styles.modalHeaderRow}>
             <Text style={styles.modalBigTitle}>Select Customer</Text>
             <TouchableOpacity onPress={onClose}>
@@ -547,11 +621,17 @@ function CustomerPickerModal({
             </TouchableOpacity>
           </View>
 
-          <TouchableOpacity onPress={onCreatePress} activeOpacity={0.92} style={styles.createRow}>
+          {/* + Create customer */}
+          <TouchableOpacity
+            onPress={onCreatePress}
+            activeOpacity={0.92}
+            style={styles.createRow}
+          >
             <Feather name="user-plus" size={14} color="#0B1221" />
             <Text style={styles.createRowText}>Create customer</Text>
           </TouchableOpacity>
 
+          {/* Search */}
           <View style={{ marginTop: 8 }}>
             <Text style={styles.label}>Search</Text>
             <TextInput
@@ -562,10 +642,25 @@ function CustomerPickerModal({
               style={[styles.input, { height: 42 }]}
               returnKeyType="search"
             />
-            {error ? <Text style={{ marginTop: 6, color: '#B91C1C', fontSize: 11 }}>{error}</Text> : null}
+            {error ? (
+              <Text
+                style={{ marginTop: 6, color: '#B91C1C', fontSize: 11 }}
+              >
+                {error}
+              </Text>
+            ) : null}
           </View>
 
-          <View style={{ marginTop: 8, borderWidth: 1, borderColor: BORDER, borderRadius: 10, overflow: 'hidden' }}>
+          {/* List */}
+          <View
+            style={{
+              marginTop: 8,
+              borderWidth: 1,
+              borderColor: BORDER,
+              borderRadius: 10,
+              overflow: 'hidden',
+            }}
+          >
             <FlatList
               data={data}
               keyExtractor={(it) => String(it.id)}
@@ -576,7 +671,9 @@ function CustomerPickerModal({
                   activeOpacity={0.9}
                 >
                   <Text style={styles.pickerMain}>{item.name}</Text>
-                  <Text style={styles.pickerSub}>{item.contact || item.phone || '—'}</Text>
+                  <Text style={styles.pickerSub}>
+                    {item.contact || item.phone || '—'}
+                  </Text>
                 </TouchableOpacity>
               )}
               style={{ maxHeight: MAX_H }}
@@ -591,14 +688,27 @@ function CustomerPickerModal({
                     onPress={onLoadMore}
                     activeOpacity={0.85}
                   >
-                    <Text style={{ fontSize: 12, color: '#0B1221', fontWeight: '700' }}>Load more…</Text>
+                    <Text
+                      style={{
+                        fontSize: 12,
+                        color: '#0B1221',
+                        fontWeight: '700',
+                      }}
+                    >
+                      Load more…
+                    </Text>
                   </TouchableOpacity>
                 ) : null
               }
             />
           </View>
 
-          <TouchableOpacity style={[styles.modalBtn, { marginTop: 12 }]} onPress={onClose} activeOpacity={0.92}>
+          {/* Close */}
+          <TouchableOpacity
+            style={[styles.modalBtn, { marginTop: 12 }]}
+            onPress={onClose}
+            activeOpacity={0.92}
+          >
             <Text style={styles.modalBtnText}>Close</Text>
           </TouchableOpacity>
         </View>
@@ -633,7 +743,13 @@ function WakaaladPickerModal({
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <View style={styles.modalBackdrop}>
-        <View style={[styles.modalCard, { width: '100%', maxWidth: 520, paddingTop: 10 }]}>
+        <View
+          style={[
+            styles.modalCard,
+            { width: '100%', maxWidth: 520, paddingTop: 10 },
+          ]}
+        >
+          {/* Header */}
           <View style={styles.modalHeaderRow}>
             <Text style={styles.modalBigTitle}>Select Wakaalad / Oil</Text>
             <TouchableOpacity onPress={onClose}>
@@ -641,6 +757,7 @@ function WakaaladPickerModal({
             </TouchableOpacity>
           </View>
 
+          {/* Search */}
           <View style={{ marginTop: 8 }}>
             <Text style={styles.label}>Search</Text>
             <TextInput
@@ -653,14 +770,25 @@ function WakaaladPickerModal({
             />
           </View>
 
-          <View style={{ marginTop: 8, borderWidth: 1, borderColor: BORDER, borderRadius: 10, overflow: 'hidden' }}>
+          {/* List */}
+          <View
+            style={{
+              marginTop: 8,
+              borderWidth: 1,
+              borderColor: BORDER,
+              borderRadius: 10,
+              overflow: 'hidden',
+            }}
+          >
             {loading ? (
               <View style={{ padding: 10, alignItems: 'center' }}>
                 <ActivityIndicator />
               </View>
             ) : data.length === 0 ? (
               <View style={{ padding: 12 }}>
-                <Text style={{ color: '#6B7280', fontSize: 12 }}>No matching wakaalad.</Text>
+                <Text style={{ color: '#6B7280', fontSize: 12 }}>
+                  No matching wakaalad.
+                </Text>
               </View>
             ) : (
               <FlatList
@@ -674,16 +802,24 @@ function WakaaladPickerModal({
                     activeOpacity={0.9}
                   >
                     <Text style={styles.pickerMain}>
-                      {o.oil_type.toUpperCase()} • {o.wakaalad_name} • {o.truck_plate || '—'}
+                      {o.oil_type.toUpperCase()} • {o.wakaalad_name} •{' '}
+                      {o.truck_plate || '—'}
                     </Text>
-                    <Text style={styles.pickerSub}>Stock: {fmtNum(o.in_stock_l, 2)} L</Text>
+                    <Text style={styles.pickerSub}>
+                      Stock: {fmtNum(o.in_stock_l, 2)} L
+                    </Text>
                   </TouchableOpacity>
                 )}
               />
             )}
           </View>
 
-          <TouchableOpacity style={[styles.modalBtn, { marginTop: 12 }]} onPress={onClose} activeOpacity={0.92}>
+          {/* Close */}
+          <TouchableOpacity
+            style={[styles.modalBtn, { marginTop: 12 }]}
+            onPress={onClose}
+            activeOpacity={0.92}
+          >
             <Text style={styles.modalBtnText}>Close</Text>
           </TouchableOpacity>
         </View>
@@ -691,6 +827,188 @@ function WakaaladPickerModal({
     </Modal>
   );
 }
+
+/* ─────────────────────────────────────────────
+   Create Customer Modal (same as cash sale)
+────────────────────────────────────────────── */
+function CreateCustomerModal({
+  visible,
+  onClose,
+  online,
+  token,
+  userId,
+  onCreated,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  online: boolean;
+  token?: string | null;
+  userId?: number;
+  onCreated: (c: {
+    id: number;
+    name: string;
+    phone?: string | null;
+    address?: string | null;
+  }) => void;
+}) {
+  const [name, setName] = useState('');
+  const [phone, setPhone] = useState('');
+  const [address, setAddress] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const reset = () => {
+    setName('');
+    setPhone('');
+    setAddress('');
+    setError(null);
+  };
+
+  const handleClose = () => {
+    if (submitting) return;
+    reset();
+    onClose();
+  };
+
+  const handleSave = async () => {
+    if (!name.trim()) {
+      setError('Fadlan geli magaca macaamiilka');
+      return;
+    }
+    if (!userId) {
+      setError('No tenant selected.');
+      return;
+    }
+
+    setSubmitting(true);
+    setError(null);
+
+    try {
+      const res: any = await createOrUpdateCustomer({
+        formMode: 'add',
+        payload: {
+          name: name.trim(),
+          phone: phone.trim() || null,
+          address: address.trim() || null,
+          status: 'active',
+        },
+        online,
+        token,
+        userId,
+      });
+
+      const created = {
+        id: res.id,
+        name: res.name || name.trim(),
+        phone: res.phone ?? res.contact ?? (phone.trim() || null),
+        address: res.address ?? (address.trim() || null),
+      };
+
+      onCreated(created);
+      reset();
+      onClose();
+    } catch (e: any) {
+      console.log('[CreateCustomerModal] error', e?.response?.data || e?.message || e);
+      setError(e?.response?.data?.detail || e?.message || 'Operation failed.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={handleClose}>
+      <View style={styles.modalBackdrop}>
+        <View style={[styles.modalCard, { maxWidth: 420 }]}>
+          <View style={styles.modalHeaderRow}>
+            <Text style={styles.modalBigTitle}>Create Customer</Text>
+            <TouchableOpacity onPress={handleClose}>
+              <Feather name="x" size={18} color="#0B1221" />
+            </TouchableOpacity>
+          </View>
+
+          <View style={{ gap: 10 }}>
+            <View>
+              <Text style={styles.label}>Magaca</Text>
+              <TextInput
+                value={name}
+                onChangeText={setName}
+                placeholder="Magaca macaamiilka"
+                placeholderTextColor="#9CA3AF"
+                style={styles.input}
+                autoCapitalize="words"
+              />
+            </View>
+
+            <View>
+              <Text style={styles.label}>Phone</Text>
+              <TextInput
+                value={phone}
+                onChangeText={setPhone}
+                placeholder="(+252) 61 234 5678"
+                placeholderTextColor="#9CA3AF"
+                style={styles.input}
+                keyboardType="phone-pad"
+              />
+            </View>
+
+            <View>
+              <Text style={styles.label}>Address</Text>
+              <TextInput
+                value={address}
+                onChangeText={setAddress}
+                placeholder="Degmada, xaafadda…"
+                placeholderTextColor="#9CA3AF"
+                style={[
+                  styles.input,
+                  { height: 80, textAlignVertical: 'top', paddingTop: 10 },
+                ]}
+                multiline
+              />
+            </View>
+
+            {error ? (
+              <Text style={{ color: '#B91C1C', fontSize: 12, marginTop: 4 }}>
+                {error}
+              </Text>
+            ) : null}
+          </View>
+
+          <View style={[styles.modalActions, { marginTop: 16 }]}>
+            <TouchableOpacity
+              style={[styles.modalActionBtn, styles.modalCancel]}
+              onPress={handleClose}
+              activeOpacity={0.92}
+              disabled={submitting}
+            >
+              <Text style={styles.modalCancelText}>Cancel</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[
+                styles.modalActionBtn,
+                styles.modalSave,
+                (submitting || !name.trim()) && { opacity: 0.6 },
+              ]}
+              onPress={handleSave}
+              activeOpacity={0.92}
+              disabled={submitting || !name.trim()}
+            >
+              {submitting ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.modalSaveText}>Save</Text>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   MAIN COMPONENT – Invoice Form
+────────────────────────────────────────────── */
 
 export default function OilSaleInvoiceForm() {
   const router = useRouter();
@@ -722,10 +1040,12 @@ export default function OilSaleInvoiceForm() {
     typeof customer_contact === 'string' ? customer_contact : ''
   );
 
-  const customerSegment = encodeURIComponent((custName || routeCustomerParam || '').trim());
+  const customerSegment = encodeURIComponent(
+    (custName || routeCustomerParam || '').trim()
+  );
   const goToInvoices = () => {
     if (customerSegment) router.replace(`/${customerSegment}/invoices`);
-    else router.replace('/oilsalespage');
+    
   };
 
   /* ── Customer popup + fetch list ── */
@@ -746,128 +1066,113 @@ export default function OilSaleInvoiceForm() {
 
   useEffect(() => {
     const sub = NetInfo.addEventListener((state) => {
-      const ok = Boolean(state.isConnected && state.isInternetReachable);
+      const ok = Boolean(
+        state.isConnected && (state.isInternetReachable ?? true)
+      );
       setOnline(ok);
     });
+
+    // seed once
+    NetInfo.fetch().then((state) => {
+      const ok = Boolean(
+        state.isConnected && (state.isInternetReachable ?? true)
+      );
+      setOnline(ok);
+    });
+
     return () => sub();
   }, []);
 
-  const loadCustomers = useCallback(
-    async (reset = false) => {
-      if (!user?.id) return;
-      if (loadingRef.current) return;
-      loadingRef.current = true;
+  
+ const loadCustomers = useCallback(
+  async (reset = false) => {
+    if (!user?.id) return;
+    if (loadingRef.current) return;
+    loadingRef.current = true;
 
-      try {
-        if (reset) {
-          setLoading(true);
-          setHasMore(true);
-          offsetRef.current = 0;
-        }
-
-        const localOffset = reset ? 0 : offsetRef.current;
-        let data: Customer[] = [];
-
-        if (online && token) {
-  // ONLINE → hit API, then ALWAYS read from local DB so we keep merged phone/address
-  const res = await api.get('/diiwaancustomers', {
-    params: {
-      q: search || undefined,
-      offset: localOffset,
-      limit,
-    },
-    headers: { Authorization: `Bearer ${token}` },
-  });
-
-  const raw: any = res.data;
-  const list: any[] = Array.isArray(raw?.items)
-    ? raw.items
-    : Array.isArray(raw)
-    ? raw
-    : [];
-
-  // Update local cache (this merges server + existing offline phone/address)
-  if (list.length) {
-    upsertCustomersFromServer(list, user.id);
-  }
-
-  // ✅ Now build UI list from LOCAL DB, which has the merged phone
-  const rows = getCustomersLocal(search, limit, localOffset, user.id);
-  data = rows.map((c) => ({
-    id: c.id,
-    name: c.name || '',
-    contact: c.phone ?? null,
-    phone: c.phone ?? null,
-  }));
-} else {
-  // OFFLINE (or no token) → purely local SQLite
-  const rows = getCustomersLocal(search, limit, localOffset, user.id);
-  data = rows.map((c) => ({
-    id: c.id,
-    name: c.name || '',
-    contact: c.phone ?? null,
-    phone: c.phone ?? null,
-  }));
-}
-
-
-          setCustomers((prev) => {
-          if (reset) return mergeCustomersByName(data);
-          return mergeCustomersByName([...prev, ...data]);
-        });
-
-        setHasMore(data.length === limit);
-        offsetRef.current = localOffset + data.length;
-        setError(null);
-      } catch (e: any) {
-        console.warn('loadCustomers failed', e?.response?.data || e?.message || e);
-
-        // Final fallback: try local if something blew up while online
-        try {
-          const localOffset = reset ? 0 : offsetRef.current;
-          const rows = getCustomersLocal(search, limit, localOffset, user?.id || 0);
-          const data = rows.map((c) => ({
-            id: c.id,
-            name: c.name || '',
-            contact: c.phone ?? null,
-            phone: c.phone ?? null,
-          }));
-
-              setCustomers((prev) =>
-            reset ? mergeCustomersByName(data) : mergeCustomersByName([...prev, ...data])
-          );
-
-          setHasMore(data.length === limit);
-          offsetRef.current = localOffset + data.length;
-          setError(null);
-        } catch (inner: any) {
-          setError(inner?.message || 'Failed to load customers.');
-        }
-      } finally {
-        setLoading(false);
-        loadingRef.current = false;
+    try {
+      if (reset) {
+        setLoading(true);
+        setHasMore(true);
+        offsetRef.current = 0;
       }
-    },
-    [user?.id, token, online, search, limit]
-  );
 
+      const localOffset = reset ? 0 : offsetRef.current;
+
+      // 🔹 Only hit server if we're online AND have a token
+      if (online && token) {
+        try {
+          const res = await api.get('/diiwaancustomers', {
+            params: {
+              q: search || undefined,
+              offset: localOffset,
+              limit,
+            },
+            headers: { Authorization: `Bearer ${token}` },
+          });
+
+          const raw: any = res.data;
+          const list: any[] = Array.isArray(raw?.items)
+            ? raw.items
+            : Array.isArray(raw)
+            ? raw
+            : [];
+
+          if (list.length) {
+            // save page into SQLite
+            upsertCustomersFromServer(list, user.id);
+          }
+        } catch (e: any) {
+          // 🔹 Just log; we still fall back to local DB
+          console.warn('loadCustomers server fetch failed; using local only', e?.message || e);
+        }
+      }
+
+      // 🔹 ALWAYS read from local DB (offline/online)
+      const rows = getCustomersLocal(search, limit, localOffset, user.id);
+      const data: Customer[] = rows.map((c) => ({
+        id: c.id,
+        name: c.name || '',
+        contact: c.phone ?? null,
+        phone: c.phone ?? null,
+      }));
+
+      setCustomers((prev) => {
+        if (reset) return mergeCustomersByName(data);
+        return mergeCustomersByName([...prev, ...data]);
+      });
+
+      setHasMore(rows.length === limit);
+      offsetRef.current = localOffset + rows.length;
+      setError(null);
+    } catch (e: any) {
+      console.warn('loadCustomers failed', e?.response?.data || e?.message || e);
+      setError(e?.message || 'Failed to load customers.');
+    } finally {
+      setLoading(false);
+      loadingRef.current = false;
+    }
+  },
+  [user?.id, token, search, limit, online]
+);
   useEffect(() => {
     if (custPickerOpen) loadCustomers(true);
   }, [custPickerOpen, loadCustomers]);
 
+  // debounce search inside popup
   useEffect(() => {
     if (!custPickerOpen) return;
     const t = setTimeout(() => loadCustomers(true), 250);
     return () => clearTimeout(t);
   }, [search, custPickerOpen, loadCustomers]);
 
-  // oil & unit
+  /* ── Oil & unit dropdowns ── */
   const [openOil, setOpenOil] = useState(false);
   const [openUnit, setOpenUnit] = useState(false);
 
   const [oilQuery, setOilQuery] = useState('');
 
-  // receipt + validation + currency modal
+  /* ── Receipt + validation + currency modal ── */
   const [receipt, setReceipt] = useState<OilSaleRead | null>(null);
   const [receiptOpen, setReceiptOpen] = useState(false);
   const [valOpen, setValOpen] = useState(false);
@@ -883,7 +1188,7 @@ export default function OilSaleInvoiceForm() {
     setValOpen(true);
   };
 
-  // fetch wakaalad options from local db
+  // fetch wakaalad sell options from local DB (pre-synced)
   useEffect(() => {
     if (!user?.id) return;
 
@@ -899,7 +1204,10 @@ export default function OilSaleInvoiceForm() {
     } catch (e: any) {
       if (!cancelled) {
         console.warn('Local wakaalad options load failed', e);
-        openValidation('Load failed', 'Failed to load wakaalad sell options.');
+        openValidation(
+          'Load failed',
+          'Failed to load wakaalad sell options.'
+        );
       }
     } finally {
       if (!cancelled) setLoadingOptions(false);
@@ -910,7 +1218,7 @@ export default function OilSaleInvoiceForm() {
     };
   }, [user?.id]);
 
-  // default price
+  // price display derives from selected + unit
   useEffect(() => {
     if (!selected) {
       setPriceDisplay('');
@@ -932,31 +1240,31 @@ export default function OilSaleInvoiceForm() {
     setFinalFxRate('');
   }, [selected]);
 
-  const qtyNum = useMemo(() => Math.max(parseInt(qty || '0', 10) || 0, 0), [qty]);
+  const qtyNum = useMemo(
+    () => Math.max(parseInt(qty || '0', 10) || 0, 0),
+    [qty]
+  );
 
-  // PHYSICAL liters
+  // PHYSICAL liters for stock checking
   const estimatedLiters = useMemo(() => {
     if (!selected) return 0;
     if (unitType === 'liters') return qtyNum;
     return qtyNum * capacityL(unitType, selected);
   }, [selected, unitType, qtyNum]);
 
-  // BILLED liters
+  // BILLED liters (petrol fuusto bills 230L if cap is 240L)
   const billedLiters = useMemo(() => {
     if (!selected) return 0;
     if (unitType === 'liters') return qtyNum;
     if (unitType === 'caag') return qtyNum * capacityL('caag', selected);
     if (unitType === 'fuusto') {
-      const cap = capacityL('fuusto', selected);
-      const billedPer =
-        (selected.oil_type || '').toLowerCase() === 'petrol'
-          ? Math.max(0, cap - 10)
-          : cap;
+      const billedPer = billableFuustoL(selected);
       return qtyNum * billedPer;
     }
     return 0;
   }, [selected, unitType, qtyNum]);
 
+  // shorts per fuusto (only petrol)
   const shortsPerFuusto = useMemo(() => {
     if (!selected || unitType !== 'fuusto') return 0;
     return (selected.oil_type || '').toLowerCase() === 'petrol' ? 10 : 0;
@@ -973,19 +1281,35 @@ export default function OilSaleInvoiceForm() {
     return estimatedLiters > stock + 1e-9;
   }, [selected, estimatedLiters]);
 
-  const priceNum = useMemo(() => parseFloat((priceDisplay || '').replace(',', '.')) || 0, [priceDisplay]);
+  const priceNum = useMemo(
+    () => parseFloat((priceDisplay || '').replace(',', '.')) || 0,
+    [priceDisplay]
+  );
 
+  function getUnitPrice(o: WakaaladSellOption, u: SaleUnitType): number {
+    const r = (n: number, d = 6) => Math.round(n * 10 ** d) / 10 ** d;
+    if (u === 'liters') return o.liter_price != null ? r(o.liter_price, 6) : 0;
+    if (u === 'fuusto') return o.fuusto_price != null ? r(o.fuusto_price, 2) : 0;
+    if (u === 'caag') return o.caag_price != null ? r(o.caag_price, 2) : 0;
+    return 0;
+  }
+
+  const lotCurrency = (selected?.currency || 'USD').toUpperCase() as
+    | 'USD'
+    | 'SOS';
+  const saleCurrencyFromKey = (ck: CurrencyKey) => CURRENCY_FROM_KEY[ck];
+
+  // per-L in lot currency, derived from displayed unit price (use billable fuusto logic)
   const perLInLotCurrency = useMemo(() => {
     const r = (n: number, d = 6) => Math.round(n * 10 ** d) / 10 ** d;
     if (!selected || priceNum <= 0) return 0;
-
     if (unitType === 'liters') return r(priceNum, 6);
     if (unitType === 'fuusto') return r(priceNum / billableFuustoL(selected), 6);
     if (unitType === 'caag') return r(priceNum / capacityL('caag', selected), 6);
-
     return 0;
   }, [selected, unitType, priceNum]);
 
+  // Line total uses BILLED liters
   const lineTotal = useMemo(() => {
     if (!selected) return 0;
     if (billedLiters <= 0 || perLInLotCurrency <= 0) return 0;
@@ -1000,31 +1324,12 @@ export default function OilSaleInvoiceForm() {
     return true;
   }, [selected, estimatedLiters, priceNum]);
 
-  function getUnitPrice(o: WakaaladSellOption, u: SaleUnitType): number {
-    const r = (n: number, d = 6) => Math.round(n * 10 ** d) / 10 ** d;
-    if (u === 'liters') return o.liter_price != null ? r(o.liter_price, 6) : 0;
-    if (u === 'fuusto') return o.fuusto_price != null ? r(o.fuusto_price, 2) : 0;
-    if (u === 'caag') return o.caag_price != null ? r(o.caag_price, 2) : 0;
-    return 0;
-  }
-
-  const lastWarnKeyRef = useRef<string>('');
-  useEffect(() => {
-    const key = selected ? `${selected.wakaalad_id}-${unitType}-${qtyNum}` : '';
-    if (stockExceeded && key && lastWarnKeyRef.current !== key) {
-      lastWarnKeyRef.current = key;
-      openValidation(
-        'Not enough stock',
-        `Requested ${fmtNum(estimatedLiters, 2)} L exceeds available ${fmtNum(selected?.in_stock_l ?? 0, 2)} L.`
-      );
-    }
-    if (!stockExceeded) lastWarnKeyRef.current = '';
-  }, [stockExceeded, selected, unitType, qtyNum, estimatedLiters]);
-
-  const lotCurrency = (selected?.currency || 'USD').toUpperCase() as 'USD' | 'SOS';
-  const saleCurrencyFromKey = (ck: CurrencyKey) => CURRENCY_FROM_KEY[ck];
-
-  function convertPerL(lotCur: 'USD' | 'SOS', saleCur: 'USD' | 'SOS', perL_lot: number, fx: number | undefined) {
+  function convertPerL(
+    lotCur: 'USD' | 'SOS',
+    saleCur: 'USD' | 'SOS',
+    perL_lot: number,
+    fx: number | undefined
+  ) {
     if (perL_lot <= 0) return 0;
     if (lotCur === saleCur) return perL_lot;
     if (!fx || !(fx > 0)) return 0;
@@ -1035,164 +1340,323 @@ export default function OilSaleInvoiceForm() {
 
   const handleSubmit = () => {
     if (!selected) {
-      openValidation('Select wakaalad', 'Please choose a wakaalad to sell from.');
+      openValidation(
+        'Select wakaalad',
+        'Please choose a wakaalad to sell from.'
+      );
       return;
     }
     if (!canSubmit) {
-      openValidation('Invalid amount', 'Please check quantity, price, and stock limits.');
+      openValidation(
+        'Invalid amount',
+        'Please check quantity, price, and stock limits.'
+      );
       return;
     }
     setFinalOpen(true);
   };
 
-  const confirmAndCreate = async (pickedCurrencyKey: CurrencyKey, fxRateStr: string) => {
-  if (!selected) return;
-  if (!user?.id) {
-    openValidation('Missing user', 'User ID is required to create sales.');
-    return;
-  }
+  // create sale with invoice sale_type (online + offline queue), same pattern as cash sale
+  const confirmAndCreate = async (
+    pickedCurrencyKey: CurrencyKey,
+    fxRateStr: string
+  ) => {
+    const LOG_TAG = '[ConfirmAndCreateInvoice]';
 
-  const saleCurrency = saleCurrencyFromKey(pickedCurrencyKey);
-  const fxRaw = parseFloat((fxRateStr || '').replace(',', '.'));
-  const fxValid = !isNaN(fxRaw) && fxRaw > 0 ? fxRaw : undefined;
+    console.log(`${LOG_TAG} Starting`, {
+      pickedCurrencyKey,
+      fxRateStr,
+      online,
+      hasToken: !!token,
+      userId: user?.id,
+      wakaaladSelected: !!selected,
+    });
 
-  const perL_sale = convertPerL(
-    lotCurrency,
-    saleCurrency,
-    perLInLotCurrency,
-    fxValid
-  );
+    if (!selected) {
+      console.warn(`${LOG_TAG} Aborted: wakaalad not selected`);
+      openValidation(
+        'Select wakaalad',
+        'Please choose a wakaalad to sell from.'
+      );
+      return;
+    }
 
-  if (lotCurrency !== saleCurrency && !fxValid) {
-    openValidation('FX required', 'Please provide a valid exchange rate.');
-    return;
-  }
+    if (!user?.id) {
+      console.error(`${LOG_TAG} Aborted: missing user.id`);
+      openValidation('Missing user', 'User ID is required to create sales.');
+      return;
+    }
 
-  const payload: CreateSalePayload = {
-    oil_id: selected.oil_id,
-    wakaalad_id: selected.wakaalad_id,
-    unit_type: unitType,
-    sale_type: SALE_TYPE,
-    liters_sold: unitType === 'liters' ? qtyNum : undefined,
-    unit_qty: unitType === 'fuusto' || unitType === 'caag' ? qtyNum : undefined,
-    price_per_l: perL_sale || undefined,
-    customer: custName?.trim() ? custName.trim() : undefined,
-    customer_contact: custContact?.trim() ? custContact.trim() : undefined,
-    currency: saleCurrency,
-    fx_rate_to_usd: saleCurrency === 'USD' ? undefined : fxValid,
-  };
+    const saleCurrency = saleCurrencyFromKey(pickedCurrencyKey);
+    const fxRaw = parseFloat((fxRateStr || '').replace(',', '.'));
+    const fxValid = !isNaN(fxRaw) && fxRaw > 0 ? fxRaw : undefined;
 
-  setSubmitting(true);
-  setFinalOpen(false);
+    console.log(`${LOG_TAG} Currency + FX`, {
+      lotCurrency,
+      saleCurrency,
+      fxRateInput: fxRateStr,
+      fxRaw,
+      fxValid,
+    });
 
-  try {
-    if (online && token) {
-      // ONLINE: normal API flow
+    const perL_sale = convertPerL(
+      lotCurrency,
+      saleCurrency,
+      perLInLotCurrency,
+      fxValid
+    );
+
+    console.log(`${LOG_TAG} Per-liter`, {
+      perLInLotCurrency,
+      perL_sale,
+    });
+
+    if (lotCurrency !== saleCurrency && !fxValid) {
+      console.warn(
+        `${LOG_TAG} Aborted: FX required for currency conversion`,
+        { lotCurrency, saleCurrency, fxValid }
+      );
+      openValidation('FX required', 'Please provide a valid exchange rate.');
+      return;
+    }
+
+    // Build payload – same as cash sale, but sale_type='invoice' and payment_method='credit'
+    const payload: CreateSalePayload = {
+      oil_id: selected.oil_id,
+      wakaalad_id: selected.wakaalad_id,
+      unit_type: unitType,
+      sale_type: SALE_TYPE, // 'invoice'
+      liters_sold: unitType === 'liters' ? qtyNum : undefined,
+      unit_qty:
+        unitType === 'fuusto' || unitType === 'caag' ? qtyNum : undefined,
+      price_per_l: perL_sale || undefined,
+      customer: custName?.trim() ? custName.trim() : undefined,
+      customer_contact: custContact?.trim()
+        ? custContact.trim()
+        : undefined,
+      currency: saleCurrency,
+      fx_rate_to_usd: saleCurrency === 'USD' ? undefined : fxValid,
+      payment_method: 'credit',
+    };
+
+    console.log(`${LOG_TAG} Payload`, {
+      payload,
+      unitType,
+      qtyNum,
+      lotCurrency,
+      perL_sale,
+    });
+
+    setSubmitting(true);
+    setFinalOpen(false);
+
+    // OFFLINE BRANCH
+    if (!online || !token) {
+      console.log(`${LOG_TAG} OFFLINE branch`, {
+        online,
+        hasToken: !!token,
+        userId: user.id,
+      });
+
+      try {
+        const tempId = -Date.now();
+        console.log(`${LOG_TAG} tempId`, { tempId });
+
+        console.log(`${LOG_TAG} queueOilSaleOffline() START`, {
+          ownerId: user.id,
+          tempLocalId: tempId,
+        });
+        await queueOilSaleOffline({
+          ownerId: user.id,
+          payload,
+          tempLocalId: tempId,
+        });
+        console.log(`${LOG_TAG} queueOilSaleOffline() SUCCESS`, { tempId });
+
+        const totalNative =
+          perL_sale && perL_sale > 0 && billedLiters > 0
+            ? perL_sale * billedLiters
+            : null;
+
+        const totalUsd =
+          saleCurrency === 'USD'
+            ? totalNative
+            : fxValid && totalNative != null
+            ? totalNative / fxValid
+            : null;
+
+        const nowIso = new Date().toISOString();
+
+        console.log(`${LOG_TAG} Offline totals`, {
+          billedLiters,
+          perL_sale,
+          totalNative,
+          totalUsd,
+          nowIso,
+        });
+
+        const offlineRow: any = {
+          id: tempId,
+          oil_id: payload.oil_id,
+          wakaalad_id: payload.wakaalad_id,
+          oil_type: selected.oil_type,
+          truck_plate: selected.truck_plate,
+          customer: payload.customer ?? null,
+          customer_contact: payload.customer_contact ?? null,
+          unit_type: payload.unit_type,
+          unit_qty: payload.unit_qty ?? null,
+          liters_sold:
+            payload.liters_sold ??
+            (payload.unit_type === 'liters' ? qtyNum : billedLiters),
+          price_per_unit_type: null,
+          price_per_l: payload.price_per_l ?? null,
+          subtotal_native: totalNative,
+          discount_native: null,
+          tax_native: null,
+          total_native: totalNative,
+          total_usd: totalUsd,
+          currency: saleCurrency,
+          fx_rate_to_usd: saleCurrency === 'USD' ? null : fxValid ?? null,
+          payment_status: 'unpaid', // invoice → unpaid by default
+          payment_method: payload.payment_method ?? null, // 'credit'
+          note: (payload as any).note ?? null,
+          created_at: nowIso,
+          updated_at: null,
+        };
+
+        console.log(`${LOG_TAG} offlineRow summary`, {
+          id: offlineRow.id,
+          oil_id: offlineRow.oil_id,
+          wakaalad_id: offlineRow.wakaalad_id,
+          total_native: offlineRow.total_native,
+          total_usd: offlineRow.total_usd,
+          currency: offlineRow.currency,
+        });
+
+        if (user?.id) {
+          console.log(
+            `${LOG_TAG} upsertOilSalesFromServer() [OFFLINE] START`,
+            { userId: user.id, rowsCount: 1 }
+          );
+          await upsertOilSalesFromServer([offlineRow], user.id);
+          console.log(
+            `${LOG_TAG} upsertOilSalesFromServer() [OFFLINE] SUCCESS`,
+            { userId: user.id, rowsCount: 1 }
+          );
+        } else {
+          console.warn(
+            `${LOG_TAG} Skipped local upsert in OFFLINE branch: missing user.id`
+          );
+        }
+
+        showToast('Invoice saved offline – will sync when online');
+        console.log(`${LOG_TAG} Offline invoice completed; navigate`);
+        goToInvoices();
+      } catch (e: any) {
+        console.error(`${LOG_TAG} OFFLINE branch failed`, {
+          errorMessage: e?.message,
+          errorStack: e?.stack,
+          error: e,
+        });
+        openValidation(
+          'Offline save failed',
+          'Could not save invoice locally. Please try again.'
+        );
+      } finally {
+        console.log(`${LOG_TAG} OFFLINE finally setSubmitting(false)`);
+        setSubmitting(false);
+      }
+
+      return;
+    }
+
+  // ONLINE BRANCH
+    console.log(`${LOG_TAG} ONLINE branch`, {
+      online,
+      hasToken: !!token,
+      userId: user.id,
+      endpoint: '/oilsale',
+    });
+
+    try {
+      console.log(`${LOG_TAG} api.post('/oilsale') START`, {
+        payloadSummary: {
+          oil_id: payload.oil_id,
+          wakaalad_id: payload.wakaalad_id,
+          unit_type: payload.unit_type,
+          liters_sold: payload.liters_sold,
+          unit_qty: payload.unit_qty,
+          currency: payload.currency,
+          payment_method: payload.payment_method,
+          sale_type: payload.sale_type,
+        },
+      });
+
       const res = await api.post<OilSaleRead>('/oilsale', payload, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      setReceipt(res.data);
-      setReceiptOpen(true);
-      showToast('Invoice created successfully');
-    } else {
-      // 🔴 OFFLINE: enqueue to local SQLite queue
-      await queueOilSaleForSync(user.id, payload);
 
-      // 🔹 Record local income-statement delta
+      console.log(`${LOG_TAG} api.post('/oilsale') SUCCESS`, {
+        saleId: res.data?.id,
+        currency: res.data?.currency,
+        total_native: (res.data as any)?.total_native,
+      });
+
       try {
-        const createdAt = new Date().toISOString();
-        const totalNativeSale = billedLiters * (perL_sale || 0);
-
-        let totalUsd = 0;
-        if (saleCurrency === 'USD') {
-          totalUsd = totalNativeSale;
-        } else if (saleCurrency === 'SOS' && fxValid) {
-          totalUsd = totalNativeSale / fxValid;
-        }
-
-        if (totalNativeSale > 0 && totalUsd > 0 && Number.isFinite(totalUsd)) {
-          registerOfflineOilInvoiceDelta({
-            ownerId: user.id,
-            createdAt,
-            truckPlate: selected.truck_plate || null,
-            currency: saleCurrency,
-            totalNative: totalNativeSale,
-            totalUsd,
-          });
-        }
-      } catch (e) {
-        console.warn('registerOfflineOilInvoiceDelta failed', e);
-      }
-
-      // 🔹 NEW: update local wakaalad sell-option + wakaalad dashboard stock
-      try {
-        const stockLiters = estimatedLiters; // physical liters removed from stock
-
-        if (stockLiters > 0) {
-          const newStock = Math.max(
-            0,
-            (selected.in_stock_l ?? 0) - stockLiters
+        if (user?.id && res.data) {
+          console.log(
+            `${LOG_TAG} upsertOilSalesFromServer() [ONLINE] START`,
+            { userId: user.id, saleId: res.data.id }
           );
-
-          // 1) Update local wakaalad_sell_options row
-          await upsertLocalWakaaladSellOption({
-            ownerId: user.id,
-            wakaalad_id: selected.wakaalad_id,
-            oil_id: selected.oil_id,
-            oil_type: selected.oil_type,
-            wakaalad_name: selected.wakaalad_name,
-            truck_plate: selected.truck_plate,
-            currency: selected.currency,
-            in_stock_l: newStock,
-            liter_price: selected.liter_price,
-            fuusto_price: selected.fuusto_price,
-            caag_price: selected.caag_price,
-            fuusto_capacity_l: selected.fuusto_capacity_l,
-            caag_capacity_l: selected.caag_capacity_l,
-          });
-
-          // 2) Update in-memory options for this screen
-          setOptions((prev) =>
-            prev.map((o) =>
-              o.wakaalad_id === selected.wakaalad_id
-                ? { ...o, in_stock_l: newStock }
-                : o
-            )
+          await upsertOilSalesFromServer([res.data], user.id);
+          console.log(
+            `${LOG_TAG} upsertOilSalesFromServer() [ONLINE] SUCCESS`,
+            { userId: user.id, saleId: res.data.id }
           );
-
-          // 3) Update wakaalad dashboard offline DB so stock/sold reflect the sale
-          await applyLocalWakaaladSale(
-            user.id,
-            selected.wakaalad_id,
-            stockLiters
+        } else {
+          console.warn(
+            `${LOG_TAG} Skipped local upsert in ONLINE branch: missing user.id or res.data`
           );
         }
-      } catch (e) {
-        console.warn(
-          'Failed to apply local wakaalad stock/sale change',
-          e
+      } catch (e: any) {
+        console.error(
+          `${LOG_TAG} Failed to upsert oil sale locally in ONLINE branch`,
+          { errorMessage: e?.message, errorStack: e?.stack, error: e }
         );
       }
 
-      showToast('Invoice saved offline – will sync when online');
-    }
+      setReceipt(res.data);
+      setReceiptOpen(true);
+      showToast('Invoice created successfully');
 
-    goToInvoices();
-  } catch (e: any) {
-    openValidation(
-      'Create failed',
-      String(
+      console.log(
+        `${LOG_TAG} Online invoice completed; receipt set; navigating`,
+        { saleId: res.data?.id }
+      );
+
+      goToInvoices();
+    } catch (e: any) {
+      const errMsg =
         e?.response?.data?.detail ||
-          e?.message ||
-          'Unable to create invoice sale.'
-      )
-    );
-  } finally {
-    setSubmitting(false);
-  }
-};
+        e?.message ||
+        'Unable to create invoice sale.';
 
+      console.error(`${LOG_TAG} ONLINE branch failed`, {
+        errorMessage: errMsg,
+        errorStack: e?.stack,
+        error: e,
+        responseData: e?.response?.data,
+        status: e?.response?.status,
+      });
 
+      openValidation('Create failed', String(errMsg));
+    } finally {
+      console.log(`${LOG_TAG} ONLINE finally setSubmitting(false)`);
+      setSubmitting(false);
+    }
+  };
+
+  // USD preview for summary
   const amountUSD: number | null = useMemo(() => {
     if (lineTotal <= 0) return null;
     if (lotCurrency === 'USD') return lineTotal;
@@ -1201,29 +1665,33 @@ export default function OilSaleInvoiceForm() {
     return null;
   }, [lineTotal, lotCurrency, finalFxRate]);
 
-  const applyPriceIntoOption = useCallback((oilId: number, update: { basis: SaleUnitType; value: number }) => {
-    setOptions((prev) =>
-      prev.map((o) => {
-        if (o.oil_id !== oilId) return o;
-        const next: WakaaladSellOption = { ...o };
-        const fuustoBillable = billableFuustoL(next);
-        if (update.basis === 'liters') {
-          next.liter_price = update.value;
-          next.fuusto_price = update.value * fuustoBillable;
-          next.caag_price = update.value * capacityL('caag', next);
-        } else if (update.basis === 'fuusto') {
-          next.fuusto_price = update.value;
-          next.liter_price = update.value / fuustoBillable;
-          next.caag_price = next.liter_price * capacityL('caag', next);
-        } else {
-          next.caag_price = update.value;
-          next.liter_price = update.value / capacityL('caag', next);
-          next.fuusto_price = next.liter_price * fuustoBillable;
-        }
-        return next;
-      })
-    );
-  }, []);
+  // Update options after price change (in-memory)
+  const applyPriceIntoOption = useCallback(
+    (oilId: number, update: { basis: SaleUnitType; value: number }) => {
+      setOptions((prev) =>
+        prev.map((o) => {
+          if (o.oil_id !== oilId) return o;
+          const next: WakaaladSellOption = { ...o };
+          const fuustoBillable = billableFuustoL(next);
+          if (update.basis === 'liters') {
+            next.liter_price = update.value;
+            next.fuusto_price = update.value * fuustoBillable;
+            next.caag_price = update.value * capacityL('caag', next);
+          } else if (update.basis === 'fuusto') {
+            next.fuusto_price = update.value;
+            next.liter_price = update.value / fuustoBillable;
+            next.caag_price = next.liter_price * capacityL('caag', next);
+          } else {
+            next.caag_price = update.value;
+            next.liter_price = update.value / capacityL('caag', next);
+            next.fuusto_price = next.liter_price * fuustoBillable;
+          }
+          return next;
+        })
+      );
+    },
+    []
+  );
 
   const filteredOptions = useMemo(() => {
     const q = oilQuery.trim().toLowerCase();
@@ -1236,8 +1704,28 @@ export default function OilSaleInvoiceForm() {
     });
   }, [options, oilQuery]);
 
-  const currentUnitPrice = useMemo(() => (selected ? getUnitPrice(selected, unitType) : 0), [selected, unitType]);
+  const currentUnitPrice = useMemo(
+    () => (selected ? getUnitPrice(selected, unitType) : 0),
+    [selected, unitType]
+  );
   const hasUnitPrice = currentUnitPrice > 0;
+
+  // stock-exceeded one-time modal warning
+  const lastWarnKeyRef = useRef<string>('');
+  useEffect(() => {
+    const key = selected ? `${selected.wakaalad_id}-${unitType}-${qtyNum}` : '';
+    if (stockExceeded && key && lastWarnKeyRef.current !== key) {
+      lastWarnKeyRef.current = key;
+      openValidation(
+        'Not enough stock',
+        `Requested ${fmtNum(
+          estimatedLiters,
+          2
+        )} L exceeds available ${fmtNum(selected?.in_stock_l ?? 0, 2)} L.`
+      );
+    }
+    if (!stockExceeded) lastWarnKeyRef.current = '';
+  }, [stockExceeded, selected, unitType, qtyNum, estimatedLiters]);
 
   return (
     <View style={{ flex: 1, backgroundColor: '#FFFFFF' }}>
@@ -1278,7 +1766,7 @@ export default function OilSaleInvoiceForm() {
           overScrollMode="always"
           showsVerticalScrollIndicator={false}
         >
-          {/* Customer + contact */}
+          {/* Customer (popup trigger + contact) */}
           <View style={styles.inlineRow}>
             <View style={styles.inlineField}>
               <Text style={styles.label}>Customer</Text>
@@ -1307,7 +1795,7 @@ export default function OilSaleInvoiceForm() {
             </View>
           </View>
 
-          {/* Wakaalad popup trigger + sell type dropdown */}
+          {/* Wakaalad popup trigger + Sell type dropdown */}
           <View style={styles.inlineRow}>
             {/* Wakaalad button -> popup */}
             <View style={styles.inlineField}>
@@ -1320,46 +1808,63 @@ export default function OilSaleInvoiceForm() {
                 }}
                 activeOpacity={0.9}
               >
-                <Text style={[styles.selectValue, styles.wakaaladSelectValue]} numberOfLines={1}>
+                <Text
+                  style={[styles.selectValue, styles.wakaaladSelectValue]}
+                  numberOfLines={1}
+                >
                   {selected
-                    ? `${selected.oil_type.toUpperCase()} • ${selected.truck_plate || '—'}`
+                    ? `${selected.oil_type.toUpperCase()} • ${
+                        selected.truck_plate || '—'
+                      }`
                     : 'Select'}
                 </Text>
                 <Feather name="chevron-down" size={16} color="#0B1221" />
               </TouchableOpacity>
             </View>
 
-            {/* Sell type dropdown */}
+            {/* Sell type inline dropdown */}
             <View style={[styles.inlineField, { zIndex: 30 }]}>
               <InlineDropdown
                 label="Sell type"
                 columnLabel
-                value={unitType === 'liters' ? 'Liters' : unitType === 'fuusto' ? 'Fuusto' : 'Caag'}
+                value={
+                  unitType === 'liters'
+                    ? 'Liters'
+                    : unitType === 'fuusto'
+                    ? 'Fuusto'
+                    : 'Caag'
+                }
                 open={openUnit}
                 onToggle={() => setOpenUnit((s) => !s)}
                 z={30}
               >
-                {(['liters', 'fuusto', 'caag'] as SaleUnitType[]).map((val) => (
-                  <TouchableOpacity
-                    key={val}
-                    style={styles.optionRowSm}
-                    onPress={() => {
-                      setUnitType(val);
-                      setQty('1');
-                      if (selected) {
-                        const p = getUnitPrice(selected, val);
-                        setPriceDisplay(p > 0 ? String(p) : '');
-                      } else {
-                        setPriceDisplay('');
-                      }
-                      setOpenUnit(false);
-                    }}
-                  >
-                    <Text style={styles.pickerMain}>
-                      {val === 'liters' ? 'Liters' : val === 'fuusto' ? 'Fuusto' : 'Caag'}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
+                {(['liters', 'fuusto', 'caag'] as SaleUnitType[]).map(
+                  (val) => (
+                    <TouchableOpacity
+                      key={val}
+                      style={styles.optionRowSm}
+                      onPress={() => {
+                        setUnitType(val);
+                        setQty('1');
+                        if (selected) {
+                          const p = getUnitPrice(selected, val);
+                          setPriceDisplay(p > 0 ? String(p) : '');
+                        } else {
+                          setPriceDisplay('');
+                        }
+                        setOpenUnit(false);
+                      }}
+                    >
+                      <Text style={styles.pickerMain}>
+                        {val === 'liters'
+                          ? 'Liters'
+                          : val === 'fuusto'
+                          ? 'Fuusto'
+                          : 'Caag'}
+                      </Text>
+                    </TouchableOpacity>
+                  )
+                )}
               </InlineDropdown>
             </View>
           </View>
@@ -1389,10 +1894,19 @@ export default function OilSaleInvoiceForm() {
                     onPress={() => selected && setChangeOpen(true)}
                     disabled={!selected}
                     activeOpacity={0.9}
-                    style={[styles.addonBtn, !selected && { opacity: 0.5 }]}
+                    style={[
+                      styles.addonBtn,
+                      !selected && { opacity: 0.5 },
+                    ]}
                   >
-                    <Feather name={hasUnitPrice ? 'edit-3' : 'plus'} size={12} color="#0B1221" />
-                    <Text style={styles.addonBtnText}>{hasUnitPrice ? 'Change' : 'Add price'}</Text>
+                    <Feather
+                      name={hasUnitPrice ? 'edit-3' : 'plus'}
+                      size={12}
+                      color="#0B1221"
+                    />
+                    <Text style={styles.addonBtnText}>
+                      {hasUnitPrice ? 'Change' : 'Add price'}
+                    </Text>
                   </TouchableOpacity>
                 }
               />
@@ -1402,33 +1916,46 @@ export default function OilSaleInvoiceForm() {
           {/* Summary */}
           {selected && (
             <View style={styles.summaryCard}>
+              {/* Wakaalad row */}
               <View style={styles.summaryRow}>
                 <Text style={styles.summaryKey}>Wakaalad</Text>
                 <Text style={styles.summaryVal}>
-                  {selected.oil_type.toUpperCase()} • {selected.wakaalad_name} • {selected.truck_plate || '—'}
+                  {selected.oil_type.toUpperCase()} •{' '}
+                  {selected.wakaalad_name} • {selected.truck_plate || '—'}
                 </Text>
               </View>
 
-              <View style={styles.divider} />
+              <View className="divider" style={styles.divider} />
 
+              {/* Amount in USD (primary) */}
               <View style={styles.summaryRow}>
-                <Text style={[styles.summaryKey, styles.bold]}>Amount (USD)</Text>
+                <Text style={[styles.summaryKey, styles.bold]}>
+                  Amount (USD)
+                </Text>
                 <Text style={[styles.summaryVal, styles.bold]}>
                   {amountUSD != null ? `$${fmtNum(amountUSD, 2)}` : '—'}
                 </Text>
               </View>
 
+              {/* Base total (muted) */}
               <View style={styles.summaryInlineSmall}>
                 <Text style={styles.smallMuted}>
-                  Base total: {symbolFor(selected?.currency)} {fmtNum(lineTotal, 2)}
+                  Base total: {symbolFor(selected?.currency)}{' '}
+                  {fmtNum(lineTotal, 2)}
                 </Text>
-                {(selected?.currency || 'USD').toUpperCase() !== 'USD' && amountUSD == null ? (
-                  <Text style={styles.tinyHint}>Enter USD rate at checkout to preview dollars.</Text>
+                {(selected?.currency || 'USD').toUpperCase() !== 'USD' &&
+                amountUSD == null ? (
+                  <Text style={styles.tinyHint}>
+                    Enter USD rate at checkout to preview dollars.
+                  </Text>
                 ) : null}
               </View>
 
+              {/* Simple shorts note for petrol fuusto */}
               {unitType === 'fuusto' && shortsPerFuusto > 0 && (
-                <Text style={[styles.smallMuted, { marginTop: 6 }]}>Shorts: 10 L per fuusto</Text>
+                <Text style={[styles.smallMuted, { marginTop: 6 }]}>
+                  Shorts: 10 L per fuusto
+                </Text>
               )}
             </View>
           )}
@@ -1437,14 +1964,18 @@ export default function OilSaleInvoiceForm() {
             <View style={styles.inlineWarning}>
               <Feather name="alert-triangle" size={14} color="#92400E" />
               <Text style={styles.inlineWarningText}>
-                Requested {fmtNum(estimatedLiters, 2)} L exceeds available {fmtNum(selected?.in_stock_l ?? 0, 2)} L.
+                Requested {fmtNum(estimatedLiters, 2)} L exceeds available{' '}
+                {fmtNum(selected?.in_stock_l ?? 0, 2)} L.
               </Text>
             </View>
           )}
 
           {/* Submit */}
           <TouchableOpacity
-            style={[styles.submitBtn, (!canSubmit || submitting || !selected) && { opacity: 0.6 }]}
+            style={[
+              styles.submitBtn,
+              (!canSubmit || submitting || !selected) && { opacity: 0.6 },
+            ]}
             disabled={!canSubmit || submitting || !selected}
             onPress={handleSubmit}
             activeOpacity={0.92}
@@ -1462,10 +1993,19 @@ export default function OilSaleInvoiceForm() {
       </KeyboardAvoidingView>
 
       {/* Validation Modal */}
-      <ValidationModal visible={valOpen} title={valTitle} message={valMsg} onClose={() => setValOpen(false)} />
+      <ValidationModal
+        visible={valOpen}
+        title={valTitle}
+        message={valMsg}
+        onClose={() => setValOpen(false)}
+      />
 
       {/* Receipt Modal */}
-      <ReceiptModal visible={receiptOpen} receipt={receipt} onClose={() => setReceiptOpen(false)} />
+      <ReceiptModal
+        visible={receiptOpen}
+        receipt={receipt}
+        onClose={() => setReceiptOpen(false)}
+      />
 
       {/* Final currency/rate modal */}
       <SaleCurrencyModal
@@ -1474,7 +2014,11 @@ export default function OilSaleInvoiceForm() {
         lineTotal={lineTotal}
         qty={qtyNum}
         unitType={unitType}
-        baseCurrency={(selected?.currency || 'USD').toUpperCase() === 'USD' ? 'USD' : 'SOS'}
+        baseCurrency={
+          (selected?.currency || 'USD').toUpperCase() === 'USD'
+            ? 'USD'
+            : 'SOS'
+        }
         onClose={() => setFinalOpen(false)}
         onConfirm={(ck, fx) => {
           setFinalCurrencyKey(ck);
@@ -1483,7 +2027,7 @@ export default function OilSaleInvoiceForm() {
         }}
       />
 
-      {/* Change price mini modal */}
+      {/* Change Price Mini Modal */}
       {selected && (
         <ChangePriceMiniModal
           visible={changeOpen}
@@ -1494,14 +2038,16 @@ export default function OilSaleInvoiceForm() {
           initialAmount={priceDisplay || ''}
           online={online}
           ownerId={user?.id}
-          onSaved={({ basis, value, offline }) => {
-            // 1) Update in-memory options for this session
+          onSaved={({ basis, value }) => {
+            // 1) Update in-memory options
             applyPriceIntoOption(selected.oil_id, { basis, value });
 
-            // 2) Persist into local wakaalad_sell_options so it survives app restart
+            // 2) Persist into local wakaalad_sell_options so it survives restart
             if (user?.id) {
               const current =
-                options.find((o) => o.wakaalad_id === selected.wakaalad_id) || selected;
+                options.find(
+                  (o) => o.wakaalad_id === selected.wakaalad_id
+                ) || selected;
 
               const fuustoBillable = billableFuustoL(current);
               let liter_price = current.liter_price ?? null;
@@ -1517,7 +2063,6 @@ export default function OilSaleInvoiceForm() {
                 liter_price = value / fuustoBillable;
                 caag_price = liter_price * capacityL('caag', current);
               } else {
-                // caag basis
                 caag_price = value;
                 liter_price = value / capacityL('caag', current);
                 fuusto_price = liter_price * fuustoBillable;
@@ -1556,11 +2101,7 @@ export default function OilSaleInvoiceForm() {
               setPriceDisplay(String(value));
             }
 
-            showToast(
-              offline
-                ? 'Price saved offline – will sync to server when online'
-                : 'Price updated'
-            );
+            showToast('Price updated');
           }}
         />
       )}
@@ -1587,63 +2128,20 @@ export default function OilSaleInvoiceForm() {
         }}
       />
 
-      {/* Create Customer Modal */}
-      <CustomerCreateModal
+      {/* Create Customer Modal (same as cash sale) */}
+      <CreateCustomerModal
         visible={createOpen}
-        mode="add"
-        submitting={createSubmitting}
         onClose={() => setCreateOpen(false)}
-        onSubmit={async (payload) => {
-          if (!payload.name?.trim()) return;
-          if (!user?.id) {
-            showToast('Missing tenant – cannot create customer');
-            return;
-          }
+        online={online}
+        token={token}
+        userId={user?.id}
+        onCreated={(c) => {
+          setCustName(c.name);
+          setCustContact(c.phone || '');
+          showToast('Customer created');
 
-          setCreateSubmitting(true);
-          try {
-            let createdName = payload.name;
-            let createdContact = payload.phone;
-
-            if (online && token) {
-              // ✅ ONLINE: server + SQLite
-              const res = await api.post('/diiwaancustomers', payload, {
-                headers: { Authorization: `Bearer ${token}` },
-              });
-              const created = res?.data || {};
-              upsertCustomersFromServer([created], user.id);
-
-              createdName = created?.name || payload.name;
-              createdContact =
-                created?.contact || created?.phone || payload.phone || null;
-            } else {
-              // ✅ OFFLINE: write to local SQLite so other screens see it
-              const localRow = createOrUpdateCustomerLocal(
-                {
-                  name: payload.name.trim(),
-                  phone: payload.phone?.trim() || null,
-                  address: payload.address ?? null,
-                  status: 'active',
-                },
-                user.id
-              );
-
-              createdName = localRow.name || payload.name;
-              createdContact = localRow.phone || payload.phone || null;
-            }
-
-            setCustName(createdName);
-            setCustContact(createdContact || '');
-
-            // will now include offline customer as well
-            loadCustomers(true);
-            setCreateOpen(false);
-            showToast('Customer created');
-          } catch (e: any) {
-            showToast(String(e?.response?.data?.detail || e?.message || 'Create failed'));
-          } finally {
-            setCreateSubmitting(false);
-          }
+          setSearch('');
+          loadCustomers(true);
         }}
       />
 
@@ -1690,14 +2188,28 @@ function InlineDropdown({
   return (
     <View style={{ marginBottom: 10, zIndex: z }}>
       <View style={{ flexDirection: 'column' }}>
-        {columnLabel && <Text style={[styles.label, { marginBottom: 4 }]}>{label}</Text>}
-        <TouchableOpacity style={styles.selectBtn} onPress={onToggle} activeOpacity={0.9}>
-          {!columnLabel && <Text style={styles.selectLabel}>{label}</Text>}
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+        {columnLabel && (
+          <Text style={[styles.label, { marginBottom: 4 }]}>{label}</Text>
+        )}
+        <TouchableOpacity
+          style={styles.selectBtn}
+          onPress={onToggle}
+          activeOpacity={0.9}
+        >
+          {!columnLabel && (
+            <Text style={styles.selectLabel}>{label}</Text>
+          )}
+          <View
+            style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}
+          >
             <Text style={styles.selectValue} numberOfLines={1}>
               {value || 'Select'}
             </Text>
-            <Feather name={open ? 'chevron-up' : 'chevron-down'} size={16} color="#0B1221" />
+            <Feather
+              name={open ? 'chevron-up' : 'chevron-down'}
+              size={16}
+              color="#0B1221"
+            />
           </View>
         </TouchableOpacity>
       </View>
@@ -1708,9 +2220,17 @@ function InlineDropdown({
 
 function Row({ label, value }: { label: string; value: string }) {
   return (
-    <View style={{ flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 3 }}>
+    <View
+      style={{
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        paddingVertical: 3,
+      }}
+    >
       <Text style={{ color: '#6B7280', fontSize: 12 }}>{label}</Text>
-      <Text style={{ color: '#0B1221', fontWeight: '700', fontSize: 12 }}>{value}</Text>
+      <Text style={{ color: '#0B1221', fontWeight: '700', fontSize: 12 }}>
+        {value}
+      </Text>
     </View>
   );
 }
@@ -1824,7 +2344,6 @@ const styles = StyleSheet.create({
   },
   selectLabel: { fontSize: 11, color: '#64748B' },
   selectValue: { fontSize: 13, fontWeight: '700', color: '#0B1221' },
-  // smaller text specifically for wakaalad field
   wakaaladSelectValue: {
     fontSize: 10,
     fontWeight: '700',
@@ -1917,7 +2436,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 8,
   },
-  inlineWarningText: { color: '#92400E', fontSize: 11, flex: 1, lineHeight: 16 },
+  inlineWarningText: {
+    color: '#92400E',
+    fontSize: 11,
+    flex: 1,
+    lineHeight: 16,
+  },
 
   modalBackdrop: {
     flex: 1,
@@ -1940,11 +2464,26 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 8 },
     elevation: 10,
   },
-  modalHeader: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 6 },
-  modalHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
+  modalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 6,
+  },
+  modalHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
   modalTitle: { fontWeight: '800', color: '#7C2D12', fontSize: 14 },
   modalBigTitle: { fontWeight: '800', color: '#0B1221', fontSize: 16 },
-  modalMessage: { color: '#0B1221', fontSize: 13, lineHeight: 18, marginTop: 4 },
+  modalMessage: {
+    color: '#0B1221',
+    fontSize: 13,
+    lineHeight: 18,
+    marginTop: 4,
+  },
   modalBtn: {
     height: 44,
     borderRadius: 12,
@@ -1966,7 +2505,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
   },
   segmentBtnActive: {
-    borderColor: '#0B1221',
+    borderColor: '#0B122A',
     backgroundColor: '#0B1221',
   },
   segmentText: { fontWeight: '800', color: '#0B1221', fontSize: 12 },
@@ -2005,6 +2544,7 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
 
+  // "+ Create customer" row
   createRow: {
     height: 40,
     borderRadius: 10,

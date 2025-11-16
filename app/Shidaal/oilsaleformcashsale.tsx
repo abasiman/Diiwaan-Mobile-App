@@ -4,10 +4,12 @@ import api from '@/services/api';
 import { useAuth } from '@/src/context/AuthContext';
 import { Feather } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { registerOfflineOilInvoiceDelta } from '../offlineincomestatement/incomeStatementRepo';
+import { queueOilRepriceForSync } from '../dbform/oilRepriceOfflineRepo';
+import { queueOilSaleOffline, QueueOilSalePayload } from '../oilSalesfOfflineRepo/oilSalesformOfflineRepo';
+
+import NetInfo from '@react-native-community/netinfo';
 
 
-import { queueOilSaleForSync } from '../oilsaleformoffline/oilSalesFormRepo';
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -24,11 +26,9 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-
-import NetInfo from '@react-native-community/netinfo';
+import { upsertOilSalesFromServer } from '../oilSalesfOfflineRepo/oilSalesRepo';
 
 import {
-  createOrUpdateCustomerLocal,
   getCustomersLocal,
   upsertCustomersFromServer,
 } from '../db/customerRepo';
@@ -40,10 +40,9 @@ import {
 } from '../dbform/wakaaladSellOptionsRepo';
 
 
-import { queueOilRepriceForSync } from '../dbform/oilRepriceOfflineRepo';
-import { applyLocalWakaaladSale } from '../WakaaladOffline/wakaaladRepo';
 
-import CustomerCreateModal from './customercreate';
+import { createOrUpdateCustomer } from '../db/customerCreateUpdate';
+
 import SaleCurrencyModal, { CurrencyKey } from './SaleCurrencyModalCashSale';
 
 const BORDER = '#CBD5E1';
@@ -51,20 +50,8 @@ const BORDER = '#CBD5E1';
 type SaleUnitType = 'liters' | 'fuusto' | 'caag';
 type SaleType = 'cashsale' | 'invoice';
 
-type CreateSalePayload = {
-  oil_id: number;
-  wakaalad_id: number;
-  unit_type: SaleUnitType;
-  unit_qty?: number;
-  liters_sold?: number;
-  price_per_l?: number;
-  customer?: string | null;
-  customer_contact?: string | null;
-  currency?: string;
-  fx_rate_to_usd?: number;
-  sale_type: SaleType;
-  payment_method?: 'cash' | 'bank';
-};
+type CreateSalePayload = QueueOilSalePayload;
+
 
 type OilSaleRead = {
   id: number;
@@ -100,7 +87,7 @@ type Customer = {
   phone?: string | null;
 };
 
-/** Merge customers by name (server + offline), keep real IDs & best contact */
+/** Merge customers by name (server + local), keep real IDs & best contact */
 const mergeCustomersByName = (rows: Customer[]): Customer[] => {
   const map = new Map<string, Customer>();
 
@@ -355,7 +342,6 @@ function FloatingInput({
     </View>
   );
 }
-
 /** ---------- Change Price mini modal with OFFLINE support ---------- */
 function ChangePriceMiniModal({
   visible,
@@ -700,22 +686,179 @@ function WakaaladPickerModal({
   );
 }
 
+
+
+
+function CreateCustomerModal({
+  visible,
+  onClose,
+  online,
+  token,
+  userId,
+  onCreated,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  online: boolean;
+  token?: string | null;
+  userId?: number;
+  onCreated: (c: { id: number; name: string; phone?: string | null; address?: string | null }) => void;
+}) {
+  const [name, setName] = useState('');
+  const [phone, setPhone] = useState('');
+  const [address, setAddress] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const reset = () => {
+    setName('');
+    setPhone('');
+    setAddress('');
+    setError(null);
+  };
+
+  const handleClose = () => {
+    if (submitting) return;
+    reset();
+    onClose();
+  };
+
+  const handleSave = async () => {
+    if (!name.trim()) {
+      setError('Fadlan geli magaca macaamiilka');
+      return;
+    }
+    if (!userId) {
+      setError('No tenant selected.');
+      return;
+    }
+
+    setSubmitting(true);
+    setError(null);
+
+    try {
+      const res: any = await createOrUpdateCustomer({
+        formMode: 'add',
+        payload: {
+          name: name.trim(),
+          phone: phone.trim() || null,
+          address: address.trim() || null,
+          status: 'active',
+        },
+        online,
+        token,
+        userId,
+      });
+
+      // Normalize the returned row (online or offline)
+      const created = {
+        id: res.id,
+        name: res.name || name.trim(),
+        phone: res.phone ?? res.contact ?? (phone.trim() || null),
+        address: res.address ?? (address.trim() || null),
+      };
+
+      onCreated(created);
+      reset();
+      onClose();
+    } catch (e: any) {
+      console.log('[CreateCustomerModal] error', e?.response?.data || e?.message || e);
+      setError(e?.response?.data?.detail || e?.message || 'Operation failed.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={handleClose}>
+      <View style={styles.modalBackdrop}>
+        <View style={[styles.modalCard, { maxWidth: 420 }]}>
+          <View style={styles.modalHeaderRow}>
+            <Text style={styles.modalBigTitle}>Create Customer</Text>
+            <TouchableOpacity onPress={handleClose}>
+              <Feather name="x" size={18} color="#0B1221" />
+            </TouchableOpacity>
+          </View>
+
+          <View style={{ gap: 10 }}>
+            <View>
+              <Text style={styles.label}>Magaca</Text>
+              <TextInput
+                value={name}
+                onChangeText={setName}
+                placeholder="Magaca macaamiilka"
+                placeholderTextColor="#9CA3AF"
+                style={styles.input}
+                autoCapitalize="words"
+              />
+            </View>
+
+            <View>
+              <Text style={styles.label}>Phone</Text>
+              <TextInput
+                value={phone}
+                onChangeText={setPhone}
+                placeholder="(+252) 61 234 5678"
+                placeholderTextColor="#9CA3AF"
+                style={styles.input}
+                keyboardType="phone-pad"
+              />
+            </View>
+
+            <View>
+              <Text style={styles.label}>Address</Text>
+              <TextInput
+                value={address}
+                onChangeText={setAddress}
+                placeholder="Degmada, xaafadda…"
+                placeholderTextColor="#9CA3AF"
+                style={[styles.input, { height: 80, textAlignVertical: 'top', paddingTop: 10 }]}
+                multiline
+              />
+            </View>
+
+            {error ? (
+              <Text style={{ color: '#B91C1C', fontSize: 12, marginTop: 4 }}>{error}</Text>
+            ) : null}
+          </View>
+
+          <View style={[styles.modalActions, { marginTop: 16 }]}>
+            <TouchableOpacity
+              style={[styles.modalActionBtn, styles.modalCancel]}
+              onPress={handleClose}
+              activeOpacity={0.92}
+              disabled={submitting}
+            >
+              <Text style={styles.modalCancelText}>Cancel</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[
+                styles.modalActionBtn,
+                styles.modalSave,
+                (submitting || !name.trim()) && { opacity: 0.6 },
+              ]}
+              onPress={handleSave}
+              activeOpacity={0.92}
+              disabled={submitting || !name.trim()}
+            >
+              {submitting ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.modalSaveText}>Save</Text>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 export default function OilSaleCashSaleForm() {
   const router = useRouter();
   const { token, user } = useAuth();
   const { show: showToast, ToastView } = useToast();
-
-  const [online, setOnline] = useState(true);
-
-  // track connectivity
-  useEffect(() => {
-    const sub = NetInfo.addEventListener((state) => {
-      const ok = Boolean(state.isConnected && state.isInternetReachable);
-      setOnline(ok);
-    });
-    return () => sub();
-  }, []);
-
 
   const [options, setOptions] = useState<WakaaladSellOption[]>([]);
   const [loadingOptions, setLoadingOptions] = useState(false);
@@ -760,24 +903,54 @@ export default function OilSaleCashSaleForm() {
   const offsetRef = useRef(0);
   const loadingRef = useRef(false);
 
-  const loadCustomers = useCallback(
-    async (reset = false) => {
-      if (!user?.id) return;
-      if (loadingRef.current) return;
-      loadingRef.current = true;
 
-      try {
-        if (reset) {
-          setLoading(true);
-          setHasMore(true);
-          offsetRef.current = 0;
-        }
 
-        const localOffset = reset ? 0 : offsetRef.current;
-        let data: Customer[] = [];
 
-        if (online && token) {
-          // ONLINE → hit API, then always read from local DB (merged)
+
+
+
+
+
+
+
+
+
+  const [online, setOnline] = useState(true);
+
+useEffect(() => {
+  const sub = NetInfo.addEventListener((state) => {
+    const ok = Boolean(state.isConnected && (state.isInternetReachable ?? true));
+    setOnline(ok);
+  });
+
+  // seed once
+  NetInfo.fetch().then((state) => {
+    const ok = Boolean(state.isConnected && (state.isInternetReachable ?? true));
+    setOnline(ok);
+  });
+
+  return () => sub();
+}, []);
+
+
+ const loadCustomers = useCallback(
+  async (reset = false) => {
+    if (!user?.id) return;
+    if (loadingRef.current) return;
+    loadingRef.current = true;
+
+    try {
+      if (reset) {
+        setLoading(true);
+        setHasMore(true);
+        offsetRef.current = 0;
+      }
+
+      const localOffset = reset ? 0 : offsetRef.current;
+
+      // 🔹 Only hit server if we're online AND have a token
+      if (online && token) {
+        try {
           const res = await api.get('/diiwaancustomers', {
             params: {
               q: search || undefined,
@@ -795,65 +968,42 @@ export default function OilSaleCashSaleForm() {
             : [];
 
           if (list.length) {
+            // save page into SQLite
             upsertCustomersFromServer(list, user.id);
           }
-
-          const rows = getCustomersLocal(search, limit, localOffset, user.id);
-          data = rows.map((c) => ({
-            id: c.id,
-            name: c.name || '',
-            contact: c.phone ?? null,
-            phone: c.phone ?? null,
-          }));
-        } else {
-          // OFFLINE (or no token) → purely local SQLite
-          const rows = getCustomersLocal(search, limit, localOffset, user.id);
-          data = rows.map((c) => ({
-            id: c.id,
-            name: c.name || '',
-            contact: c.phone ?? null,
-            phone: c.phone ?? null,
-          }));
+        } catch (e: any) {
+          // 🔹 Just log; we still fall back to local DB
+          console.warn('loadCustomers server fetch failed; using local only', e?.message || e);
         }
-
-        setCustomers((prev) => {
-          if (reset) return mergeCustomersByName(data);
-          return mergeCustomersByName([...prev, ...data]);
-        });
-
-        setHasMore(data.length === limit);
-        offsetRef.current = localOffset + data.length;
-        setError(null);
-      } catch (e: any) {
-        console.warn('loadCustomers failed', e?.response?.data || e?.message || e);
-
-        // Final fallback: try local if something blew up
-        try {
-          const localOffset = reset ? 0 : offsetRef.current;
-          const rows = getCustomersLocal(search, limit, localOffset, user?.id || 0);
-          const data = rows.map((c) => ({
-            id: c.id,
-            name: c.name || '',
-            contact: c.phone ?? null,
-            phone: c.phone ?? null,
-          }));
-
-          setCustomers((prev) =>
-            reset ? mergeCustomersByName(data) : mergeCustomersByName([...prev, ...data])
-          );
-          setHasMore(data.length === limit);
-          offsetRef.current = localOffset + data.length;
-          setError(null);
-        } catch (inner: any) {
-          setError(inner?.message || 'Failed to load customers.');
-        }
-      } finally {
-        setLoading(false);
-        loadingRef.current = false;
       }
-    },
-    [user?.id, token, online, search, limit]
-  );
+
+      // 🔹 ALWAYS read from local DB (offline/online)
+      const rows = getCustomersLocal(search, limit, localOffset, user.id);
+      const data: Customer[] = rows.map((c) => ({
+        id: c.id,
+        name: c.name || '',
+        contact: c.phone ?? null,
+        phone: c.phone ?? null,
+      }));
+
+      setCustomers((prev) => {
+        if (reset) return mergeCustomersByName(data);
+        return mergeCustomersByName([...prev, ...data]);
+      });
+
+      setHasMore(rows.length === limit);
+      offsetRef.current = localOffset + rows.length;
+      setError(null);
+    } catch (e: any) {
+      console.warn('loadCustomers failed', e?.response?.data || e?.message || e);
+      setError(e?.message || 'Failed to load customers.');
+    } finally {
+      setLoading(false);
+      loadingRef.current = false;
+    }
+  },
+  [user?.id, token, search, limit, online]
+);
 
   useEffect(() => {
     if (custPickerOpen) loadCustomers(true);
@@ -889,7 +1039,7 @@ export default function OilSaleCashSaleForm() {
     setValOpen(true);
   };
 
-  // fetch wakaalad sell options from local DB (like invoice form)
+  // fetch wakaalad sell options from local DB (pre-synced)
   useEffect(() => {
     if (!user?.id) return;
 
@@ -1035,36 +1185,95 @@ export default function OilSaleCashSaleForm() {
     setFinalOpen(true);
   };
 
-  // create sale with payment_method, supporting offline queue (same pattern as invoice form)
- const confirmAndCreate = async (
+  // create sale with payment_method (online + offline queue)
+const confirmAndCreate = async (
   pickedCurrencyKey: CurrencyKey,
   fxRateStr: string,
   paymentMethodServer: 'cash' | 'bank'
 ) => {
-  if (!selected) return;
+  const LOG_TAG = '[ConfirmAndCreate]';
+
+  console.log(
+    `${LOG_TAG} Starting with params`,
+    {
+      pickedCurrencyKey,
+      fxRateStr,
+      paymentMethodServer,
+      online,
+      hasToken: !!token,
+      userId: user?.id,
+      wakaaladSelected: !!selected,
+    }
+  );
+
+  // ─────────────────────────────────────────────
+  // Basic validations
+  // ─────────────────────────────────────────────
+  if (!selected) {
+    console.warn(`${LOG_TAG} Aborted: wakaalad not selected`);
+    openValidation('Select wakaalad', 'Please choose a wakaalad to sell from.');
+    return;
+  }
+
   if (!user?.id) {
+    console.error(`${LOG_TAG} Aborted: missing user.id`);
     openValidation('Missing user', 'User ID is required to create sales.');
     return;
   }
 
+  // ─────────────────────────────────────────────
+  // Currency / FX / per-liter calculation
+  // ─────────────────────────────────────────────
   const saleCurrency = saleCurrencyFromKey(pickedCurrencyKey);
   const fxRaw = parseFloat((fxRateStr || '').replace(',', '.'));
   const fxValid = !isNaN(fxRaw) && fxRaw > 0 ? fxRaw : undefined;
 
-  const perL_sale = convertPerL(lotCurrency, saleCurrency, perLInLotCurrency, fxValid);
+  console.log(
+    `${LOG_TAG} Derived currency + FX`,
+    {
+      lotCurrency,
+      saleCurrency,
+      fxRateInput: fxRateStr,
+      fxRaw,
+      fxValid,
+    }
+  );
+
+  const perL_sale = convertPerL(
+    lotCurrency,
+    saleCurrency,
+    perLInLotCurrency,
+    fxValid
+  );
+
+  console.log(
+    `${LOG_TAG} Per-liter conversion result`,
+    {
+      perLInLotCurrency,
+      perL_sale,
+    }
+  );
 
   if (lotCurrency !== saleCurrency && !fxValid) {
+    console.warn(
+      `${LOG_TAG} Aborted: FX required for currency conversion`,
+      { lotCurrency, saleCurrency, fxValid }
+    );
     openValidation('FX required', 'Please provide a valid exchange rate.');
     return;
   }
 
+  // ─────────────────────────────────────────────
+  // Build payload
+  // ─────────────────────────────────────────────
   const payload: CreateSalePayload = {
     oil_id: selected.oil_id,
     wakaalad_id: selected.wakaalad_id,
     unit_type: unitType,
     sale_type: SALE_TYPE,
     liters_sold: unitType === 'liters' ? qtyNum : undefined,
-    unit_qty: unitType === 'fuusto' || unitType === 'caag' ? qtyNum : undefined,
+    unit_qty:
+      unitType === 'fuusto' || unitType === 'caag' ? qtyNum : undefined,
     price_per_l: perL_sale || undefined,
     customer: custName?.trim() ? custName.trim() : undefined,
     customer_contact: custContact?.trim() ? custContact.trim() : undefined,
@@ -1073,131 +1282,266 @@ export default function OilSaleCashSaleForm() {
     payment_method: paymentMethodServer,
   };
 
+  console.log(
+    `${LOG_TAG} Prepared CreateSalePayload`,
+    {
+      payload,
+      unitType,
+      qtyNum,
+      lotCurrency,
+      perL_sale,
+    }
+  );
+
   setSubmitting(true);
   setFinalOpen(false);
 
-  try {
-    if (online && token) {
-      // ✅ ONLINE: normal API flow
-      const res = await api.post<OilSaleRead>('/oilsale', payload, {
-        headers: { Authorization: `Bearer ${token}` },
+  // ─────────────────────────────────────────────
+  // OFFLINE BRANCH
+  // ─────────────────────────────────────────────
+  if (!online || !token) {
+    console.log(
+      `${LOG_TAG} Entering OFFLINE branch`,
+      {
+        online,
+        hasToken: !!token,
+        userId: user.id,
+      }
+    );
+
+    try {
+      const tempId = -Date.now();
+      console.log(
+        `${LOG_TAG} Generated temp offline ID`,
+        { tempId }
+      );
+
+      console.log(
+        `${LOG_TAG} queueOilSaleOffline() → START`,
+        {
+          ownerId: user.id,
+          tempLocalId: tempId,
+        }
+      );
+      await queueOilSaleOffline({
+        ownerId: user.id,
+        payload,
+        tempLocalId: tempId,
       });
-      setReceipt(res.data);
-      setReceiptOpen(true);
-      showToast('Cash sale created successfully');
-    } else {
-      // 🟣 OFFLINE: queue sale for later sync
-      try {
-        await queueOilSaleForSync(user.id, {
-          oil_id: selected.oil_id,
-          wakaalad_id: selected.wakaalad_id,
-          unit_type: unitType,
-          liters_sold: unitType === 'liters' ? qtyNum : undefined,
-          unit_qty: unitType === 'fuusto' || unitType === 'caag' ? qtyNum : undefined,
-          price_per_l: perL_sale || undefined,
-          customer: custName?.trim() || null,
-          customer_contact: custContact?.trim() || null,
-          currency: saleCurrency,
-          fx_rate_to_usd: saleCurrency === 'USD' ? undefined : fxValid,
-          sale_type: SALE_TYPE,
-          payment_method: paymentMethodServer,
-            oil_type: selected.oil_type,              // 👈 add
-  truck_plate: selected.truck_plate || null // 👈 add
-        });
-      } catch (e) {
-        console.warn('queueOilSaleForSync failed', e);
-      }
+      console.log(`${LOG_TAG} queueOilSaleOffline() → SUCCESS`, { tempId });
 
-      // Also register local delta so tenant accounts reflect this cash sale while offline
-      try {
-        const createdAt = new Date().toISOString();
-        const totalNativeSale = billedLiters * (perL_sale || 0);
+      // ── Compute totals for local upsert
+      const totalNative =
+        perL_sale && perL_sale > 0 && billedLiters > 0
+          ? perL_sale * billedLiters
+          : null;
 
-        let totalUsd = 0;
-        if (saleCurrency === 'USD') {
-          totalUsd = totalNativeSale;
-        } else if (saleCurrency === 'SOS' && fxValid) {
-          totalUsd = totalNativeSale / fxValid;
+      const totalUsd =
+        saleCurrency === 'USD'
+          ? totalNative
+          : fxValid && totalNative != null
+          ? totalNative / fxValid
+          : null;
+
+      const nowIso = new Date().toISOString();
+
+      console.log(
+        `${LOG_TAG} Computed totals for offline row`,
+        {
+          billedLiters,
+          perL_sale,
+          totalNative,
+          totalUsd,
+          nowIso,
         }
+      );
 
-        if (totalNativeSale > 0 && totalUsd > 0 && Number.isFinite(totalUsd)) {
-          registerOfflineOilInvoiceDelta({
-            ownerId: user.id,
-            createdAt,
-            truckPlate: selected.truck_plate || null,
-            currency: saleCurrency,
-            totalNative: totalNativeSale,
-            totalUsd,
-          });
+      const offlineRow = {
+        id: tempId,
+        oil_id: payload.oil_id,
+        wakaalad_id: payload.wakaalad_id,
+        oil_type: selected.oil_type,
+        truck_plate: selected.truck_plate,
+        customer: payload.customer ?? null,
+        customer_contact: payload.customer_contact ?? null,
+        unit_type: payload.unit_type,
+        unit_qty: payload.unit_qty ?? null,
+        liters_sold:
+          payload.liters_sold ??
+          (payload.unit_type === 'liters' ? qtyNum : billedLiters),
+        price_per_unit_type: null,
+        price_per_l: payload.price_per_l ?? null,
+        subtotal_native: totalNative,
+        discount_native: null,
+        tax_native: null,
+        total_native: totalNative,
+        total_usd: totalUsd,
+        currency: saleCurrency,
+        fx_rate_to_usd: saleCurrency === 'USD' ? null : fxValid ?? null,
+        payment_status: 'paid',
+        payment_method: payload.payment_method ?? null,
+        note: (payload as any).note ?? null,
+        created_at: nowIso,
+        updated_at: null,
+      };
+
+      console.log(
+        `${LOG_TAG} Built offlineRow for local DB`,
+        { offlineRowSummary: {
+            id: offlineRow.id,
+            oil_id: offlineRow.oil_id,
+            wakaalad_id: offlineRow.wakaalad_id,
+            total_native: offlineRow.total_native,
+            total_usd: offlineRow.total_usd,
+            currency: offlineRow.currency,
+          }
         }
-      } catch (e) {
-        console.warn('registerOfflineOilInvoiceDelta failed', e);
-      }
+      );
 
-      // 🔹 Update local wakaalad sell-option + wakaalad dashboard stock
-      try {
-        const stockLiters = estimatedLiters; // physical liters removed from stock
-
-        if (stockLiters > 0) {
-          const newStock = Math.max(
-            0,
-            (selected.in_stock_l ?? 0) - stockLiters
-          );
-
-          // 1) Update local wakaalad_sell_options row
-          await upsertLocalWakaaladSellOption({
-            ownerId: user.id,
-            wakaalad_id: selected.wakaalad_id,
-            oil_id: selected.oil_id,
-            oil_type: selected.oil_type,
-            wakaalad_name: selected.wakaalad_name,
-            truck_plate: selected.truck_plate,
-            currency: selected.currency,
-            in_stock_l: newStock,
-            liter_price: selected.liter_price,
-            fuusto_price: selected.fuusto_price,
-            caag_price: selected.caag_price,
-            fuusto_capacity_l: selected.fuusto_capacity_l,
-            caag_capacity_l: selected.caag_capacity_l,
-          });
-
-          // 2) Update in-memory options for this screen
-          setOptions((prev) =>
-            prev.map((o) =>
-              o.wakaalad_id === selected.wakaalad_id
-                ? { ...o, in_stock_l: newStock }
-                : o
-            )
-          );
-
-          // 3) Update wakaalad dashboard offline DB so stock/sold reflect the sale
-          await applyLocalWakaaladSale(
-            user.id,
-            selected.wakaalad_id,
-            stockLiters
-          );
-        }
-      } catch (e) {
+      if (user?.id) {
+        console.log(
+          `${LOG_TAG} upsertOilSalesFromServer() [OFFLINE] → START`,
+          { userId: user.id, rowsCount: 1 }
+        );
+        await upsertOilSalesFromServer([offlineRow], user.id);
+        console.log(
+          `${LOG_TAG} upsertOilSalesFromServer() [OFFLINE] → SUCCESS`,
+          { userId: user.id, rowsCount: 1 }
+        );
+      } else {
         console.warn(
-          'Failed to apply local wakaalad stock/sale change',
-          e
+          `${LOG_TAG} Skipped local upsert in OFFLINE branch: missing user.id`
         );
       }
 
-      showToast('Cash sale saved offline – will sync when online');
+      showToast('Sale saved offline – will sync when online');
+      console.log(`${LOG_TAG} Offline sale completed; navigating to invoices`);
+
+      setFinalPaymentMethod(paymentMethodServer);
+      goToInvoices();
+    } catch (e: any) {
+      console.error(`${LOG_TAG} OFFLINE branch failed`, {
+        errorMessage: e?.message,
+        errorStack: e?.stack,
+        error: e,
+      });
+      openValidation(
+        'Offline save failed',
+        'Could not save sale locally. Please try again.'
+      );
+    } finally {
+      console.log(`${LOG_TAG} OFFLINE branch → finally() setSubmitting(false)`);
+      setSubmitting(false);
     }
+
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  // ONLINE BRANCH
+  // ─────────────────────────────────────────────
+  console.log(
+    `${LOG_TAG} Entering ONLINE branch`,
+    {
+      online,
+      hasToken: !!token,
+      userId: user.id,
+      endpoint: '/oilsale',
+    }
+  );
+
+  try {
+    console.log(
+      `${LOG_TAG} api.post('/oilsale') → START`,
+      { payloadSummary: {
+          oil_id: payload.oil_id,
+          wakaalad_id: payload.wakaalad_id,
+          unit_type: payload.unit_type,
+          liters_sold: payload.liters_sold,
+          unit_qty: payload.unit_qty,
+          currency: payload.currency,
+          payment_method: payload.payment_method,
+        }
+      }
+    );
+
+    const res = await api.post<OilSaleRead>('/oilsale', payload, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    console.log(
+      `${LOG_TAG} api.post('/oilsale') → SUCCESS`,
+      {
+        saleId: res.data?.id,
+        currency: res.data?.currency,
+        total_native: (res.data as any)?.total_native,
+      }
+    );
+
+    // Upsert into local DB so dashboard & offline cache stay in sync
+    try {
+      if (user?.id && res.data) {
+        console.log(
+          `${LOG_TAG} upsertOilSalesFromServer() [ONLINE] → START`,
+          { userId: user.id, saleId: res.data.id }
+        );
+        await upsertOilSalesFromServer([res.data], user.id);
+        console.log(
+          `${LOG_TAG} upsertOilSalesFromServer() [ONLINE] → SUCCESS`,
+          { userId: user.id, saleId: res.data.id }
+        );
+      } else {
+        console.warn(
+          `${LOG_TAG} Skipped local upsert in ONLINE branch: missing user.id or res.data`
+        );
+      }
+    } catch (e: any) {
+      console.error(
+        `${LOG_TAG} Failed to upsert oil sale locally in ONLINE branch`,
+        {
+          errorMessage: e?.message,
+          errorStack: e?.stack,
+          error: e,
+        }
+      );
+    }
+
+    setReceipt(res.data);
+    setReceiptOpen(true);
+    showToast('Cash sale created successfully');
+
+    console.log(
+      `${LOG_TAG} Online sale completed; receipt set; navigating to invoices`,
+      { saleId: res.data?.id }
+    );
 
     setFinalPaymentMethod(paymentMethodServer);
     goToInvoices();
   } catch (e: any) {
+    const errMsg =
+      e?.response?.data?.detail ||
+      e?.message ||
+      'Unable to create cash sale.';
+
+    console.error(`${LOG_TAG} ONLINE branch failed`, {
+      errorMessage: errMsg,
+      errorStack: e?.stack,
+      error: e,
+      responseData: e?.response?.data,
+      status: e?.response?.status,
+    });
+
     openValidation(
       'Create failed',
-      String(e?.response?.data?.detail || e?.message || 'Unable to create cash sale.')
+      String(errMsg)
     );
   } finally {
+    console.log(`${LOG_TAG} ONLINE branch → finally() setSubmitting(false)`);
     setSubmitting(false);
   }
 };
+
+
 
   // USD preview for summary
   const amountUSD: number | null = useMemo(() => {
@@ -1351,7 +1695,7 @@ export default function OilSaleCashSaleForm() {
               </TouchableOpacity>
             </View>
 
-            {/* Sell type stays as inline dropdown */}
+            {/* Sell type inline dropdown */}
             <View style={[styles.inlineField, { zIndex: 30 }]}>
               <InlineDropdown
                 label="Sell type"
@@ -1512,88 +1856,83 @@ export default function OilSaleCashSaleForm() {
         }}
       />
 
-      {/* Change price (with offline queue) */}
       {selected && (
-        <ChangePriceMiniModal
-          visible={changeOpen}
-          onClose={() => setChangeOpen(false)}
-          oilId={selected.oil_id}
-          authToken={token || undefined}
-          initialBasis={unitType}
-          initialAmount={priceDisplay || ''}
-          online={online}
-          ownerId={user?.id}
-          onSaved={({ basis, value, offline }) => {
-            // 1) Update in-memory options
-            applyPriceIntoOption(selected.oil_id, { basis, value });
+  <ChangePriceMiniModal
+    visible={changeOpen}
+    onClose={() => setChangeOpen(false)}
+    oilId={selected.oil_id}
+    authToken={token || undefined}
+    initialBasis={unitType}
+    initialAmount={priceDisplay || ''}
+    online={online}             // 🔹 pass connectivity state
+    ownerId={user?.id}          // 🔹 pass tenant/owner ID for queue
+    onSaved={({ basis, value }) => {
+      // 1) Update in-memory options
+      applyPriceIntoOption(selected.oil_id, { basis, value });
 
-            // 2) Persist into local wakaalad_sell_options so it survives restart
-            if (user?.id) {
-              const current =
-                options.find((o) => o.wakaalad_id === selected.wakaalad_id) || selected;
+      // 2) Persist into local wakaalad_sell_options so it survives restart
+      if (user?.id) {
+        const current =
+          options.find((o) => o.wakaalad_id === selected.wakaalad_id) || selected;
 
-              const fuustoBillable = billableFuustoL(current);
-              let liter_price = current.liter_price ?? null;
-              let fuusto_price = current.fuusto_price ?? null;
-              let caag_price = current.caag_price ?? null;
+        const fuustoBillable = billableFuustoL(current);
+        let liter_price = current.liter_price ?? null;
+        let fuusto_price = current.fuusto_price ?? null;
+        let caag_price = current.caag_price ?? null;
 
-              if (basis === 'liters') {
-                liter_price = value;
-                fuusto_price = value * fuustoBillable;
-                caag_price = value * capacityL('caag', current);
-              } else if (basis === 'fuusto') {
-                fuusto_price = value;
-                liter_price = value / fuustoBillable;
-                caag_price = liter_price * capacityL('caag', current);
-              } else {
-                // caag basis
-                caag_price = value;
-                liter_price = value / capacityL('caag', current);
-                fuusto_price = liter_price * fuustoBillable;
-              }
+        if (basis === 'liters') {
+          liter_price = value;
+          fuusto_price = value * fuustoBillable;
+          caag_price = value * capacityL('caag', current);
+        } else if (basis === 'fuusto') {
+          fuusto_price = value;
+          liter_price = value / fuustoBillable;
+          caag_price = liter_price * capacityL('caag', current);
+        } else {
+          // caag basis
+          caag_price = value;
+          liter_price = value / capacityL('caag', current);
+          fuusto_price = liter_price * fuustoBillable;
+        }
 
-              upsertLocalWakaaladSellOption({
-                ownerId: user.id,
-                wakaalad_id: current.wakaalad_id,
-                oil_id: current.oil_id,
-                oil_type: current.oil_type,
-                wakaalad_name: current.wakaalad_name,
-                truck_plate: current.truck_plate,
-                currency: current.currency,
-                in_stock_l: current.in_stock_l,
-                liter_price,
-                fuusto_price,
-                caag_price,
-                fuusto_capacity_l: current.fuusto_capacity_l,
-                caag_capacity_l: current.caag_capacity_l,
-              });
-            }
+        upsertLocalWakaaladSellOption({
+          ownerId: user.id,
+          wakaalad_id: current.wakaalad_id,
+          oil_id: current.oil_id,
+          oil_type: current.oil_type,
+          wakaalad_name: current.wakaalad_name,
+          truck_plate: current.truck_plate,
+          currency: current.currency,
+          in_stock_l: current.in_stock_l,
+          liter_price,
+          fuusto_price,
+          caag_price,
+          fuusto_capacity_l: current.fuusto_capacity_l,
+          caag_capacity_l: current.caag_capacity_l,
+        });
+      }
 
-            // 3) Update visible price field based on current unitType
-            let fresh = value;
-            if (basis !== unitType) {
-              if (basis === 'liters') {
-                fresh =
-                  unitType === 'liters'
-                    ? value
-                    : value * capacityL(unitType, selected);
-                setPriceDisplay(String(fresh));
-              } else if (basis === unitType) {
-                setPriceDisplay(String(value));
-              }
-            } else {
-              setPriceDisplay(String(value));
-            }
+      // 3) Update visible price field based on current unitType
+      let fresh = value;
+      if (basis !== unitType) {
+        if (basis === 'liters') {
+          fresh =
+            unitType === 'liters'
+              ? value
+              : value * capacityL(unitType, selected);
+          setPriceDisplay(String(fresh));
+        } else if (basis === unitType) {
+          setPriceDisplay(String(value));
+        }
+      } else {
+        setPriceDisplay(String(value));
+      }
 
-            // 4) Toast depending on offline / online
-            showToast(
-              offline
-                ? 'Price saved offline – will sync to server when online'
-                : 'Price updated'
-            );
-          }}
-        />
-      )}
+      showToast('Price updated');
+    }}
+  />
+)}
+
 
       {/* Customer Picker Popup */}
       <CustomerPickerModal
@@ -1617,65 +1956,25 @@ export default function OilSaleCashSaleForm() {
         }}
       />
 
-      {/* Create Customer Modal */}
-      <CustomerCreateModal
+            {/* Create Customer Modal */}
+      <CreateCustomerModal
         visible={createOpen}
-        mode="add"
-        submitting={createSubmitting}
         onClose={() => setCreateOpen(false)}
-        onSubmit={async (payload) => {
-          if (!payload.name?.trim()) return;
-          if (!user?.id) {
-            showToast('Missing tenant – cannot create customer');
-            return;
-          }
+        online={online}
+        token={token}
+        userId={user?.id}
+        onCreated={(c) => {
+          // fill form with the new customer
+          setCustName(c.name);
+          setCustContact(c.phone || '');
+          showToast('Customer created');
 
-          setCreateSubmitting(true);
-          try {
-            let createdName = payload.name;
-            let createdContact = payload.phone;
-
-            if (online && token) {
-              // ✅ ONLINE: server + SQLite
-              const res = await api.post('/diiwaancustomers', payload, {
-                headers: { Authorization: `Bearer ${token}` },
-              });
-              const created = res?.data || {};
-
-              upsertCustomersFromServer([created], user.id);
-
-              createdName = created?.name || payload.name;
-              createdContact = created?.contact || created?.phone || payload.phone || null;
-            } else {
-              // ✅ OFFLINE: write to local SQLite so other screens see it
-              const localRow = createOrUpdateCustomerLocal(
-                {
-                  name: payload.name.trim(),
-                  phone: payload.phone?.trim() || null,
-                  address: payload.address ?? null,
-                  status: 'active',
-                },
-                user.id
-              );
-
-              createdName = localRow.name || payload.name;
-              createdContact = localRow.phone || payload.phone || null;
-            }
-
-            setCustName(createdName);
-            setCustContact(createdContact || '');
-
-            // refresh picker list from whatever source we just wrote to
-            loadCustomers(true);
-            setCreateOpen(false);
-            showToast('Customer created');
-          } catch (e: any) {
-            showToast(String(e?.response?.data?.detail || e?.message || 'Create failed'));
-          } finally {
-            setCreateSubmitting(false);
-          }
+          // optionally refresh the list in the picker
+          setSearch('');
+          loadCustomers(true);
         }}
       />
+
 
       {/* Wakaalad Picker Popup */}
       <WakaaladPickerModal

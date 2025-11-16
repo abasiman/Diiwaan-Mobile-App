@@ -8,6 +8,8 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
 import * as SecureStore from 'expo-secure-store';
 import { useEffect, useMemo, useState } from 'react';
+
+
 import { Controller, useForm } from 'react-hook-form';
 import {
   Alert,
@@ -169,45 +171,58 @@ export default function LoginForm({ onSuccess }: { onSuccess?: () => void }) {
     if (role === 'super_admin') {
       router.replace('/diiwaanadmin/userslist');
     } else {
-      router.replace('/customerslist');
+      router.replace('/oilsalesdashboard');
     }
   };
+const onSubmit = async (data: Data) => {
+  setFormError(null);
+  clearErrors();
 
-  const onSubmit = async (data: Data) => {
-    setFormError(null);
-    clearErrors();
+  const loginOrEmail = data.username.trim();
+  const password = data.password;
 
-    const loginOrEmail = data.username.trim();
-    const password = data.password;
+  try {
+    const info = await withTimeout(login(loginOrEmail, password));
 
-    try {
-      const info = await withTimeout(login(loginOrEmail, password));
+    // Optional: grab ownerId / token if you need them
+    const ownerId =
+      (info as any)?.user?.id ??
+      (info as any)?.id ??
+      null;
 
-      routeByRole(info.role);
-      onSuccess?.();
+    const tokenStr =
+      (info as any)?.token ??
+      (info as any)?.access_token ??
+      null;
 
-      // Persist based on "Remember me"
-      if (remember) {
-        const toSet: [string, string][] = [
-          [KEY_REMEMBER, '1'],
-          [KEY_USERNAME, loginOrEmail],
-        ];
-        Promise.allSettled([
-          AsyncStorage.multiSet(toSet),
-          SecureStore.setItemAsync(KEY_PASSWORD, password),
-        ]).catch(() => {});
-      } else {
-        Promise.allSettled([
-          AsyncStorage.multiRemove([KEY_REMEMBER, KEY_USERNAME]),
-          SecureStore.deleteItemAsync(KEY_PASSWORD),
-        ]).catch(() => {});
-      }
-    } catch (err: any) {
-      const parsed = parseAuthError(err);
-      LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-      setFormError(parsed.message);
+    // Route based on role
+    routeByRole((info as any)?.role);
+    onSuccess?.();
+
+    // Persist based on "Remember me"
+    if (remember) {
+      const toSet: [string, string][] = [
+        [KEY_REMEMBER, '1'],
+        [KEY_USERNAME, loginOrEmail],
+      ];
+
+      Promise.allSettled([
+        AsyncStorage.multiSet(toSet),
+        SecureStore.setItemAsync(KEY_PASSWORD, password),
+      ]).catch(() => {});
+    } else {
+      Promise.allSettled([
+        AsyncStorage.multiRemove([KEY_REMEMBER, KEY_USERNAME]),
+        SecureStore.deleteItemAsync(KEY_PASSWORD),
+      ]).catch(() => {});
     }
-  };
+  } catch (err: any) {
+    const parsed = parseAuthError(err);
+    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    setFormError(parsed.message);
+  }
+};
+
 
   const handleWhatsAppPress = async () => {
     const digits = (WHATSAPP_NUMBER || '').replace(/\D/g, '');
