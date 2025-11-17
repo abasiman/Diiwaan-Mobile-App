@@ -2,12 +2,12 @@
 import api from '@/services/api';
 import { deleteCustomerInvoiceLocal } from '../db/CustomerInvoicesPagerepo';
 import { db } from '../db/db'; // ✅ shared DB instance (openDatabaseSync)
+import { registerOfflineOilInvoiceDelta } from '../offlineincomestatement/incomeStatementRepo';
 import { getRealWakaaladId } from '../wakaaladformoffline/wakaaladIdMapRepo';
 import { deleteLocalOilSale, upsertOilSalesFromServer } from './oilSalesRepo';
 // Make sure this matches all possible unit types in your app
 export type SaleUnitType = 'liters' | 'fuusto' | 'caag' | 'lot';
 export type SaleType = 'cashsale' | 'invoice';
-
 // --- Internal helpers wired to sync SQLite API ---
 
 type TxLike = {
@@ -115,7 +115,54 @@ export async function queueOilSaleOffline({
     tempLocalId: tempLocalId ?? null,
     payload,
   });
+
+  // ⭐ NEW: register sale delta so income statement includes it offline
+try {
+  if (ownerId && (payload.sale_type === 'cashsale' || payload.sale_type === 'invoice')) {
+    const rawCur = (payload.currency || 'USD').toUpperCase();
+    const currency: 'USD' | 'SOS' =
+      rawCur === 'SOS' ? 'SOS' : 'USD';
+
+    const price = payload.price_per_l ?? 0;
+
+    // Simple total: liters_sold for 'liters', unit_qty for other units.
+    let qty = 0;
+    if (payload.unit_type === 'liters') {
+      qty = payload.liters_sold ?? 0;
+    } else {
+      qty = payload.unit_qty ?? 0;
+    }
+
+    const totalNative = qty * price;
+
+    let totalUsd = 0;
+    if (currency === 'USD') {
+      totalUsd = totalNative;
+    } else if (payload.fx_rate_to_usd && totalNative) {
+      totalUsd = totalNative * payload.fx_rate_to_usd;
+    }
+
+    if (totalNative || totalUsd) {
+      registerOfflineOilInvoiceDelta({
+        ownerId,
+        createdAt: nowIso,          // same timestamp as queue insert
+        truckPlate: null,           // hook in truck plate if/when you add it
+        currency,
+        totalNative,
+        totalUsd,
+        saleType: payload.sale_type // <── 🔹 use actual sale type
+      });
+    }
+  }
+} catch (err) {
+  console.warn(
+    '[OilSalesQueue] failed to register offline income delta for sale',
+    err
+  );
 }
+
+}
+
 
 async function getQueuedOilSales(ownerId: number): Promise<QueuedOilSaleRow[]> {
   await initOilSalesOfflineDb();

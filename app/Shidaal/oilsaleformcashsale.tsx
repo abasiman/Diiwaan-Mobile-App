@@ -9,7 +9,7 @@ import { upsertSingleCustomerInvoiceFromSale } from '../db/CustomerInvoicesPager
 import { queueOilRepriceForSync } from '../dbform/oilRepriceOfflineRepo';
 import { queueOilSaleOffline, QueueOilSalePayload } from '../oilSalesfOfflineRepo/oilSalesformOfflineRepo';
 
-
+import { applyLocalWakaaladSale } from '../WakaaladOffline/wakaaladRepo';
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -1465,6 +1465,43 @@ const confirmAndCreate = async (
         );
       }
 
+
+
+
+
+      // 🔹 Apply wakaalad stock decrease locally (OFFLINE too)
+try {
+  if (user?.id && selected && estimatedLiters > 0) {
+    await applyLocalWakaaladSale(user.id, selected.wakaalad_id, estimatedLiters);
+
+    // Also update in-memory options so UI reflects new stock immediately
+    setOptions((prev) =>
+      prev.map((o) =>
+        o.wakaalad_id === selected.wakaalad_id
+          ? {
+              ...o,
+              in_stock_l: Math.max(
+                0,
+                (o.in_stock_l ?? 0) - estimatedLiters
+              ),
+            }
+          : o
+      )
+    );
+  } else {
+    console.log(
+      `${LOG_TAG} Skipped applyLocalWakaaladSale (missing user/selected or 0 liters)`,
+      { userId: user?.id, hasSelected: !!selected, estimatedLiters }
+    );
+  }
+} catch (err) {
+  console.warn(
+    `${LOG_TAG} applyLocalWakaaladSale() [OFFLINE] failed`,
+    err
+  );
+}
+
+
       showToast('Sale saved offline – will sync when online');
       console.log(`${LOG_TAG} Offline sale completed; navigating to invoices`);
 
@@ -1484,6 +1521,9 @@ const confirmAndCreate = async (
       console.log(`${LOG_TAG} OFFLINE branch → finally() setSubmitting(false)`);
       setSubmitting(false);
     }
+
+
+
 
     return;
   }

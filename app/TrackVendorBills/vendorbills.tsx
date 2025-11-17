@@ -1,4 +1,4 @@
-//oilpurchasevendorbills
+// oilpurchasevendorbills
 
 import { AntDesign, Feather } from '@expo/vector-icons';
 import DateTimePicker from '@react-native-community/datetimepicker';
@@ -8,21 +8,15 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BackHandler } from 'react-native';
+import { BackHandler, StyleSheet } from 'react-native';
 
 import { syncPendingOilModalForms } from '../OilModalOffline/oilModalSync';
 
-
-
 import { getVendorBillsForOwner } from '../OilPurchaseOffline/oilpurchasevendorbillsrepo';
-
 
 import NetInfo from '@react-native-community/netinfo';
 
 import { getVendorBillsWithSync } from '../OilPurchaseOffline/oilpurchasevendorbillsync';
-
-
-
 
 import { events, EVT_EXTRA_COST_CREATED, EVT_VENDOR_PAYMENT_CREATED } from '../Shidaal/eventBus';
 
@@ -33,12 +27,11 @@ import {
   Platform,
   RefreshControl,
   ScrollView,
-  StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
   TouchableWithoutFeedback,
-  View
+  View,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -55,6 +48,7 @@ import {
   saveOilSummaryCache,
   saveWakaaladStatsCache,
 } from '../OilPurchaseOffline/oilSummaryStatsCache';
+
 const { width } = Dimensions.get('window');
 
 const ALL_TRUCKS = '__ALL__';
@@ -181,8 +175,6 @@ const COLOR_CARD = '#F8FAFC';
 const COLOR_ACCENT = '#0B2447';
 const COLOR_SHADOW = 'rgba(2, 6, 23, 0.04)';
 
-
-
 function formatNumber(n?: number | null, fractionDigits = 0) {
   if (n === undefined || n === null || isNaN(Number(n))) return '—';
   return new Intl.NumberFormat(undefined, {
@@ -257,7 +249,6 @@ export default function VendorBillsScreen() {
 
   const insets = useSafeAreaInsets();
 
-
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [items, setItems] = useState<SupplierDueItem[]>([]);
@@ -310,11 +301,6 @@ export default function VendorBillsScreen() {
     endDate: dayjs().endOf('day').toDate(),
   });
 
-
-  
-
-
-
   const [online, setOnline] = useState(true);
   useEffect(() => {
     const sub = NetInfo.addEventListener((state) => {
@@ -329,33 +315,27 @@ export default function VendorBillsScreen() {
     return () => sub();
   }, []);
 
-
   const closeFilters = () => {
     setShowFilters(false);
     setTruckPickerOpen(false);
     setUnitPickerOpen(false);
   };
 
-
-
-
-
   const loadVendorBillsLocal = useCallback(async () => {
-  if (!user?.id) {
-    console.log('[VendorBills] loadVendorBillsLocal: no user id');
-    setItems([]);
-    return;
-  }
+    if (!user?.id) {
+      console.log('[VendorBills] loadVendorBillsLocal: no user id');
+      setItems([]);
+      return;
+    }
 
-  try {
-    const local = await getVendorBillsForOwner(user.id);
-    console.log('[VendorBills] loadVendorBillsLocal →', local.length, 'rows');
-    setItems(local);
-  } catch (err) {
-    console.warn('[VendorBills] loadVendorBillsLocal error', err);
-  }
-}, [user?.id]);
-
+    try {
+      const local = await getVendorBillsForOwner(user.id);
+      console.log('[VendorBills] loadVendorBillsLocal →', local.length, 'rows');
+      setItems(local);
+    } catch (err) {
+      console.warn('[VendorBills] loadVendorBillsLocal error', err);
+    }
+  }, [user?.id]);
 
   // Derived effective range with fallback to previous month when "this month" has no data
   const effectiveRange = useMemo(() => {
@@ -412,12 +392,6 @@ export default function VendorBillsScreen() {
     [token]
   );
 
-
-
-
-  
-
-
   function formatCurrency(n: number | undefined | null, currency = 'USD') {
     const v = Number(n ?? 0);
     const formatted = new Intl.NumberFormat('en-US', {
@@ -430,126 +404,117 @@ export default function VendorBillsScreen() {
     return `${currency} ${formatted}`;
   }
 
+  const hasRealOilId =
+    !!(selected?.oil_id && selected.oil_id > 0) ||
+    !!(selected?.child_oils?.[0]?.oil_id && selected.child_oils[0].oil_id! > 0);
 
+  // allow Actions whenever we have a real oil id, regardless of online state
+  const canOpenActions = !!hasRealOilId;
 
-const hasRealOilId =
-  !!(selected?.oil_id && selected.oil_id > 0) ||
-  !!(selected?.child_oils?.[0]?.oil_id && selected.child_oils[0].oil_id! > 0);
+  const fetchVendorDues = useCallback(async () => {
+    if (!user?.id) {
+      console.log('[VendorBills] fetchVendorDues: no user id');
+      setItems([]);
+      return;
+    }
 
-// allow Actions whenever we have a real oil id, regardless of online state
-const canOpenActions = !!hasRealOilId;
+    // 1) ALWAYS show what’s already in local SQLite (offline-first)
+    await loadVendorBillsLocal();
 
+    // 2) If we’re offline or no token, stop here – rely on local cache only
+    if (!online || !token) {
+      console.log('[VendorBills] offline or no token → using local cache only');
+      return;
+    }
 
+    try {
+      // 🔹 2b) FIRST: flush queued oil-modal forms so vendor bills get real oil_id / lot_id
+      console.log('[VendorBills] syncing pending oil-modal forms…');
+      await syncPendingOilModalForms(user.id, token);
 
-
-
-const fetchVendorDues = useCallback(async () => {
-  if (!user?.id) {
-    console.log('[VendorBills] fetchVendorDues: no user id');
-    setItems([]);
-    return;
-  }
-
-  // 1) ALWAYS show what’s already in local SQLite (offline-first)
-  await loadVendorBillsLocal();
-
-  // 2) If we’re offline or no token, stop here – rely on local cache only
-  if (!online || !token) {
-    console.log('[VendorBills] offline or no token → using local cache only');
-    return;
-  }
-
-  try {
-    // 🔹 2b) FIRST: flush queued oil-modal forms so vendor bills get real oil_id / lot_id
-    console.log('[VendorBills] syncing pending oil-modal forms…');
-    await syncPendingOilModalForms(user.id, token);
-
-    // 3) Online + token → sync vendor bills from server, then update list
-    console.log('[VendorBills] syncing vendor bills from server…');
-    const fresh = await getVendorBillsWithSync({
-      token,
-      ownerId: user.id,
-      force: true,
-    });
-    console.log('[VendorBills] server sync returned', fresh.length, 'items');
-    setItems(fresh);
-  } catch (err) {
-    console.warn('[VendorBills] sync failed, keeping local bills', err);
-    // items from local are already in state
-  }
-}, [user?.id, token, online, loadVendorBillsLocal]);
-
+      // 3) Online + token → sync vendor bills from server, then update list
+      console.log('[VendorBills] syncing vendor bills from server…');
+      const fresh = await getVendorBillsWithSync({
+        token,
+        ownerId: user.id,
+        force: true,
+      });
+      console.log('[VendorBills] server sync returned', fresh.length, 'items');
+      setItems(fresh);
+    } catch (err) {
+      console.warn('[VendorBills] sync failed, keeping local bills', err);
+      // items from local are already in state
+    }
+  }, [user?.id, token, online, loadVendorBillsLocal]);
 
   /** Fetch oil summary */
- const fetchOilSummary = useCallback(async () => {
-  if (!user?.id) return;
+  const fetchOilSummary = useCallback(async () => {
+    if (!user?.id) return;
 
-  // 1) show cached snapshot first (works offline / after restart)
-  try {
-    const cached = await getOilSummaryCache(user.id);
-    if (cached) {
-      setSummary(cached as SummaryResponse);
+    // 1) show cached snapshot first (works offline / after restart)
+    try {
+      const cached = await getOilSummaryCache(user.id);
+      if (cached) {
+        setSummary(cached as SummaryResponse);
+      }
+    } catch (e) {
+      console.warn('[VendorBills] failed to load cached oil summary', e);
     }
-  } catch (e) {
-    console.warn('[VendorBills] failed to load cached oil summary', e);
-  }
 
-  // 2) if offline or no token → keep whatever we have
-  if (!online || !token) return;
+    // 2) if offline or no token → keep whatever we have
+    if (!online || !token) return;
 
-  // 3) online: fetch fresh + update cache
-  try {
-    const res = await api.get<SummaryResponse>('/diiwaanoil/summary', {
-      headers: { ...(headers || {}) },
-    });
-    setSummary(res.data);
-    await saveOilSummaryCache(user.id, res.data);
-  } catch (e) {
-    console.warn('[VendorBills] fetchOilSummary failed, keeping cached', e);
-  }
-}, [user?.id, online, token, headers]);
-
-
-
-const fetchWakaaladStats = useCallback(async () => {
-  if (!user?.id) return;
-
-  // 1) cached snapshot
-  try {
-    const cached = await getWakaaladStatsCache(user.id);
-    if (cached) {
-      setWakaaladStats(cached as WakaaladStatsResponse);
+    // 3) online: fetch fresh + update cache
+    try {
+      const res = await api.get<SummaryResponse>('/diiwaanoil/summary', {
+        headers: { ...(headers || {}) },
+      });
+      setSummary(res.data);
+      await saveOilSummaryCache(user.id, res.data);
+    } catch (e) {
+      console.warn('[VendorBills] fetchOilSummary failed, keeping cached', e);
     }
-  } catch (e) {
-    console.warn('[VendorBills] failed to load cached wakaalad stats', e);
-  }
+  }, [user?.id, online, token, headers]);
 
-  // 2) offline / no token → keep cached
-  if (!online || !token) return;
+  const fetchWakaaladStats = useCallback(async () => {
+    if (!user?.id) return;
 
-  // 3) online: refresh + cache
-  try {
-    const res = await api.get<WakaaladStatsResponse>('/wakaalad_diiwaan/stats/summary', {
-      headers: { ...(headers || {}) },
-    });
-    setWakaaladStats(res.data);
-    await saveWakaaladStatsCache(user.id, res.data);
-  } catch (e) {
-    console.warn('[VendorBills] fetchWakaaladStats failed, keeping cached', e);
-  }
-}, [user?.id, online, token, headers]);
+    // 1) cached snapshot
+    try {
+      const cached = await getWakaaladStatsCache(user.id);
+      if (cached) {
+        setWakaaladStats(cached as WakaaladStatsResponse);
+      }
+    } catch (e) {
+      console.warn('[VendorBills] failed to load cached wakaalad stats', e);
+    }
 
-const fetchAll = useCallback(async () => {
-  if (fetchingRef.current) return;
-  fetchingRef.current = true;
-  try {
-    setLoading(true);
-    await Promise.all([fetchVendorDues(), fetchOilSummary(), fetchWakaaladStats()]);
-  } finally {
-    setLoading(false);
-    fetchingRef.current = false;
-  }
-}, [fetchVendorDues, fetchOilSummary, fetchWakaaladStats]);
+    // 2) offline / no token → keep cached
+    if (!online || !token) return;
+
+    // 3) online: refresh + cache
+    try {
+      const res = await api.get<WakaaladStatsResponse>('/wakaalad_diiwaan/stats/summary', {
+        headers: { ...(headers || {}) },
+      });
+      setWakaaladStats(res.data);
+      await saveWakaaladStatsCache(user.id, res.data);
+    } catch (e) {
+      console.warn('[VendorBills] fetchWakaaladStats failed, keeping cached', e);
+    }
+  }, [user?.id, online, token, headers]);
+
+  const fetchAll = useCallback(async () => {
+    if (fetchingRef.current) return;
+    fetchingRef.current = true;
+    try {
+      setLoading(true);
+      await Promise.all([fetchVendorDues(), fetchOilSummary(), fetchWakaaladStats()]);
+    } finally {
+      setLoading(false);
+      fetchingRef.current = false;
+    }
+  }, [fetchVendorDues, fetchOilSummary, fetchWakaaladStats]);
 
   useFocusEffect(
     useCallback(() => {
@@ -706,7 +671,12 @@ const fetchAll = useCallback(async () => {
   const kpiDecimals = displayUnit === 'liters' ? 0 : 2;
 
   /** CHILD SECTION (popup): Oil type header + plate/date inline; lines: Oil cost / Stock */
-  const renderChildSection = (c: OilDueLine, ix: number, plate?: string | null, dateIso?: string | null) => {
+  const renderChildSection = (
+    c: OilDueLine,
+    ix: number,
+    plate?: string | null,
+    dateIso?: string | null
+  ) => {
     const stockL = Number(c.in_stock_l || 0);
     const stockDisplay = convertLitersForDisplay(stockL, displayUnit);
     const stockLabel = `Stock (${unitLabel})`;
@@ -746,22 +716,6 @@ const fetchAll = useCallback(async () => {
       </View>
     );
   };
-
-
-
-const realLotId =
-  selected?.lot_id && selected.lot_id > 0 ? selected.lot_id : null;
-const realOilId =
-  selected?.oil_id && selected.oil_id > 0
-    ? selected.oil_id
-    : selected?.child_oils?.[0]?.oil_id && selected.child_oils[0].oil_id! > 0
-    ? selected.child_oils[0].oil_id!
-    : null;
-
-// enable as long as we have some real id, regardless of online
-const canOpenExtras = !!(realLotId || realOilId);
-
-
 
   return (
     <View style={styles.page}>
@@ -871,102 +825,143 @@ const canOpenExtras = !!(realLotId || realOilId);
           )}
         </View>
       </View>
-{/* List */}
-<ScrollView
-  contentContainerStyle={styles.scrollContent}
-  refreshControl={
-    <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
-  }
-  keyboardShouldPersistTaps="handled"
-  showsVerticalScrollIndicator
->
-  {loading ? (
-    <View style={styles.loading}>
-      <ActivityIndicator />
-    </View>
-  ) : filteredItems.length === 0 ? (
-    <View style={styles.empty}>
-      <Feather name="inbox" size={18} color={COLOR_MUTED} />
-      <Text style={styles.emptyText}>No vendor bills found.</Text>
-    </View>
-  ) : (
-    filteredItems.map((it, idx) => {
-      const plateOrSupplier = it.truck_plate?.trim() || it.supplier_name || '—';
-      const titlePieces = [it.truck_type?.trim(), plateOrSupplier].filter(
-        Boolean
-      ) as string[];
-      const title = titlePieces.join(' · ');
 
-      const children = it.child_oils || [];
-      let right: OilDueLine[] = [];
-
-      if (children.length > 0) {
-        // normal / lot or offline-both bills (we already have child_oils)
-        right = children.slice(0, 2);
-      } else {
-        // 🔁 Fallback for offline *single* bills (no child_oils, no oil_id yet)
-        const liters = Number(it.liters || 0);
-        const oilType = it.oil_type || null;
-
-        if (liters > 0 || oilType || it.oil_id) {
-          right = [
-            {
-              oil_id: it.oil_id ?? 0, // 0 = local/unknown id
-              oil_type: oilType,
-              liters,
-              sold_l: 0,
-              in_stock_l: liters, // treat all liters as current stock
-              oil_total_landed_cost: Number(it.oil_total_landed_cost || 0),
-              total_extra_cost: Number(it.total_extra_cost || 0),
-              over_all_cost:
-                typeof it.over_all_cost === 'number'
-                  ? Number(it.over_all_cost)
-                  : Number(it.oil_total_landed_cost || 0) +
-                    Number(it.total_extra_cost || 0),
-              total_paid: Number(it.total_paid || 0),
-              amount_due: Number(it.amount_due || 0),
-              extra_costs: it.extra_costs || [],
-            },
-          ];
-        }
-      }
-
-      return (
-        <TouchableOpacity
-          key={billKey(it, idx)}
-          style={styles.card}
-          activeOpacity={0.9}
-          onPress={() => setSelected(it)}
-        >
-          {/* LEFT */}
-          <View style={{ flex: 1, minWidth: 0 }}>
-            <Text style={styles.supplier} numberOfLines={1}>
-              {title}
-            </Text>
-            <View style={styles.childRow}>
-              <View style={styles.childPill}>
-                <Feather name="calendar" size={10} color={COLOR_TEXT} />
-                <Text style={styles.childText}>{formatDateLocal(it.date)}</Text>
-              </View>
-            </View>
+      {/* List */}
+      <ScrollView
+        contentContainerStyle={styles.scrollContent}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator
+      >
+        {loading ? (
+          <View style={styles.loading}>
+            <ActivityIndicator />
           </View>
-
-          {/* RIGHT: Child oil(s) compact */}
-          <View style={styles.rightCol}>
-            {right.map((c, ix) => (
-              <ChildOilBadge
-                key={`${c.oil_id}_${ix}`}
-                label={(c.oil_type || '—').toUpperCase()}
-                instock={Number(c.in_stock_l || 0)}
-                displayUnit={displayUnit}
-              />
-            ))}
+        ) : filteredItems.length === 0 ? (
+          <View style={styles.empty}>
+            <Feather name="inbox" size={18} color={COLOR_MUTED} />
+            <Text style={styles.emptyText}>No vendor bills found.</Text>
           </View>
-        </TouchableOpacity>
-      );
-    })
-  )}
-</ScrollView>
+        ) : (
+          filteredItems.map((it, idx) => {
+            const plateOrSupplier = it.truck_plate?.trim() || it.supplier_name || '—';
+            const titlePieces = [it.truck_type?.trim(), plateOrSupplier].filter(Boolean) as string[];
+            const title = titlePieces.join(' · ');
+
+            const children = it.child_oils || [];
+            let right: OilDueLine[] = [];
+
+            if (children.length > 0) {
+              // normal / lot or offline-both bills (we already have child_oils)
+              right = children.slice(0, 2);
+            } else {
+              // 🔁 Fallback for offline *single* bills (no child_oils, no oil_id yet)
+              const liters = Number(it.liters || 0);
+              const oilType = it.oil_type || null;
+
+              if (liters > 0 || oilType || it.oil_id) {
+                right = [
+                  {
+                    oil_id: it.oil_id ?? 0, // 0 = local/unknown id
+                    oil_type: oilType,
+                    liters,
+                    sold_l: 0,
+                    in_stock_l: liters, // treat all liters as current stock
+                    oil_total_landed_cost: Number(it.oil_total_landed_cost || 0),
+                    total_extra_cost: Number(it.total_extra_cost || 0),
+                    over_all_cost:
+                      typeof it.over_all_cost === 'number'
+                        ? Number(it.over_all_cost)
+                        : Number(it.oil_total_landed_cost || 0) +
+                          Number(it.total_extra_cost || 0),
+                    total_paid: Number(it.total_paid || 0),
+                    amount_due: Number(it.amount_due || 0),
+                    extra_costs: it.extra_costs || [],
+                  },
+                ];
+              }
+            }
+
+            // 🔹 Real ids for this row (for Extra charges button)
+            const rowRealLotId = it.lot_id && it.lot_id > 0 ? it.lot_id : null;
+            const rowRealOilId =
+              it.oil_id && it.oil_id > 0
+                ? it.oil_id
+                : it.child_oils?.[0]?.oil_id && it.child_oils[0].oil_id! > 0
+                ? it.child_oils[0].oil_id!
+                : null;
+            const canOpenRowExtras = !!(rowRealLotId || rowRealOilId);
+
+            return (
+              <TouchableOpacity
+                key={billKey(it, idx)}
+                style={styles.card}
+                activeOpacity={0.9}
+                onPress={() => setSelected(it)}
+              >
+                {/* LEFT */}
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Text style={styles.supplier} numberOfLines={1}>
+                    {title}
+                  </Text>
+
+                  <View style={styles.childRow}>
+                    {/* Date pill */}
+                    <View style={styles.childPill}>
+                      <Feather name="calendar" size={10} color={COLOR_TEXT} />
+                      <Text style={styles.childText}>{formatDateLocal(it.date)}</Text>
+                    </View>
+
+                    {/* 🔹 Extra charges – main row button */}
+                    <TouchableOpacity
+                      style={[
+                        styles.headerTabBtn,
+                        { paddingVertical: 3, paddingHorizontal: 8 },
+                        !canOpenRowExtras && { opacity: 0.5 },
+                      ]}
+                      activeOpacity={canOpenRowExtras ? 0.9 : 1}
+                      disabled={!canOpenRowExtras}
+                      onPress={(e) => {
+                        e.stopPropagation(); // don't trigger card onPress
+                        if (!canOpenRowExtras) return;
+
+                        const plate = (it.truck_plate || '').trim();
+
+                        if (rowRealLotId) {
+                          router.push({
+                            pathname: '/Shidaal/extracostspage',
+                            params: { lot_id: String(rowRealLotId), plate },
+                          });
+                        } else if (rowRealOilId) {
+                          router.push({
+                            pathname: '/Shidaal/extracostspage',
+                            params: { oil_id: String(rowRealOilId), plate },
+                          });
+                        }
+                      }}
+                    >
+                      <Feather name="layers" size={11} color="#0B2447" />
+                      <Text style={styles.headerTabTxt}>Extra charges</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                {/* RIGHT: Child oil(s) compact */}
+                <View style={styles.rightCol}>
+                  {right.map((c, ix) => (
+                    <ChildOilBadge
+                      key={`${c.oil_id}_${ix}`}
+                      label={(c.oil_type || '—').toUpperCase()}
+                      instock={Number(c.in_stock_l || 0)}
+                      displayUnit={displayUnit}
+                    />
+                  ))}
+                </View>
+              </TouchableOpacity>
+            );
+          })
+        )}
+      </ScrollView>
 
       {/* Floating "+ Dalab Cusub" button */}
       <TouchableOpacity
@@ -998,19 +993,17 @@ const canOpenExtras = !!(realLotId || realOilId);
                     {(() => {
                       const hasOil = !!(selected?.oil_id || selected?.child_oils?.[0]?.oil_id);
                       return (
-                      <TouchableOpacity
-                            style={[styles.headerTabBtn, !canOpenActions && { opacity: 0.5 }]}
-                            disabled={!canOpenActions}
-                            onPress={() => {
-                              if (!canOpenActions) return;
-                              setActionsOpen(true);  // OilActionsModal already gets token, will behave as before
-                            }}
-                          >
-                            <Feather name="settings" size={12} color="#0B2447" />
-                            <Text style={styles.headerTabTxt}>Actions</Text>
-                          </TouchableOpacity>
-
-
+                        <TouchableOpacity
+                          style={[styles.headerTabBtn, !canOpenActions && { opacity: 0.5 }]}
+                          disabled={!canOpenActions}
+                          onPress={() => {
+                            if (!canOpenActions) return;
+                            setActionsOpen(true); // OilActionsModal already gets token, will behave as before
+                          }}
+                        >
+                          <Feather name="settings" size={12} color="#0B2447" />
+                          <Text style={styles.headerTabTxt}>Actions</Text>
+                        </TouchableOpacity>
                       );
                     })()}
                   </View>
@@ -1032,7 +1025,7 @@ const canOpenExtras = !!(realLotId || realOilId);
                   </Text>
                 </View>
 
-                {/* List header inside popup — Truck plate | Qarashaad */}
+                {/* List header inside popup — Truck plate only */}
                 <View style={styles.listHeaderRow}>
                   <View
                     style={{
@@ -1051,37 +1044,8 @@ const canOpenExtras = !!(realLotId || realOilId);
                       </View>
                     )}
                   </View>
-
-
-
-                  <TouchableOpacity
-                  style={[styles.headerTabBtn, !canOpenExtras && { opacity: 0.5 }]}
-                  activeOpacity={canOpenExtras ? 0.9 : 1}
-                  disabled={!canOpenExtras}
-                  onPress={() => {
-                    if (!canOpenExtras) return;
-                    const plate = (selected?.truck_plate || '').trim();
-
-                    if (realLotId) {
-                      router.push({
-                        pathname: '/Shidaal/extracostspage',
-                        params: { lot_id: String(realLotId), plate },
-                      });
-                    } else if (realOilId) {
-                      router.push({
-                        pathname: '/Shidaal/extracostspage',
-                        params: { oil_id: String(realOilId), plate },
-                      });
-                    }
-                  }}
-                >
-                  <Feather name="layers" size={12} color="#0B2447" />
-                  <Text style={styles.headerTabTxt}>Qarashaad Dheerad Ah</Text>
-                </TouchableOpacity>
-
-
-
                 </View>
+
                 <View style={styles.listHeaderDivider} />
 
                 <ScrollView
@@ -1153,8 +1117,7 @@ const canOpenExtras = !!(realLotId || realOilId);
                           const base = Number(selected?.over_all_cost ?? 0);
                           if (base) return base;
                           return Number(
-                            (selected?.oil_total_landed_cost || 0) +
-                              (selected?.total_extra_cost || 0)
+                            (selected?.oil_total_landed_cost || 0) + (selected?.total_extra_cost || 0)
                           );
                         })()
                       )}
@@ -1385,10 +1348,7 @@ const canOpenExtras = !!(realLotId || realOilId);
                   >
                     <Text style={styles.resetTxt}>Reset</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.applyBtn}
-                    onPress={closeFilters}
-                  >
+                  <TouchableOpacity style={styles.applyBtn} onPress={closeFilters}>
                     <Text style={styles.applyTxt}>Apply</Text>
                   </TouchableOpacity>
                 </View>
@@ -1519,6 +1479,8 @@ function QuickRangeChip({ label, onPress }: { label: string; onPress: () => void
     </TouchableOpacity>
   );
 }
+
+
 
 const CARD_WIDTH = (width - 16 * 2 - 10 * 2) / 3;
 

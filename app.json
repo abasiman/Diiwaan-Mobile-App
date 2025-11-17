@@ -1,8 +1,12 @@
+
+
+//app.json
+
 {
   "expo": {
     "name": "Diiwaan",
     "slug": "Diiwaan",
-    "version": "2.0.0",
+    "version": "2.0.3",
     "scheme": "diiwaan",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
@@ -33,7 +37,7 @@
     },
     "android": {
       "package": "com.luneksa.diiwaan",
-      "versionCode": 212,
+      "versionCode": 214,
       "icon": "./assets/images/android/ic_launcher.png",
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/android/ic_launcher_foreground.png",

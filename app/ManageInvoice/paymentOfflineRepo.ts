@@ -1,6 +1,6 @@
 // app/db/paymentOfflineRepo.ts
 import api from '@/services/api';
-import { db } from '../db/db';
+import { db } from '../db/db.native';
 
 export type PaymentQueueStatus = 'pending' | 'synced' | 'failed';
 

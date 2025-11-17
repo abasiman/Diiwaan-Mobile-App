@@ -5,7 +5,7 @@ import {
   type WakaaladSellOption,
 } from '@/app/dbform/wakaaladSellOptionsRepo';
 import api from '@/services/api';
-import { db } from '../db/db';
+import { db } from '../db/db.native';
 import { initOilSalesPageDb } from '../db/oilSalesPageDb';
 
 type SaleUnitType = 'liters' | 'fuusto' | 'caag';

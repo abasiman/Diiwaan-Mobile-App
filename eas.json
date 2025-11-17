@@ -1,3 +1,6 @@
+
+//eas.json
+
 {
   "cli": { "version": ">= 16.10.1", "appVersionSource": "local" },
   "build": {

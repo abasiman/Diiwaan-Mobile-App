@@ -58,6 +58,10 @@ function normalizeServerItems(items: ExtraCostServerItem[]): NormalizedExtraCost
 /**
  * Fetch extra-costs for a given oil or lot from the server
  * and upsert them into the local offline DB.
+ *
+ * Uses:
+ *   - /diiwaanoil/{oil_id}/extra-costs
+ *   - /diiwaanoil/lots/{lot_id}/extra-costs
  */
 export async function syncExtraCostsForAnchor(opts: {
   token: string;
@@ -68,38 +72,27 @@ export async function syncExtraCostsForAnchor(opts: {
   const { token, ownerId, oilId, lotId } = opts;
   if (!token || !ownerId || (!oilId && !lotId)) return;
 
-  const params: Record<string, any> = {};
-  if (oilId) params.oil_id = oilId;
-  if (lotId) params.lot_id = lotId;
-  params.order = 'created_desc';
-  params.limit = 500;
+  const url = lotId
+    ? `/diiwaanoil/lots/${lotId}/extra-costs`
+    : `/diiwaanoil/${oilId}/extra-costs`;
 
-  const res = await api.get<ExtraCostServerItem[]>('/diiwaanoil/extra-costs', {
+  const res = await api.get<ExtraCostServerItem[]>(url, {
     headers: { Authorization: `Bearer ${token}` },
-    params,
   });
 
-  const items = normalizeServerItems(res.data || []);
+  const items = normalizeServerItems(res.data || []).map((row) => ({
+    ...row,
+    oil_id: lotId ? null : (oilId ?? row.oil_id ?? null),
+    lot_id: lotId ? (lotId ?? row.lot_id ?? null) : (row.lot_id ?? null),
+  }));
+
   await upsertExtraCostsFromServer(ownerId, items);
 }
 
 /**
- * 🔹 Global sync helper: fetch a recent batch of extra-costs
- * for this owner and cache them locally.
- *
- * Called from RootLayout.GlobalSync after login.
+ * Global sync helper – currently a no-op because there is no
+ * global /diiwaanoil/extra-costs endpoint in the backend.
  */
 export async function syncAllExtraCosts(ownerId: number, token: string) {
   if (!token || !ownerId) return;
-
-  const res = await api.get<ExtraCostServerItem[]>('/diiwaanoil/extra-costs', {
-    headers: { Authorization: `Bearer ${token}` },
-    params: {
-      order: 'updated_desc', // prefer newest first
-      limit: 2000,           // adjust if needed
-    },
-  });
-
-  const items = normalizeServerItems(res.data || []);
-  await upsertExtraCostsFromServer(ownerId, items);
 }

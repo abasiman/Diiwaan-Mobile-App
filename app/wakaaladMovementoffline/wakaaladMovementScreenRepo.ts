@@ -1,9 +1,9 @@
 // app/WakaaladMovementOffline/wakaaladMovementScreenRepo.ts
 import { db } from '../db/db';
 import {
-    initWakaaladMovementScreenDb,
-    WAKAALAD_MOVEMENT_SCREEN_META_TABLE,
-    WAKAALAD_MOVEMENT_SCREEN_TABLE,
+  initWakaaladMovementScreenDb,
+  WAKAALAD_MOVEMENT_SCREEN_META_TABLE,
+  WAKAALAD_MOVEMENT_SCREEN_TABLE,
 } from './wakaaladMovementScreenDb';
 
 /** Mirror types from wakaaladmovement.tsx */

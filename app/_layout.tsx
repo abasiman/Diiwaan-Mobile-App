@@ -28,7 +28,7 @@ import { initOilSellOptionsDb } from './WakaaladOffline/oilSellOptionsRepo';
 import { initWakaaladDb } from './WakaaladOffline/wakaaladOfflineDb';
 import { initCustomerInvoiceDb } from './db/customerinvoicedb';
 import { initCustomerLedgerDb } from './db/customerledgerdb';
-import { initDb } from './db/db';
+import { initDb } from './db/db.native';
 import { initIncomeStatementDb } from './offlineincomestatement/incomeStatementDb';
 import { initMeProfileDb } from './profile/meProfileDb';
 import { initVendorPaymentsScreenDb } from './vendorPaymentTransactionsOffline/vendorPaymentsScreenDb';

@@ -1,10 +1,10 @@
 // app/OilCreateOffline/oilModalRepo.ts
 import { db } from '../db/db';
 import {
-    initOilModalDb,
-    type OilModalMode,
-    type OilModalRow,
-    type OilModalStatus,
+  initOilModalDb,
+  type OilModalMode,
+  type OilModalRow,
+  type OilModalStatus,
 } from './oilModalDb';
 
 export type OilModalQueuePayload = {

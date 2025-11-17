@@ -22,13 +22,13 @@ import {
   View,
 } from 'react-native';
 import { upsertSingleCustomerInvoiceFromSale } from '../db/CustomerInvoicesPagerepo';
-
 import { queueOilRepriceForSync } from '../dbform/oilRepriceOfflineRepo';
 import {
   queueOilSaleOffline,
   QueueOilSalePayload,
 } from '../oilSalesfOfflineRepo/oilSalesformOfflineRepo';
 import { upsertOilSalesFromServer } from '../oilSalesfOfflineRepo/oilSalesRepo';
+import { applyLocalWakaaladSale } from '../WakaaladOffline/wakaaladRepo';
 
 import {
   getCustomersLocal,
@@ -1451,172 +1451,203 @@ export default function OilSaleInvoiceForm() {
     setFinalOpen(false);
 
     // OFFLINE BRANCH
-    if (!online || !token) {
-      console.log(`${LOG_TAG} OFFLINE branch`, {
-        online,
-        hasToken: !!token,
-        userId: user.id,
-      });
+    // OFFLINE BRANCH
+if (!online || !token) {
+  console.log(`${LOG_TAG} OFFLINE branch`, {
+    online,
+    hasToken: !!token,
+    userId: user.id,
+  });
 
+  try {
+    const tempId = -Date.now();
+    console.log(`${LOG_TAG} tempId`, { tempId });
+
+    console.log(`${LOG_TAG} queueOilSaleOffline() START`, {
+      ownerId: user.id,
+      tempLocalId: tempId,
+    });
+    await queueOilSaleOffline({
+      ownerId: user.id,
+      payload,
+      tempLocalId: tempId,
+    });
+    console.log(`${LOG_TAG} queueOilSaleOffline() SUCCESS`, { tempId });
+
+    const totalNative =
+      perL_sale && perL_sale > 0 && billedLiters > 0
+        ? perL_sale * billedLiters
+        : null;
+
+    const totalUsd =
+      saleCurrency === 'USD'
+        ? totalNative
+        : fxValid && totalNative != null
+        ? totalNative / fxValid
+        : null;
+
+    const nowIso = new Date().toISOString();
+
+    console.log(`${LOG_TAG} Offline totals`, {
+      billedLiters,
+      perL_sale,
+      totalNative,
+      totalUsd,
+      nowIso,
+    });
+
+    const offlineRow: any = {
+      id: tempId,
+      oil_id: payload.oil_id,
+      wakaalad_id: payload.wakaalad_id,
+      oil_type: selected.oil_type,
+      truck_plate: selected.truck_plate,
+      customer: payload.customer ?? null,
+      customer_contact: payload.customer_contact ?? null,
+      unit_type: payload.unit_type,
+      unit_qty: payload.unit_qty ?? null,
+      liters_sold:
+        payload.liters_sold ??
+        (payload.unit_type === 'liters' ? qtyNum : billedLiters),
+      price_per_unit_type: null,
+      price_per_l: payload.price_per_l ?? null,
+      subtotal_native: totalNative,
+      discount_native: null,
+      tax_native: null,
+      total_native: totalNative,
+      total_usd: totalUsd,
+      currency: saleCurrency,
+      fx_rate_to_usd: saleCurrency === 'USD' ? null : fxValid ?? null,
+      payment_status: 'unpaid',
+      payment_method: payload.payment_method ?? null, // 'credit'
+      note: (payload as any).note ?? null,
+      created_at: nowIso,
+      updated_at: null,
+    };
+
+    console.log(`${LOG_TAG} offlineRow summary`, {
+      id: offlineRow.id,
+      oil_id: offlineRow.oil_id,
+      wakaalad_id: offlineRow.wakaalad_id,
+      total_native: offlineRow.total_native,
+      total_usd: offlineRow.total_usd,
+      currency: offlineRow.currency,
+    });
+
+    if (user?.id) {
+      console.log(
+        `${LOG_TAG} upsertOilSalesFromServer() [OFFLINE] START`,
+        { userId: user.id, rowsCount: 1 }
+      );
+      await upsertOilSalesFromServer([offlineRow], user.id);
+      console.log(
+        `${LOG_TAG} upsertOilSalesFromServer() [OFFLINE] SUCCESS`,
+        { userId: user.id, rowsCount: 1 }
+      );
+
+      // 🔹 NEW: also write to customer-invoices DB so it shows on the invoices page immediately
       try {
-        const tempId = -Date.now();
-        console.log(`${LOG_TAG} tempId`, { tempId });
-
-        console.log(`${LOG_TAG} queueOilSaleOffline() START`, {
-          ownerId: user.id,
-          tempLocalId: tempId,
-        });
-        await queueOilSaleOffline({
-          ownerId: user.id,
-          payload,
-          tempLocalId: tempId,
-        });
-        console.log(`${LOG_TAG} queueOilSaleOffline() SUCCESS`, { tempId });
-
-        const totalNative =
-          perL_sale && perL_sale > 0 && billedLiters > 0
-            ? perL_sale * billedLiters
-            : null;
-
-        const totalUsd =
-          saleCurrency === 'USD'
-            ? totalNative
-            : fxValid && totalNative != null
-            ? totalNative / fxValid
-            : null;
-
-        const nowIso = new Date().toISOString();
-
-        console.log(`${LOG_TAG} Offline totals`, {
-          billedLiters,
-          perL_sale,
-          totalNative,
-          totalUsd,
-          nowIso,
-        });
-
-        const offlineRow: any = {
+        const offlineInvoiceSale = {
           id: tempId,
           oil_id: payload.oil_id,
-          wakaalad_id: payload.wakaalad_id,
-          oil_type: selected.oil_type,
-          truck_plate: selected.truck_plate,
+          owner_id: user.id,
           customer: payload.customer ?? null,
           customer_contact: payload.customer_contact ?? null,
+          oil_type: selected.oil_type,
           unit_type: payload.unit_type,
-          unit_qty: payload.unit_qty ?? null,
+          unit_qty:
+            payload.unit_qty ??
+            (payload.unit_type === 'liters' ? qtyNum : 0),
+          unit_capacity_l: null,
           liters_sold:
             payload.liters_sold ??
             (payload.unit_type === 'liters' ? qtyNum : billedLiters),
-          price_per_unit_type: null,
+          currency: saleCurrency,
           price_per_l: payload.price_per_l ?? null,
           subtotal_native: totalNative,
           discount_native: null,
           tax_native: null,
           total_native: totalNative,
+          fx_rate_to_usd:
+            saleCurrency === 'USD' ? null : fxValid ?? null,
           total_usd: totalUsd,
-          currency: saleCurrency,
-          fx_rate_to_usd: saleCurrency === 'USD' ? null : fxValid ?? null,
-          payment_status: 'unpaid', // invoice → unpaid by default
-          payment_method: payload.payment_method ?? null, // 'credit'
-          note: (payload as any).note ?? null,
+          payment_status: 'unpaid' as const,
+          payment_method: (payload.payment_method ??
+            'credit') as 'cash' | 'bank' | 'mobile' | 'credit' | null,
+          paid_native: null,
+          note: (payload as any).note ?? 'Offline sale (pending sync)',
           created_at: nowIso,
-          updated_at: null,
+          updated_at: nowIso,
         };
 
-        console.log(`${LOG_TAG} offlineRow summary`, {
-          id: offlineRow.id,
-          oil_id: offlineRow.oil_id,
-          wakaalad_id: offlineRow.wakaalad_id,
-          total_native: offlineRow.total_native,
-          total_usd: offlineRow.total_usd,
-          currency: offlineRow.currency,
-        });
-
-                if (user?.id) {
-          console.log(
-            `${LOG_TAG} upsertOilSalesFromServer() [OFFLINE] START`,
-            { userId: user.id, rowsCount: 1 }
-          );
-          await upsertOilSalesFromServer([offlineRow], user.id);
-          console.log(
-            `${LOG_TAG} upsertOilSalesFromServer() [OFFLINE] SUCCESS`,
-            { userId: user.id, rowsCount: 1 }
-          );
-
-          // 🔹 NEW: also write to customer-invoices DB so it shows on the invoices page immediately
-          try {
-            const offlineInvoiceSale = {
-              id: tempId,
-              oil_id: payload.oil_id,
-              owner_id: user.id,
-              customer: payload.customer ?? null,
-              customer_contact: payload.customer_contact ?? null,
-              oil_type: selected.oil_type,
-              unit_type: payload.unit_type,
-              unit_qty:
-                payload.unit_qty ??
-                (payload.unit_type === 'liters' ? qtyNum : 0),
-              unit_capacity_l: null,
-              liters_sold:
-                payload.liters_sold ??
-                (payload.unit_type === 'liters' ? qtyNum : billedLiters),
-              currency: saleCurrency,
-              price_per_l: payload.price_per_l ?? null,
-              subtotal_native: totalNative,
-              discount_native: null,
-              tax_native: null,
-              total_native: totalNative,
-              fx_rate_to_usd:
-                saleCurrency === 'USD' ? null : fxValid ?? null,
-              total_usd: totalUsd,
-              payment_status: 'unpaid' as const,
-              payment_method: (payload.payment_method ??
-                'credit') as 'cash' | 'bank' | 'mobile' | 'credit' | null,
-              paid_native: null,
-              note: (payload as any).note ?? 'Offline sale (pending sync)',
-              created_at: nowIso,
-              updated_at: nowIso,
-            };
-
-            upsertSingleCustomerInvoiceFromSale(user.id, offlineInvoiceSale);
-            console.log(
-              `${LOG_TAG} upsertSingleCustomerInvoiceFromSale() [OFFLINE] SUCCESS`,
-              { ownerId: user.id, saleId: tempId }
-            );
-          } catch (err) {
-            console.warn(
-              `${LOG_TAG} Failed to upsert into customer-invoices DB (offline)`,
-              err
-            );
-          }
-        } else {
-          console.warn(
-            `${LOG_TAG} Skipped local upsert in OFFLINE branch: missing user.id`
-          );
-        }
-
-
-        showToast('Invoice saved offline – will sync when online');
-        console.log(`${LOG_TAG} Offline invoice completed; navigate`);
-        goToInvoices();
-      } catch (e: any) {
-        console.error(`${LOG_TAG} OFFLINE branch failed`, {
-          errorMessage: e?.message,
-          errorStack: e?.stack,
-          error: e,
-        });
-        openValidation(
-          'Offline save failed',
-          'Could not save invoice locally. Please try again.'
+        upsertSingleCustomerInvoiceFromSale(user.id, offlineInvoiceSale);
+        console.log(
+          `${LOG_TAG} upsertSingleCustomerInvoiceFromSale() [OFFLINE] SUCCESS`,
+          { ownerId: user.id, saleId: tempId }
         );
-      } finally {
-        console.log(`${LOG_TAG} OFFLINE finally setSubmitting(false)`);
-        setSubmitting(false);
+      } catch (err) {
+        console.warn(
+          `${LOG_TAG} Failed to upsert into customer-invoices DB (offline)`,
+          err
+        );
       }
 
-      return;
+      // 🔹 NEW: update local wakaalad so dashboard shows updated stock/sold OFFLINE
+      try {
+        // use *physical* liters drained from the tank (estimatedLiters),
+        // not billedLiters (which excludes petrol shorts)
+        await applyLocalWakaaladSale(
+          user.id,
+          selected.wakaalad_id,
+          estimatedLiters
+        );
+
+        console.log(
+          `${LOG_TAG} applyLocalWakaaladSale() [OFFLINE] SUCCESS`,
+          {
+            ownerId: user.id,
+            wakaaladId: selected.wakaalad_id,
+            liters: estimatedLiters,
+          }
+        );
+      } catch (err) {
+        console.warn(
+          `${LOG_TAG} applyLocalWakaaladSale() [OFFLINE] FAILED`,
+          {
+            ownerId: user.id,
+            wakaaladId: selected.wakaalad_id,
+            liters: estimatedLiters,
+            err,
+          }
+        );
+      }
+    } else {
+      console.warn(
+        `${LOG_TAG} Skipped local upsert in OFFLINE branch: missing user.id`
+      );
     }
+
+    showToast('Invoice saved offline – will sync when online');
+    console.log(`${LOG_TAG} Offline invoice completed; navigate`);
+    goToInvoices();
+  } catch (e: any) {
+    console.error(`${LOG_TAG} OFFLINE branch failed`, {
+      errorMessage: e?.message,
+      errorStack: e?.stack,
+      error: e,
+    });
+    openValidation(
+      'Offline save failed',
+      'Could not save invoice locally. Please try again.'
+    );
+  } finally {
+    console.log(`${LOG_TAG} OFFLINE finally setSubmitting(false)`);
+    setSubmitting(false);
+  }
+
+  return;
+}
+
 
   // ONLINE BRANCH
     console.log(`${LOG_TAG} ONLINE branch`, {

@@ -89,6 +89,16 @@ export default function Menu() {
       path: "/tenant-accounts",
       priority: 3,
     },
+
+
+     {
+      key: "Expenses",
+      title: "Expenses",
+      icon: <MaterialCommunityIcons name="file-chart-outline" size={20} color={COLORS.indigo} />,
+      tint: COLORS.indigo,
+      path: "/DiiwaanExpenses/expenseflow",
+      priority: 3,
+    },
   ];
 
   const filtered = useMemo(() => {

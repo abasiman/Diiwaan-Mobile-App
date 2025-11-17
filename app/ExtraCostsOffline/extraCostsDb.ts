@@ -1,6 +1,7 @@
 // app/ExtraCostsOffline/extraCostsDb.ts
 import { db } from '../db/db';
 
+
 export type ExtraCostRow = {
   owner_id: number;
   id: number;

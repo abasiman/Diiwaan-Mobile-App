@@ -172,99 +172,117 @@ export default function TenantAccountsStatement() {
   // Data
   const [summary, setSummary] = useState<AccountSummary | null>(null);
   const [loading, setLoading] = useState(true);
+const fetchSummary = useCallback(async () => {
+  const ownerId = user?.id;
+  if (!ownerId) return;
 
-  const fetchSummary = useCallback(async () => {
-    const ownerId = user?.id;
-    if (!ownerId) return;
+  setLoading(true);
+  const { start, end, label } = buildRange();
 
-    setLoading(true);
-    const { start, end, label } = buildRange();
+  const applyResponse = (overall: AccountSummary | null, trucks: AccountTruckPlate[]) => {
+    setSummary(overall);
+    setTrucksData(trucks || []);
 
-    const applyResponse = (overall: AccountSummary | null, trucks: AccountTruckPlate[]) => {
-      setSummary(overall);
-      setTrucksData(trucks || []);
+    // Gather plates from response
+    const plates = Array.from(
+      new Set((trucks || [])
+        .map(t => (t.truck_plate || '').trim())
+        .filter(Boolean))
+    );
 
-      // Gather plates from response
-      const plates = Array.from(
-        new Set((trucks || [])
-          .map(t => (t.truck_plate || '').trim())
-          .filter(Boolean))
-      );
-
-      // If "All Trucks" is selected, refresh the cached full list
-      if (!truckPlate) {
-        allPlatesRef.current = plates;
-      }
-
-      // Always show ALL known plates in the dropdown
-      const baseList = allPlatesRef.current.length ? allPlatesRef.current : plates;
-      const deduped = Array.from(new Set(baseList));
-      const items: DropdownItem[] = [{ label: 'All Trucks', value: '' }, ...deduped.map(p => ({ label: p, value: p }))];
-
-      // Ensure current selection is visible even if not in list for this range
-      if (truckPlate && !deduped.includes(truckPlate)) {
-        items.push({ label: truckPlate, value: truckPlate });
-      }
-      setTruckItems(items);
-
-      setShotUri(null);
-    };
-
-    try {
-      const params: any = {};
-      if (start) params.start = start;
-      if (end) params.end = end;
-      if (truckPlate) params.truck_plate = truckPlate;
-
-      // ONLINE → API + cache
-      if (online && token) {
-        const res = await api.get<AccountSummaryResponse>('/diiwaantenantsaccounts/summary', {
-          headers: { Authorization: `Bearer ${token}` },
-          params,
-        });
-
-        const data = res.data;
-        applyResponse(data.overall, data.trucks || []);
-
-        upsertIncomeStatementFromServer({
-          ownerId,
-          start: start ?? null,
-          end: end ?? null,
-          truckPlate,
-          label,
-          response: data,
-        });
-      } else {
-        // OFFLINE → local snapshot
-        const local = getIncomeStatementLocal({
-          ownerId,
-          start: start ?? null,
-          end: end ?? null,
-          truckPlate,
-        });
-        applyResponse(local.overall, local.trucks);
-      }
-    } catch (e: any) {
-      console.error(e);
-      // API failed → fallback to local cache
-      try {
-        const local = getIncomeStatementLocal({
-          ownerId,
-          start: start ?? null,
-          end: end ?? null,
-          truckPlate,
-        });
-        applyResponse(local.overall, local.trucks);
-      } catch (err) {
-        Alert.alert('Load failed', e?.response?.data?.detail ?? 'Unable to load tenant accounts summary.');
-        setSummary(null);
-        setTrucksData([]);
-        setTruckItems([{ label: 'All Trucks', value: '' }]);
-      }
-    } finally {
-      setLoading(false);
+    // If "All Trucks" is selected, refresh the cached full list
+    if (!truckPlate) {
+      allPlatesRef.current = plates;
     }
-  }, [user?.id, token, online, buildRange, truckPlate]);
+
+    // Always show ALL known plates in the dropdown
+    const baseList = allPlatesRef.current.length ? allPlatesRef.current : plates;
+    const deduped = Array.from(new Set(baseList));
+    const items: DropdownItem[] = [
+      { label: 'All Trucks', value: '' },
+      ...deduped.map(p => ({ label: p, value: p })),
+    ];
+
+    // Ensure current selection is visible even if not in list for this range
+    if (truckPlate && !deduped.includes(truckPlate)) {
+      items.push({ label: truckPlate, value: truckPlate });
+    }
+    setTruckItems(items);
+
+    setShotUri(null);
+  };
+
+  try {
+    const params: any = {};
+    if (start) params.start = start;
+    if (end) params.end = end;
+    if (truckPlate) params.truck_plate = truckPlate;
+
+    if (online && token) {
+      // ───────────────── ONLINE ─────────────────
+      // 1) Get fresh server snapshot
+      const res = await api.get<AccountSummaryResponse>('/diiwaantenantsaccounts/summary', {
+        headers: { Authorization: `Bearer ${token}` },
+        params,
+      });
+
+      const data = res.data;
+
+      // 2) Cache raw server snapshot (WITHOUT deltas)
+      upsertIncomeStatementFromServer({
+        ownerId,
+        start: start ?? null,
+        end: end ?? null,
+        truckPlate,
+        label,
+        response: data,
+      });
+
+      // 3) Always read through local aggregator so unsynced deltas
+      //    (tenant_income_invoice_deltas) are layered on top.
+      const local = getIncomeStatementLocal({
+        ownerId,
+        start: start ?? null,
+        end: end ?? null,
+        truckPlate,
+      });
+
+      applyResponse(local.overall, local.trucks);
+    } else {
+      // ───────────────── OFFLINE ─────────────────
+      const local = getIncomeStatementLocal({
+        ownerId,
+        start: start ?? null,
+        end: end ?? null,
+        truckPlate,
+      });
+      applyResponse(local.overall, local.trucks);
+    }
+  } catch (e: any) {
+    console.error(e);
+    // API failed → fallback to local cache with deltas
+    try {
+      const local = getIncomeStatementLocal({
+        ownerId,
+        start: start ?? null,
+        end: end ?? null,
+        truckPlate,
+      });
+      applyResponse(local.overall, local.trucks);
+    } catch (err) {
+      Alert.alert(
+        'Load failed',
+        e?.response?.data?.detail ?? 'Unable to load tenant accounts summary.'
+      );
+      setSummary(null);
+      setTrucksData([]);
+      setTruckItems([{ label: 'All Trucks', value: '' }]);
+    }
+  } finally {
+    setLoading(false);
+  }
+}, [user?.id, token, online, buildRange, truckPlate]);
+
 
   useEffect(() => { fetchSummary(); }, [fetchSummary]);
 
